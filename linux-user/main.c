@@ -57,6 +57,9 @@
 #include "user-mmap.h"
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
+#ifdef CONFIG_RR_FUZZING
+#include "rr_fuzzing/rr_framework.h"
+#endif
 
 #ifdef CONFIG_SEMIHOSTING
 #include "semihosting/semihost.h"
@@ -1030,6 +1033,14 @@ int main(int argc, char **argv, char **envp)
 
 #ifdef CONFIG_SEMIHOSTING
     qemu_semihosting_guestfd_init();
+#endif
+
+#ifdef CONFIG_RR_FUZZING
+    /* 初始化RR-Fuzz框架 */
+    if (rr_framework_init() < 0) {
+        error_report("Failed to initialize RR-Fuzz framework");
+        exit(EXIT_FAILURE);
+    }
 #endif
 
     cpu_loop(env);

@@ -2424,6 +2424,11 @@ foreach k : get_option('trace_backends')
 endforeach
 config_host_data.set_quoted('CONFIG_TRACE_FILE', get_option('trace_file'))
 config_host_data.set_quoted('CONFIG_TLS_PRIORITY', get_option('tls_priority'))
+
+# RR-Fuzz configuration
+if get_option('rr_fuzzing').enabled()
+  config_host_data.set('CONFIG_RR_FUZZING', true)
+endif
 if iasl.found()
   config_host_data.set_quoted('CONFIG_IASL', iasl.full_path())
 endif

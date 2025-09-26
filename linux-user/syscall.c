@@ -24,6 +24,10 @@
 #include "qemu/queue.h"
 #include "qemu/plugin.h"
 #include "tcg/startup.h"
+
+#ifdef CONFIG_RR_FUZZING
+#include "rr_fuzzing/rr_framework.h"
+#endif
 #include "target_mman.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
@@ -13995,8 +13999,22 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
         print_syscall(cpu_env, num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
 
+#ifdef CONFIG_RR_FUZZING
+    /* RR-Fuzz系统调用拦截 */
+    abi_long rr_ret = rr_do_syscall(cpu_env, num, arg1, arg2, arg3, arg4,
+                                   arg5, arg6, arg7, arg8);
+    if (rr_ret != -1) {
+        /* RR框架处理了这个系统调用，直接返回结果 */
+        ret = rr_ret;
+    } else {
+        /* 执行原始系统调用 */
+        ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
+                          arg5, arg6, arg7, arg8);
+    }
+#else
     ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
                       arg5, arg6, arg7, arg8);
+#endif
 
     if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
         print_syscall_ret(cpu_env, num, ret, arg1, arg2,
@@ -14004,5 +14022,14 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
     }
 
     record_syscall_return(cpu, num, ret);
+
+#ifdef CONFIG_RR_FUZZING
+    /* RR-Fuzz记录模式的post-hook */
+    if (rr_framework_enabled()) {
+        rr_syscall_post_hook(cpu_env, num, ret, arg1, arg2, arg3, arg4,
+                            arg5, arg6, arg7, arg8);
+    }
+#endif
+
     return ret;
 }

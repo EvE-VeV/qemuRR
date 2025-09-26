@@ -32,6 +32,10 @@ if get_option('plugins')
   linux_user_ss.add(files('plugin-api.c'))
 endif
 
+# RR-Fuzz integration
+subdir('rr_fuzzing')
+
+
 syscall_nr_generators = {}
 
 gen_vdso_exe = executable('gen-vdso', 'gen-vdso.c',
