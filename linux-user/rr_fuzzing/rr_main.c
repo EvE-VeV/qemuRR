@@ -16,6 +16,54 @@
 rr_framework_t *g_rr_framework = NULL;
 
 /**
+ * 获取系统调用名称
+ */
+static const char* get_syscall_name(int syscall_nr) {
+    switch (syscall_nr) {
+        case 0: return "read";
+        case 1: return "write";
+        case 2: return "open";
+        case 3: return "close";
+        case 4: return "stat";
+        case 5: return "fstat";
+        case 6: return "lstat";
+        case 7: return "poll";
+        case 8: return "lseek";
+        case 9: return "mmap";
+        case 10: return "mprotect";
+        case 11: return "munmap";
+        case 12: return "brk";
+        case 13: return "rt_sigaction";
+        case 14: return "rt_sigprocmask";
+        case 15: return "rt_sigreturn";
+        case 16: return "ioctl";
+        case 17: return "pread64";
+        case 18: return "pwrite64";
+        case 19: return "readv";
+        case 20: return "writev";
+        case 21: return "access";
+        case 22: return "pipe";
+        case 23: return "select";
+        case 39: return "getpid";
+        case 63: return "uname";
+        case 102: return "getuid";
+        case 104: return "getgid";
+        case 137: return "statfs";
+        case 158: return "arch_prctl";
+        case 217: return "getdents64";
+        case 218: return "set_tid_address";
+        case 231: return "exit_group";
+        case 257: return "openat";
+        case 262: return "newfstatat";
+        case 273: return "set_robust_list";
+        case 302: return "prlimit64";
+        case 318: return "getrandom";
+        case 334: return "rseq";
+        default: return "unknown";
+    }
+}
+
+/**
  * 初始化RR框架
  */
 int rr_framework_init(void)
@@ -196,6 +244,46 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
     RR_VERBOSE("RR_DO_SYSCALL: Framework enabled, mode=%d", g_rr_framework->mode);
 
+    /* 添加醒目的系统调用入口提示 - 调试阶段使用 */
+    const char* syscall_name = get_syscall_name(num);
+    RR_INFO("===============================================================");    
+    RR_INFO("=== ENTERING SYSCALL: %s (%d) === MODE: %s ===",
+            syscall_name, num,
+            g_rr_framework->mode == RR_MODE_RECORD ? "RECORD" :
+            g_rr_framework->mode == RR_MODE_REPLAY ? "REPLAY" :
+            g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN");
+
+    /* 特殊处理deterministic系统调用，直接返回固定值，不需要记录/重放 */
+    switch (num) {
+        case 20: /* getpid */
+            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getpid");
+            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 12345L);
+            RR_INFO("===============================================================");    
+            return 12345; // 返回固定的PID
+        case 102: /* getuid */
+            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getuid");
+            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 1000L);
+            RR_INFO("===============================================================");    
+            return 1000; // 返回固定的UID
+        case 104: /* getgid */
+            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getgid");
+            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 1000L);
+            RR_INFO("===============================================================");    
+            return 1000; // 返回固定的GID
+        case 218: /* set_tid_address */
+            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall set_tid_address");
+            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 12345L);
+            RR_INFO("===============================================================");    
+            return 12345; // 返回与getpid一致的固定值
+        case 231: /* exit_group */
+            RR_VERBOSE("RR_DO_SYSCALL: Handling exit_group syscall, allowing normal exit");
+            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, -1L);
+            RR_INFO("===============================================================");    
+            return -1; // 让系统正常退出
+        default:
+            break; // 继续正常的record/replay逻辑
+    }
+
     abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
     abi_long ret;
 
@@ -231,7 +319,10 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             ret = -1;
             break;
     }
-
+    /* 添加醒目的系统调用退出提示 - 调试阶段使用 */
+    RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===",
+            syscall_name, num, ret);
+    RR_INFO("===============================================================");    
     return ret;
 }
 
