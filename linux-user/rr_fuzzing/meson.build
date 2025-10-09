@@ -6,6 +6,8 @@ rr_fuzz_sources = files(
   'rr_main.c',
   'rr_record.c',
   'rr_replay.c',
+  'rr_replay_strace.c',
+  'rr_syscallparser.c',
   'rr_ipc.c',
   'rr_fork_server.c',
   'rr_fuzz_engine.c',

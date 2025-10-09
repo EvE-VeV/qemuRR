@@ -105,6 +105,7 @@ typedef struct {
 
     /* FD映射表 */
     GHashTable *fd_map;                 // record_fd -> replay_fd映射
+    GHashTable *addr_map;               // 地址映射(recorded_addr -> actual_addr)
 
     /* IPC通信 */
     int cmd_pipe_fd;                    // 命令管道
@@ -131,6 +132,14 @@ int rr_config_init(void);
 void rr_config_cleanup(void);
 void rr_config_print(void);
 const char *rr_config_get_mode_name(rr_mode_t mode);
+
+/* 地址映射管理函数 */
+void rr_add_addr_mapping(target_ulong recorded_addr, target_ulong actual_addr);
+target_ulong rr_get_mapped_addr(target_ulong recorded_addr);
+void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr);
+
+/* 全局变量 */
+extern target_ulong g_pending_mmap_recorded_addr;
 
 /**
  * 初始化RR框架

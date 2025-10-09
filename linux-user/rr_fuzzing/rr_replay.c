@@ -4,6 +4,7 @@
  */
 
 #include "rr_framework.h"
+#include <sys/mman.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdint.h>
@@ -58,9 +59,7 @@ int rr_start_replay(const char *trace_file)
         return -1;
     }
 
-    long header_end_pos = ftell(g_trace_file);
     RR_INFO("Trace contains %u syscall records", record_count);
-    RR_VERBOSE("Header ends at position %ld, ready to read records", header_end_pos);
 
     return 0;
 }
@@ -94,8 +93,6 @@ static syscall_record_t *read_next_record(void)
     syscall_record_t *record = g_malloc0(sizeof(syscall_record_t));
 
     /* 读取基本记录 - 逐字段读取以避免结构体对齐问题 */
-    long pos = ftell(g_trace_file);
-    RR_VERBOSE("READ_NEXT_RECORD: Reading record at file position %ld", pos);
 
     // 读取手动打包的二进制数据以匹配记录格式
     uint8_t buffer[8]; // 4字节index + 4字节syscall_nr
@@ -201,6 +198,25 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
             }
             break;
 
+#ifdef TARGET_NR_mmap
+        case TARGET_NR_mmap:
+#endif
+#ifdef TARGET_NR_mmap2
+        case TARGET_NR_mmap2:
+#endif
+            /* mmap的第5个参数（args[4]）是文件描述符 */
+            if (args[4] >= 0) {  /* 不是匿名映射 */
+                gpointer mapped_fd = g_hash_table_lookup(g_rr_framework->fd_map,
+                                                        GINT_TO_POINTER((int)args[4]));
+                if (mapped_fd) {
+                    RR_VERBOSE("FD_MAPPING: mmap fd %d -> %d", (int)args[4], GPOINTER_TO_INT(mapped_fd));
+                    args[4] = GPOINTER_TO_INT(mapped_fd);
+                } else {
+                    RR_WARN("FD_MAPPING: mmap fd %d not found in mapping table", (int)args[4]);
+                }
+            }
+            break;
+
         // 可以添加更多系统调用的FD映射处理
         default:
             break;
@@ -299,10 +315,11 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
             RR_ERROR("REPLAY_SYSCALL: End of trace reached at index %u", g_rr_framework->replay_index);
             return -1;
         }
-        fprintf(stderr, "DEBUG_rr_replay_syscall: Got record index=%u, syscall=%d, ret=%ld\n",
-                g_current_record->index, g_current_record->syscall_nr, g_current_record->retval);
-        RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%ld",
-                   g_current_record->index, g_current_record->syscall_nr, g_current_record->retval);
+        fprintf(stderr, "DEBUG_rr_replay_syscall: Got record index=%u, syscall=%d, ret=%d\n",
+                g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
+        RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
+                   g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
+                   
     }
 
     /* 智能同步 - 如果系统调用不匹配，继续读取直到找到匹配的 */
@@ -370,37 +387,88 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                 RR_VERBOSE("MMAP_REPLAY: Recorded failed mmap, forcing failure");
                 /* 这里我们不修改ret，让其保持为-1 */
             } else {
-                /* 原来记录成功，对于mmap我们采用混合策略：
-                 * 1. 不强制返回相同地址
-                 * 2. 让系统调用继续执行以分配实际内存
-                 * 3. 但确保程序行为一致性 */
-                fprintf(stderr, "DEBUG_MMAP_REPLAY: Recorded successful mmap, allowing normal execution\n");
-                RR_VERBOSE("MMAP_REPLAY: Allowing normal mmap execution for consistency");
+                /* 原来记录成功，采用强制成功策略：
+                 * 对于智能重放，确保程序执行路径的一致性比内存地址的准确性更重要 */
+                fprintf(stderr, "DEBUG_MMAP_REPLAY: Recorded successful mmap, ensuring success\n");
+                RR_VERBOSE("MMAP_REPLAY: Forcing success - recorded addr=0x%lx", (unsigned long)ret);
 
-                /* 注意：这里我们需要返回一个特殊值告诉上层代码：
-                 * "请执行原始的mmap系统调用，因为我们需要实际的内存分配"
-                 *
-                 * 在rr_main.c中：
-                 * if (rr_ret != -1) {
-                 *     ret = rr_ret;  // 使用replay的结果
-                 * } else {
-                 *     ret = do_syscall1(...);  // 执行原始系统调用
-                 * }
-                 */
-
-                /* 清理当前记录并手动递增索引，因为我们提前返回，
-                 * 不会执行到函数结尾的标准递增逻辑 */
-                for (int i = 0; i < 8; i++) {
-                    if (g_current_record->arg_data[i]) {
-                        g_free(g_current_record->arg_data[i]);
+                /* 智能策略：尝试让系统分配实际内存，但确保成功 */
+                fprintf(stderr, "DEBUG_MMAP_REPLAY: args[4]=%ld (fd), args[3]=0x%lx (flags)\n", args[4], args[3]);
+                if (args[4] == -1 || args[4] == (abi_long)4294967295UL) {
+                    /* 匿名映射：让系统正常分配，然后建立映射关系 */
+                    fprintf(stderr, "DEBUG_MMAP_REPLAY: Anonymous mapping detected\n");
+                    RR_VERBOSE("MMAP_REPLAY: Anonymous mapping, allowing normal allocation");
+                    g_pending_mmap_recorded_addr = (target_ulong)ret;
+                    
+                    /* 设置标记，表示这个记录已经被处理过了 */
+                    g_current_record->syscall_nr = -999;  /* 特殊标记，表示已处理 */
+                    /* 不清理记录，让正常流程处理索引递增和清理 */
+                    
+                    /* 返回-1让系统分配实际内存 */
+                    return -1;
+                } else {
+                    /* 文件映射：直接返回成功，跳过实际的mmap调用 */
+                    fprintf(stderr, "DEBUG_MMAP_REPLAY: File mapping detected, fd=%ld - FORCING SUCCESS\n", args[4]);
+                    RR_VERBOSE("MMAP_REPLAY: File mapping (fd=%d), forcing success without actual mmap", (int)args[4]);
+                    
+                    /* 分配一块匿名内存作为替代 */
+                    void *fallback_addr = mmap(NULL, args[1], args[2], MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if (fallback_addr != MAP_FAILED) {
+                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Fallback allocation successful at %p\n", fallback_addr);
+                        g_pending_mmap_recorded_addr = (target_ulong)ret;
+                        
+                        /* 清理当前记录并正确递增索引 */
+                        for (int i = 0; i < 8; i++) {
+                            if (g_current_record->arg_data[i]) {
+                                g_free(g_current_record->arg_data[i]);
+                            }
+                        }
+                        g_free(g_current_record);
+                        g_current_record = NULL;
+                        g_rr_framework->replay_index++;
+                        
+                        RR_VERBOSE("REPLAY_SYSCALL: Successfully handled mmap fallback %u: %d -> %p",
+                                   g_rr_framework->replay_index - 1, num, fallback_addr);
+                        /* 直接返回分配的地址 */
+                        return (abi_long)fallback_addr;
+                    } else {
+                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Fallback allocation failed, trying conversion\n");
+                        
+                        /* 将文件映射转换为匿名映射 */
+                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Converting to anonymous - before: addr=0x%lx, len=%ld, prot=0x%lx, flags=0x%lx, fd=%ld, offset=%ld\n", 
+                                args[0], args[1], args[2], args[3], args[4], args[5]);
+                        
+                        /* 清理可能有问题的标志位 */
+                        abi_long original_flags = args[3];
+                        args[3] = 0;                            /* 清空所有标志 */
+                        args[3] |= MAP_PRIVATE;                  /* 设置为私有映射 */
+                        args[3] |= MAP_ANONYMOUS;                /* 添加匿名标志 */
+                        
+                        /* 保留一些可能有用的标志 */
+                        if (original_flags & MAP_FIXED) {
+                            /* 不保留MAP_FIXED，让系统选择地址 */
+                        }
+                        if (original_flags & MAP_GROWSDOWN) {
+                            args[3] |= MAP_GROWSDOWN;
+                        }
+                        
+                        args[4] = -1;                           /* 设置fd为-1 */
+                        args[5] = 0;                            /* 偏移量设为0 */
+                        args[0] = 0;                            /* 让系统选择地址 */
+                        
+                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Converting to anonymous - after: addr=0x%lx, len=%ld, prot=0x%lx, flags=0x%lx, fd=%ld, offset=%ld\n", 
+                                args[0], args[1], args[2], args[3], args[4], args[5]);
+                        
+                        g_pending_mmap_recorded_addr = (target_ulong)ret;
+                        
+                        /* 设置标记，表示这个记录已经被处理过了 */
+                        g_current_record->syscall_nr = -999;  /* 特殊标记，表示已处理 */
+                        /* 不清理记录，让正常流程处理索引递增和清理 */
+                        
+                        /* 返回-1让系统执行修改后的mmap */
+                        return -1;
                     }
                 }
-                g_free(g_current_record);
-                g_current_record = NULL;
-                g_rr_framework->replay_index++; /* 必须手动递增，因为return -1跳过函数结尾 */
-
-                /* 返回-1让调用者执行原始mmap */
-                return -1;
             }
             break;
 

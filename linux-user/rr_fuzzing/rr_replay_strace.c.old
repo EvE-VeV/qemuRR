@@ -1,0 +1,609 @@
+/**
+ * RR-Fuzz Strace重放模块 - 重新设计版本
+ * 核心原则: 真实执行 + 句柄映射
+ * 
+ * 设计理念:
+ * 1. 所有系统调用都真实执行（返回-1给QEMU）
+ * 2. 只记录和映射句柄（FD/地址/PID）
+ * 3. 严格按序匹配，不允许跳过
+ * 4. 只在非确定性输入时记录数据
+ */
+
+#include "rr_framework.h"
+#include "rr_syscallparser.h"
+#include "rr_replay_strace.h"
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+
+/* ==================== 系统调用名称映射 ==================== */
+
+/* 使用当前的get_syscall_name实现 */
+static const char* get_syscall_name(int syscall_nr) {
+    switch (syscall_nr) {
+        case 0: return "read";
+        case 1: return "write";
+        case 2: return "open";
+        case 3: return "close";
+        case 4: return "stat";
+        case 5: return "fstat";
+        case 6: return "lstat";
+        case 8: return "lseek";
+        case 9: return "mmap";
+        case 10: return "mprotect";
+        case 11: return "munmap";
+        case 12: return "brk";
+        case 13: return "rt_sigaction";
+        case 14: return "rt_sigprocmask";
+        case 15: return "rt_sigreturn";
+        case 16: return "ioctl";
+        case 17: return "pread64";
+        case 18: return "pwrite64";
+        case 19: return "readv";
+        case 20: return "writev";
+        case 21: return "access";
+        case 22: return "pipe";
+        case 39: return "getpid";
+        case 63: return "uname";
+        case 158: return "arch_prctl";
+        case 221: return "fadvise64";
+        case 231: return "exit_group";
+        case 257: return "openat";
+        case 262: return "newfstatat";
+        case 272: return "set_tid_address";
+        case 273: return "set_robust_list";
+        case 302: return "prlimit64";
+        case 318: return "getrandom";
+        case 334: return "rseq";
+        default: 
+            return NULL;
+    }
+}
+
+/* ==================== FD映射系统 ==================== */
+
+#define MAX_FD_MAPPINGS 256
+
+typedef struct fd_mapping {
+    int recorded_fd;      // 记录时的FD
+    int actual_fd;        // 实际的FD（真实打开的）
+    struct fd_mapping *next;
+} fd_mapping_t;
+
+static fd_mapping_t *g_fd_mappings[MAX_FD_MAPPINGS] = {NULL};
+
+static int hash_fd(int fd) {
+    return (unsigned int)fd % MAX_FD_MAPPINGS;
+}
+
+/**
+ * 添加FD映射
+ */
+static void add_fd_mapping(int recorded_fd, int actual_fd) {
+    int hash = hash_fd(recorded_fd);
+    
+    // 检查是否已存在
+    fd_mapping_t *existing = g_fd_mappings[hash];
+    while (existing) {
+        if (existing->recorded_fd == recorded_fd) {
+            // 更新映射
+            existing->actual_fd = actual_fd;
+            RR_VERBOSE("FD mapping updated: %d -> %d", recorded_fd, actual_fd);
+            return;
+        }
+        existing = existing->next;
+    }
+    
+    // 添加新映射
+    fd_mapping_t *mapping = malloc(sizeof(fd_mapping_t));
+    if (mapping) {
+        mapping->recorded_fd = recorded_fd;
+        mapping->actual_fd = actual_fd;
+        mapping->next = g_fd_mappings[hash];
+        g_fd_mappings[hash] = mapping;
+        RR_VERBOSE("FD mapping added: %d -> %d", recorded_fd, actual_fd);
+    }
+}
+
+/**
+ * 获取映射的FD
+ */
+static int get_fd_mapping(int recorded_fd) {
+    // 标准FD不映射
+    if (recorded_fd <= 2) {
+        return recorded_fd;
+    }
+    
+    int hash = hash_fd(recorded_fd);
+    fd_mapping_t *mapping = g_fd_mappings[hash];
+    while (mapping) {
+        if (mapping->recorded_fd == recorded_fd) {
+            return mapping->actual_fd;
+        }
+        mapping = mapping->next;
+    }
+    
+    // 未找到映射，返回原值（可能是新的FD）
+    RR_VERBOSE("No mapping found for FD %d, using original", recorded_fd);
+    return recorded_fd;
+}
+
+/**
+ * 移除FD映射
+ */
+static void remove_fd_mapping(int recorded_fd) {
+    int hash = hash_fd(recorded_fd);
+    fd_mapping_t **mapping = &g_fd_mappings[hash];
+    while (*mapping) {
+        if ((*mapping)->recorded_fd == recorded_fd) {
+            fd_mapping_t *to_free = *mapping;
+            *mapping = (*mapping)->next;
+            free(to_free);
+            RR_VERBOSE("FD mapping removed: %d", recorded_fd);
+            return;
+        }
+        mapping = &(*mapping)->next;
+    }
+}
+
+/**
+ * 清理所有FD映射
+ */
+static void cleanup_fd_mappings(void) {
+    for (int i = 0; i < MAX_FD_MAPPINGS; i++) {
+        fd_mapping_t *mapping = g_fd_mappings[i];
+        while (mapping) {
+            fd_mapping_t *next = mapping->next;
+            free(mapping);
+            mapping = next;
+        }
+        g_fd_mappings[i] = NULL;
+    }
+}
+
+/* ==================== 全局状态 ==================== */
+
+static rr_strace_parser_t *g_strace_parser = NULL;
+
+typedef struct {
+    bool enabled;
+    bool strict_mode;
+    
+    // 统计信息
+    uint64_t total_syscalls;
+    uint64_t matched_syscalls;
+    uint64_t error_syscalls;
+    
+    // 映射表初始化标志
+    int fd_map_initialized;
+    
+    // trace文件信息
+    char *trace_filename;
+    size_t current_record_index;
+} rr_strace_replay_state_t;
+
+static rr_strace_replay_state_t g_strace_state = {0};
+
+/* 强制使用直接日志输出，确保可见性 */
+#ifdef RR_ERROR
+#undef RR_ERROR
+#endif
+#ifdef RR_INFO
+#undef RR_INFO
+#endif
+#ifdef RR_VERBOSE
+#undef RR_VERBOSE
+#endif
+#ifdef RR_WARN
+#undef RR_WARN
+#endif
+
+#define RR_ERROR(fmt, ...)   fprintf(stderr, "[STRACE-ERROR] " fmt "\n", ##__VA_ARGS__)
+#define RR_INFO(fmt, ...)    fprintf(stderr, "[STRACE-INFO] " fmt "\n", ##__VA_ARGS__)
+#define RR_VERBOSE(fmt, ...) fprintf(stderr, "[STRACE-VERBOSE] " fmt "\n", ##__VA_ARGS__)
+#define RR_WARN(fmt, ...)    fprintf(stderr, "[STRACE-WARN] " fmt "\n", ##__VA_ARGS__)
+
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+
+/* ==================== 初始化和清理 ==================== */
+
+/**
+ * 初始化strace重放模块
+ */
+int rr_strace_replay_init(const char *trace_file) {
+    if (!trace_file) {
+        RR_ERROR("STRACE_REPLAY: trace_file is NULL");
+        return -1;
+    }
+    
+    RR_INFO("STRACE_REPLAY: Initializing with trace file: %s", trace_file);
+    
+    memset(&g_strace_state, 0, sizeof(g_strace_state));
+    g_strace_state.trace_filename = strdup(trace_file);
+    if (!g_strace_state.trace_filename) {
+        return -1;
+    }
+    
+    g_strace_state.strict_mode = true;  // 严格模式
+    
+    // 初始化FD映射
+    cleanup_fd_mappings();
+    g_strace_state.fd_map_initialized = 1;
+    
+    // 初始化解析器
+    g_strace_parser = rr_strace_parser_init(trace_file);
+    if (!g_strace_parser) {
+        RR_ERROR("STRACE_REPLAY: Failed to initialize parser");
+        free(g_strace_state.trace_filename);
+        return -1;
+    }
+    
+    // 加载strace文件
+    if (rr_strace_parser_load(g_strace_parser) < 0) {
+        RR_ERROR("STRACE_REPLAY: Failed to load trace file");
+        rr_strace_parser_cleanup(g_strace_parser);
+        g_strace_parser = NULL;
+        free(g_strace_state.trace_filename);
+        return -1;
+    }
+    
+    size_t total_records, current_index;
+    rr_strace_get_stats(g_strace_parser, &total_records, &current_index);
+    
+    g_strace_state.enabled = true;
+    
+    RR_INFO("STRACE_REPLAY: Initialized successfully");
+    RR_INFO("STRACE_REPLAY: - Total records: %zu", total_records);
+    RR_INFO("STRACE_REPLAY: - Strict mode: YES");
+    
+    return 0;
+}
+
+/**
+ * 清理strace重放模块
+ */
+void rr_strace_replay_cleanup(void) {
+    if (!g_strace_state.enabled) {
+        return;
+    }
+    
+    RR_INFO("STRACE_REPLAY: === Final Statistics ===");
+    RR_INFO("STRACE_REPLAY: Total: %lu, Matched: %lu, Errors: %lu",
+            g_strace_state.total_syscalls,
+            g_strace_state.matched_syscalls,
+            g_strace_state.error_syscalls);
+    
+    if (g_strace_parser) {
+        rr_strace_parser_cleanup(g_strace_parser);
+        g_strace_parser = NULL;
+    }
+    
+    if (g_strace_state.fd_map_initialized) {
+        cleanup_fd_mappings();
+        g_strace_state.fd_map_initialized = 0;
+    }
+    
+    if (g_strace_state.trace_filename) {
+        free(g_strace_state.trace_filename);
+        g_strace_state.trace_filename = NULL;
+    }
+    
+    memset(&g_strace_state, 0, sizeof(g_strace_state));
+}
+
+/* ==================== 系统调用匹配 ==================== */
+
+/**
+ * 等价系统调用判断
+ */
+static bool are_equivalent_syscalls(const char *name1, const char *name2) {
+    if (strcmp(name1, name2) == 0) {
+        return true;
+    }
+    
+    // 定义等价关系
+    static const struct {
+        const char *name1;
+        const char *name2;
+    } equivalents[] = {
+        {"write", "writev"},
+        {"read", "readv"},
+        {"open", "openat"},
+        {"stat", "fstat"},
+        {"stat", "newfstatat"},
+        {"lstat", "newfstatat"},
+        {NULL, NULL}
+    };
+    
+    for (int i = 0; equivalents[i].name1 != NULL; i++) {
+        if ((strcmp(name1, equivalents[i].name1) == 0 &&
+             strcmp(name2, equivalents[i].name2) == 0) ||
+            (strcmp(name1, equivalents[i].name2) == 0 &&
+             strcmp(name2, equivalents[i].name1) == 0)) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * 严格的序列匹配：获取下一条记录
+ * 不允许跳过，必须完全匹配
+ */
+static rr_strace_record_t *get_next_record_strict(int syscall_nr, const char *syscall_name) {
+    rr_strace_record_t *record = rr_strace_parser_get_next(g_strace_parser);
+    
+    if (!record) {
+        RR_ERROR("STRACE_REPLAY: No more records (exhausted at #%zu)",
+                g_strace_state.current_record_index);
+        return NULL;
+    }
+    
+    g_strace_state.current_record_index++;
+    
+    // 严格验证：名称必须匹配
+    if (!are_equivalent_syscalls(syscall_name, record->syscall_name)) {
+        RR_ERROR("STRACE_REPLAY: Sequence mismatch at record #%zu",
+                g_strace_state.current_record_index - 1);
+        RR_ERROR("  Expected: %s", record->syscall_name);
+        RR_ERROR("  Got: %s (%d)", syscall_name, syscall_nr);
+        RR_ERROR("  This indicates execution path divergence!");
+        return NULL;
+    }
+    
+    RR_VERBOSE("STRACE_REPLAY: Matched record #%zu: %s",
+              g_strace_state.current_record_index - 1,
+              syscall_name);
+    
+    return record;
+}
+
+/* ==================== 句柄映射辅助函数 ==================== */
+
+/**
+ * 映射输入参数中的FD
+ */
+static void map_input_fd_args(int syscall_nr, abi_long *args) {
+    switch (syscall_nr) {
+        case 0:   // read
+        case 1:   // write
+        case 3:   // close
+        case 5:   // fstat
+        case 8:   // lseek
+        case 16:  // ioctl
+        case 17:  // pread64
+        case 18:  // pwrite64
+        case 19:  // readv
+        case 20:  // writev
+            // 第一个参数是FD
+            args[0] = get_fd_mapping(args[0]);
+            RR_VERBOSE("Mapped FD in args[0]: original=%ld, mapped=%ld",
+                      args[0], (abi_long)get_fd_mapping(args[0]));
+            break;
+            
+        case 257: // openat
+            // 第一个参数是dirfd
+            if (args[0] != AT_FDCWD) {
+                args[0] = get_fd_mapping(args[0]);
+            }
+            break;
+            
+        case 9:   // mmap
+            // 第五个参数（args[4]）是FD
+            if (args[4] >= 0) {
+                abi_long mapped_fd = get_fd_mapping(args[4]);
+                RR_VERBOSE("Mapped FD in mmap: original=%ld, mapped=%ld",
+                          args[4], mapped_fd);
+                args[4] = mapped_fd;
+            }
+            break;
+            
+        case 262: // newfstatat
+            // 第一个参数是dirfd
+            if (args[0] != AT_FDCWD) {
+                args[0] = get_fd_mapping(args[0]);
+            }
+            break;
+    }
+}
+
+/**
+ * 处理系统调用返回后的句柄映射
+ * TODO: 需要在post_hook中实现
+ */
+__attribute__((unused))
+static void map_output_handles(int syscall_nr, rr_strace_record_t *record, abi_long actual_ret) {
+    switch (syscall_nr) {
+        case 2:   // open
+        case 257: // openat
+            // 如果成功打开，建立FD映射
+            if (actual_ret >= 0 && record->ret_value >= 0) {
+                add_fd_mapping(record->ret_value, actual_ret);
+            }
+            break;
+            
+        case 22:  // pipe
+            // pipe创建两个FD，需要特殊处理
+            // TODO: 需要解析record中的pipe FD
+            break;
+            
+        case 3:   // close
+            // 移除FD映射
+            if (actual_ret == 0) {
+                remove_fd_mapping(record->ret_value);
+            }
+            break;
+    }
+}
+
+/* ==================== 系统调用类型判断 ==================== */
+
+/**
+ * 判断是否是确定性系统调用
+ * 确定性调用可以返回固定值，不需要从记录读取
+ */
+static bool is_deterministic_syscall(int syscall_nr) {
+    switch (syscall_nr) {
+        case 39:  // getpid
+        case 186: // gettid
+        case 102: // getuid
+        case 104: // getgid
+        case 107: // geteuid
+        case 108: // getegid
+        case 110: // getppid
+        case 111: // getpgrp
+        case 272: // set_tid_address
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * 处理确定性系统调用
+ */
+static abi_long handle_deterministic_syscall(int syscall_nr) {
+    switch (syscall_nr) {
+        case 39:  // getpid
+        case 186: // gettid
+        case 272: // set_tid_address
+            return 12345;  // 固定PID
+            
+        case 102: // getuid
+        case 104: // getgid
+        case 107: // geteuid
+        case 108: // getegid
+            return 1000;   // 固定UID/GID
+            
+        case 110: // getppid
+            return 12344;  // 固定PPID
+            
+        case 111: // getpgrp
+            return 12345;  // 固定PGRP
+            
+        default:
+            return -1;
+    }
+}
+
+/* ==================== 主replay函数 ==================== */
+
+/**
+ * Strace重放的核心函数
+ * 
+ * 设计原则：
+ * 1. 严格按序匹配记录
+ * 2. 映射输入句柄
+ * 3. 真实执行系统调用（返回-1）
+ * 4. 映射输出句柄
+ */
+abi_long rr_replay_syscall_strace(CPUArchState *env, int num, abi_long *args) {
+    if (!g_strace_state.enabled) {
+        RR_ERROR("STRACE_REPLAY: Module not initialized");
+        return -1;
+    }
+    
+    g_strace_state.total_syscalls++;
+    
+    const char *syscall_name = get_syscall_name(num);
+    if (!syscall_name) {
+        RR_VERBOSE("STRACE_REPLAY: Unknown syscall %d, allowing execution", num);
+        return -1;  // 未知调用，让QEMU执行
+    }
+    
+    RR_VERBOSE("STRACE_REPLAY: Processing %s (%d)", syscall_name, num);
+    
+    // 1. 处理确定性系统调用（不需要记录）
+    if (is_deterministic_syscall(num)) {
+        RR_VERBOSE("STRACE_REPLAY: Deterministic syscall, returning fixed value");
+        return handle_deterministic_syscall(num);
+    }
+    
+    // 2. 严格获取下一条记录
+    rr_strace_record_t *record = get_next_record_strict(num, syscall_name);
+    if (!record) {
+        g_strace_state.error_syscalls++;
+        RR_ERROR("STRACE_REPLAY: Failed to get matching record");
+        // 严格模式下应该abort，但这里返回-1让程序继续
+        return -1;
+    }
+    
+    g_strace_state.matched_syscalls++;
+    
+    // 3. 映射输入句柄（FD等）
+    map_input_fd_args(num, args);
+    
+    // 4. 让QEMU真实执行系统调用
+    // 返回-1表示：继续执行，不拦截
+    RR_VERBOSE("STRACE_REPLAY: Allowing real execution of %s", syscall_name);
+    
+    // 注意：我们不能在这里直接调用真实的系统调用
+    // 因为我们在QEMU的拦截点
+    // 返回-1让do_syscall继续执行do_syscall1
+    
+    // 5. 输出句柄映射在post_hook中处理
+    // 这需要在rr_syscall_post_hook中完成
+    
+    return -1;  // 让QEMU真实执行
+}
+
+/**
+ * 系统调用执行后的hook
+ * 用于处理输出句柄的映射
+ */
+void rr_strace_syscall_post_hook(CPUArchState *env, int num, abi_long ret, abi_long *args) {
+    if (!g_strace_state.enabled) {
+        return;
+    }
+    
+    const char *syscall_name = get_syscall_name(num);
+    if (!syscall_name) {
+        return;
+    }
+    
+    // 获取当前记录（假设已经在pre-hook中移动了指针）
+    // 注意：这里需要特殊处理，因为get_next已经被调用了
+    // 一个简单的方法是在replay_syscall_strace中保存record到全局变量
+    
+    // TODO: 实现输出句柄映射
+    // 这需要重构代码结构，保存当前的record
+    
+    RR_VERBOSE("STRACE_REPLAY: Post-hook for %s, ret=%ld", syscall_name, ret);
+}
+
+/* ==================== 配置接口 ==================== */
+
+/**
+ * 检查strace replay是否启用
+ */
+bool rr_strace_replay_enabled(void) {
+    return g_strace_state.enabled;
+}
+
+/**
+ * 获取重放统计信息
+ */
+void rr_strace_get_replay_stats(uint64_t *total, uint64_t *matched, 
+                                uint64_t *skipped, uint64_t *errors) {
+    if (total) *total = g_strace_state.total_syscalls;
+    if (matched) *matched = g_strace_state.matched_syscalls;
+    if (skipped) *skipped = 0;  // 新设计不允许跳过
+    if (errors) *errors = g_strace_state.error_syscalls;
+}
+
+/**
+ * 打印当前状态
+ */
+void rr_strace_print_status(void) {
+    RR_INFO("STRACE_REPLAY: === Current Status ===");
+    RR_INFO("STRACE_REPLAY: Enabled: %s", g_strace_state.enabled ? "YES" : "NO");
+    RR_INFO("STRACE_REPLAY: Strict mode: YES");
+    RR_INFO("STRACE_REPLAY: Total syscalls: %lu", g_strace_state.total_syscalls);
+    RR_INFO("STRACE_REPLAY: Matched: %lu", g_strace_state.matched_syscalls);
+    RR_INFO("STRACE_REPLAY: Errors: %lu", g_strace_state.error_syscalls);
+}
