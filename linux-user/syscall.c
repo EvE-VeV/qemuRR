@@ -27,6 +27,7 @@
 
 #ifdef CONFIG_RR_FUZZING
 #include "rr_fuzzing/rr_framework.h"
+#include "rr_fuzzing/rr_replay_strace.h"
 #endif
 #include "target_mman.h"
 #include "exec/page-protection.h"
@@ -14001,15 +14002,50 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
 
 #ifdef CONFIG_RR_FUZZING
     /* RR-Fuzz系统调用拦截 */
-    abi_long rr_ret = rr_do_syscall(cpu_env, num, arg1, arg2, arg3, arg4,
-                                   arg5, arg6, arg7, arg8);
+    abi_long orig_args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+    abi_long rr_args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+    abi_long rr_ret = rr_do_syscall(cpu_env, num, &rr_args[0], &rr_args[1], 
+                                   &rr_args[2], &rr_args[3], &rr_args[4], 
+                                   &rr_args[5], &rr_args[6], &rr_args[7]);
+    
+    /* 比较参数是否被修改 */
+    bool args_modified = false;
+    for (int i = 0; i < 8; i++) {
+        if (orig_args[i] != rr_args[i]) {
+            args_modified = true;
+            break;
+        }
+    }
+    
+    /* 如果参数被修改，输出详细信息 */
+    if (args_modified) {
+        fprintf(stderr, "[PARAM_MODIFIED] Syscall %d: Parameters were modified by RR framework:\n", num);
+        for (int i = 0; i < 8; i++) {
+            if (orig_args[i] != rr_args[i]) {
+                fprintf(stderr, "  arg[%d]: %ld -> %ld (changed)\n", i, orig_args[i], rr_args[i]);
+            } else if (orig_args[i] != 0) {  /* 只显示非零的未修改参数 */
+                fprintf(stderr, "  arg[%d]: %ld (unchanged)\n", i, orig_args[i]);
+            }
+        }
+        fflush(stderr);
+    }
+    
     if (rr_ret != -1) {
         /* RR框架处理了这个系统调用，直接返回结果 */
         ret = rr_ret;
     } else {
-        /* 执行原始系统调用 */
-        ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
-                          arg5, arg6, arg7, arg8);
+        /* 执行系统调用，使用RR框架可能修改过的参数 */
+        ret = do_syscall1(cpu_env, num, rr_args[0], rr_args[1], rr_args[2], 
+                          rr_args[3], rr_args[4], rr_args[5], rr_args[6], rr_args[7]);
+        
+        /* 调用POST-HOOK处理返回值和FD映射 */
+        rr_strace_syscall_post_hook_optimized(cpu_env, num, ret, rr_args);
+        
+        /* 如果参数被修改，也输出执行结果 */
+        if (args_modified) {
+            fprintf(stderr, "[PARAM_MODIFIED] Syscall %d executed with modified args, result: %ld\n", num, ret);
+            fflush(stderr);
+        }
     }
 #else
     ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,

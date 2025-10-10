@@ -6,7 +6,10 @@ rr_fuzz_sources = files(
   'rr_main.c',
   'rr_record.c',
   'rr_replay.c',
-  'rr_replay_strace.c',
+  # 'rr_replay_strace.c',  # 禁用原版，使用优化版本
+  'rr_replay_strace_optimized.c',  # 启用优化版本
+  'rr_syscall_dispatch.c',
+  'rr_mapping_manager.c',
   'rr_syscallparser.c',
   'rr_ipc.c',
   'rr_fork_server.c',

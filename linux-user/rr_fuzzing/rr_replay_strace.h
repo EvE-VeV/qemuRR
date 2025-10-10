@@ -40,6 +40,11 @@ void rr_strace_replay_print_stats(void);
 void rr_strace_save_stats_to_file(const char *filename);
 
 /**
+ * 设置重放模式
+ */
+void rr_strace_set_pure_replay_mode(bool enabled);
+
+/**
  * strace重放的主要系统调用处理函数
  * 这个函数可以替代原有的 rr_replay_syscall
  * @param env CPU架构状态
@@ -63,6 +68,15 @@ bool rr_strace_replay_enabled(void);
  * @param args 系统调用参数数组
  */
 void rr_strace_syscall_post_hook(CPUArchState *env, int num, abi_long ret, abi_long *args);
+
+/**
+ * 优化版系统调用执行后的hook（用于FD映射和返回值处理）
+ * @param env CPU架构状态
+ * @param num 系统调用号
+ * @param ret 系统调用返回值
+ * @param args 系统调用参数数组
+ */
+void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long ret, abi_long *args);
 
 /* ==================== 配置接口 ==================== */
 

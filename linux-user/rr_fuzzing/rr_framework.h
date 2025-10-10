@@ -163,8 +163,8 @@ static inline bool rr_framework_enabled(void) {
  * 这是被do_syscall调用的核心函数
  */
 abi_long rr_do_syscall(CPUArchState *env, int num,
-                       abi_long arg1, abi_long arg2, abi_long arg3, abi_long arg4,
-                       abi_long arg5, abi_long arg6, abi_long arg7, abi_long arg8);
+                       abi_long *arg1, abi_long *arg2, abi_long *arg3, abi_long *arg4,
+                       abi_long *arg5, abi_long *arg6, abi_long *arg7, abi_long *arg8);
 
 /**
  * 系统调用执行后的Hook函数

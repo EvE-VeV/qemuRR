@@ -264,8 +264,8 @@ void rr_framework_cleanup(void)
  * 这是do_syscall调用的入口点
  */
 abi_long rr_do_syscall(CPUArchState *env, int num,
-                       abi_long arg1, abi_long arg2, abi_long arg3, abi_long arg4,
-                       abi_long arg5, abi_long arg6, abi_long arg7, abi_long arg8)
+                       abi_long *arg1, abi_long *arg2, abi_long *arg3, abi_long *arg4,
+                       abi_long *arg5, abi_long *arg6, abi_long *arg7, abi_long *arg8)
 {
     RR_VERBOSE("RR_DO_SYSCALL: Called for syscall %d, enabled=%d", num, rr_framework_enabled());
 
@@ -316,7 +316,7 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             break; // 继续正常的record/replay逻辑
     }
 
-    abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+    abi_long args[8] = {*arg1, *arg2, *arg3, *arg4, *arg5, *arg6, *arg7, *arg8};
     abi_long ret;
 
     switch (g_rr_framework->mode) {
@@ -329,9 +329,9 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             /* 重放模式：根据类型选择重放方式 */
             RR_VERBOSE("RR_DO_SYSCALL: Checking if strace replay is enabled...");
             if (rr_strace_replay_enabled()) {
-                RR_ERROR("RR_DO_SYSCALL: ABOUT TO CALL rr_replay_syscall_strace for syscall %d", num);
+                RR_VERBOSE("RR_DO_SYSCALL: ABOUT TO CALL rr_replay_syscall_strace for syscall %d", num);
                 ret = rr_replay_syscall_strace(env, num, args);
-                RR_ERROR("RR_DO_SYSCALL: rr_replay_syscall_strace returned %d", (int)ret);
+                RR_VERBOSE("RR_DO_SYSCALL: rr_replay_syscall_strace returned %d", (int)ret);
             } else {
                 RR_VERBOSE("RR_DO_SYSCALL: STRACE REPLAY DISABLED - Calling rr_replay_syscall for syscall %d", num);
                 ret = rr_replay_syscall(env, num, args);
@@ -358,6 +358,10 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             ret = -1;
             break;
     }
+    /* 将可能修改过的参数写回到指针中 */
+    *arg1 = args[0]; *arg2 = args[1]; *arg3 = args[2]; *arg4 = args[3];
+    *arg5 = args[4]; *arg6 = args[5]; *arg7 = args[6]; *arg8 = args[7];
+    
     /* 添加醒目的系统调用退出提示 - 调试阶段使用 */
     RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %d ===",
             syscall_name, num, (int)ret);
