@@ -255,13 +255,30 @@ rr_fuzzing/
 
 ## 📖 文档资源
 
+### 用户文档
+
 | 文档 | 说明 |
 |------|------|
 | [README.md](README.md) | 项目概述和完整使用指南（本文）|
 | [quickstart.md](quickstart.md) | 5分钟快速开始教程 |
 | [test/TESTING.md](test/TESTING.md) | 完整测试指南和验证清单 |
-| [FIXES_SUMMARY.md](FIXES_SUMMARY.md) | 关键问题修复总结 |
-| [开始验证.txt](开始验证.txt) | 中文快速指引 |
+
+### 技术分析
+
+| 文档 | 行数 | 说明 |
+|------|------|------|
+| [ANALYSIS.md](ANALYSIS.md) | ~600 | **RR-Fuzz 与 EnvFuzz 对比分析**（推荐阅读）|
+| [IMPROVEMENTS.md](IMPROVEMENTS.md) | ~550 | **改进实施指南**（包含完整代码示例）|
+| [architecture_analysis.md](architecture_analysis.md) | 1474 | RR-Fuzz 架构详细分析 |
+| [execution_flow_analysis.md](execution_flow_analysis.md) | 2167 | 执行流程详解 |
+| [ipc_communication_summary.md](ipc_communication_summary.md) | 361 | IPC 机制说明 |
+
+### EnvFuzz 参考
+
+| 文档 | 行数 | 说明 |
+|------|------|------|
+| [envfuzz_analysis_and_insights.md](envfuzz_analysis_and_insights.md) | 1412 | EnvFuzz 技术深度分析 |
+| [envfuzz_claims_verification.md](envfuzz_claims_verification.md) | 1028 | EnvFuzz 声称验证 |
 
 ## 🎉 完整示例
 

@@ -13,7 +13,7 @@ test/*.log
 test/*.strace
 test/rr_test_file.txt
 test/simple_qemu_test.log
-
+compare/
 # Python缓存
 __pycache__/
 *.pyc
