@@ -1,0 +1,41 @@
+# 编译产物
+*.o
+*.a
+*.so
+test/test_fuzz_target
+test/simple_test
+test_fixed
+test_debug
+
+# 测试日志和临时文件
+*.log
+test/*.log
+test/*.strace
+test/rr_test_file.txt
+test/simple_qemu_test.log
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 编辑器临时文件
+*~
+.*.swp
+.*.swo
+*.bak
+.vscode/
+.idea/
+
+# 共享内存文件
+/dev/shm/rr_*
+
+# IPC管道
+/tmp/rr_cmd_pipe*
+/tmp/rr_status_pipe*
+
+# 调试文件
+core
+vgcore.*
+

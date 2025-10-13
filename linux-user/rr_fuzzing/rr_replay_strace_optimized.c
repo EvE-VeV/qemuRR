@@ -8,6 +8,7 @@
 #include "rr_replay_strace.h"
 #include "rr_syscall_dispatch.h"
 #include "rr_mapping_manager.h"
+#include "qemu.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -238,18 +239,89 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
         
         g_strace_state.current_record_index++;
         
-        // 精确匹配
-        if (strcmp(record->syscall_name, syscall_name) == 0) {
+        // === 智能匹配算法 - 三级策略 ===
+        
+        // Level 0: syscall号必须匹配
+        if (strcmp(record->syscall_name, syscall_name) != 0) {
+            skip_count++;
+            continue;
+        }
+        
+        // Level 1: 探测性匹配 (PROBE)
+        // 识别"探测性"syscall: 返回ENOENT的文件访问
+        if ((syscall_nr == 257 || syscall_nr == 262 || syscall_nr == 21) &&  // openat/newfstatat/access
+            record->ret_value == -2) {  // ENOENT
+            
+            RR_VERBOSE("✓ Probe match: %s returned ENOENT", syscall_name);
             if (skip_count > 0) {
-                RR_INFO("Optimized match successful after skipping %d records: %s", 
-                        skip_count, record->syscall_name);
-            } else {
-                RR_VERBOSE("Direct match successful: %s", record->syscall_name);
+                RR_INFO("Probe match successful after skipping %d records: %s", 
+                        skip_count, syscall_name);
             }
             return record;
         }
         
-        skip_count++;
+        // Level 2: 语义匹配 (SEMANTIC)
+        
+        // openat 成功的情况 - 只检查访问模式
+        if (syscall_nr == 257 && record->ret_value >= 0) {
+            // 只检查访问模式（flags的低2位）
+            if (record->arg_count > 2 && args) {
+                int record_mode = record->args[2].value & 0x3;  // O_ACCMODE
+                int current_mode = args[2] & 0x3;
+                
+                if (record_mode == current_mode) {
+                    RR_VERBOSE("✓ Semantic match: openat mode=%s", 
+                               record_mode == 0 ? "RDONLY" : 
+                               record_mode == 1 ? "WRONLY" : "RDWR");
+                    if (skip_count > 0) {
+                        RR_INFO("Semantic match successful after skipping %d records: %s", 
+                                skip_count, syscall_name);
+                    }
+                    return record;
+                }
+            }
+        }
+        
+        // newfstatat - 只检查flags
+        if (syscall_nr == 262) {
+            if (record->arg_count > 3 && args) {
+                if (args[3] == record->args[3].value) {  // flags相同
+                    RR_VERBOSE("✓ Semantic match: newfstatat flags=0x%lx", args[3]);
+                    if (skip_count > 0) {
+                        RR_INFO("Semantic match successful after skipping %d records: %s", 
+                                skip_count, syscall_name);
+                    }
+                    return record;
+                }
+            }
+        }
+        
+        // mmap - 检查prot和flags，忽略地址和长度
+        if (syscall_nr == 9) {
+            if (record->arg_count > 3 && args) {
+                bool prot_match = (args[2] == record->args[2].value);  // prot
+                bool flags_match = (args[3] == record->args[3].value); // flags
+                
+                if (prot_match && flags_match) {
+                    RR_VERBOSE("✓ Semantic match: mmap prot=0x%lx flags=0x%lx", 
+                               args[2], args[3]);
+                    if (skip_count > 0) {
+                        RR_INFO("Semantic match successful after skipping %d records: %s", 
+                                skip_count, syscall_name);
+                    }
+                    return record;
+                }
+            }
+        }
+        
+        // Level 3: 精确匹配（兜底策略）
+        // syscall号已经匹配，直接返回
+        RR_VERBOSE("✓ Exact match: %s", syscall_name);
+        if (skip_count > 0) {
+            RR_INFO("Exact match successful after skipping %d records: %s", 
+                    skip_count, syscall_name);
+        }
+        return record;
     }
     
     RR_ERROR("Optimized match failed after %d attempts for %s", max_skip + 1, syscall_name);
@@ -403,6 +475,15 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         const char *syscall_name = rr_get_syscall_name_fast(num);
         RR_VERBOSE("Trace exhausted, fallback execution for %s (%zu total fallbacks)", 
                   syscall_name ? syscall_name : "unknown", g_strace_state.fallback_syscalls);
+        
+        /* 🔥 关键修复：如果是fuzzing模式的子进程，trace耗尽后应该退出 */
+        if (g_rr_framework && 
+            g_rr_framework->mode == RR_MODE_FUZZING && 
+            g_rr_framework->child_pid == 0) {
+            RR_INFO("🎯 Trace exhausted in child process (PID=%d), exiting normally", getpid());
+            exit(0);  // 子进程正常退出，父进程的waitpid()会返回
+        }
+        
         return -1;
     }
     
@@ -423,6 +504,16 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         const char *syscall_name = rr_get_syscall_name_fast(num);
         RR_WARN("No matching record found for %s (%d)", 
                 syscall_name ? syscall_name : "unknown", num);
+        
+        /* 🔥 如果连续多个系统调用找不到匹配，可能trace已经偏移，子进程应该退出 */
+        if (g_rr_framework && 
+            g_rr_framework->mode == RR_MODE_FUZZING && 
+            g_rr_framework->child_pid == 0 && 
+            g_strace_state.error_syscalls > 5) {  // 容忍5次失败
+            RR_WARN("🎯 Too many unmatched syscalls in child process (%zu errors), exiting", 
+                   g_strace_state.error_syscalls);
+            exit(1);  // 异常退出，父进程会检测到
+        }
         
         if (g_strace_state.skip_unmatched) {
             return -1;
@@ -477,29 +568,66 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     }
     
     // 使用优化的参数处理
-    // 应用记录的参数和FD映射
+    // 步骤1: 应用记录的参数和FD映射（来自trace）
     rr_apply_syscall_args_optimized(record, args);
     rr_apply_fd_mapping_optimized(num, args);
     
-    // 输出参数修改信息
+    // 输出trace参数修改信息
     bool args_modified = false;
     for (int i = 0; i < 8; i++) {
         if (orig_args[i] != args[i]) {
             args_modified = true;
-            RR_DEBUG("PARAM_OPTIMIZED: %s arg[%d] %ld -> %ld", 
+            RR_DEBUG("TRACE_REPLAY: %s arg[%d] %ld -> %ld", 
                     record->syscall_name, i, orig_args[i], args[i]);
         }
     }
     
     if (args_modified) {
-        RR_DEBUG("PARAM_OPTIMIZED: %s parameter replacement completed", record->syscall_name);
+        RR_DEBUG("TRACE_REPLAY: %s parameter replacement from trace completed", record->syscall_name);
+    }
+    
+    /* ===== 🔥 关键修复：Fuzz变异注入点 ===== */
+    /* 
+     * 步骤2: 在Fuzzing模式下，对已重放的参数进行变异
+     * 
+     * 执行顺序：
+     * 1. 参数从trace恢复（上面完成）
+     * 2. 应用Fuzz变异（这里）
+     * 3. 执行真实系统调用（下面返回-1）
+     * 
+     * 注意：g_rr_framework可能为NULL（如果使用纯strace模式）
+     */
+    if (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING) {
+        // 使用strace的记录索引作为syscall_index
+        uint32_t syscall_index = (uint32_t)g_strace_state.current_record_index;
+        
+        RR_VERBOSE("Applying fuzz mutations at syscall_index=%u (%s)", 
+                   syscall_index, record->syscall_name);
+        
+        // 调用Fuzz引擎应用变异
+        rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+        
+        // 检测参数是否被变异
+        bool fuzz_modified = false;
+        for (int i = 0; i < 8; i++) {
+            if (args_modified && orig_args[i] != args[i]) {
+                fuzz_modified = true;
+                RR_VERBOSE("FUZZ_MUTATED: %s arg[%d] changed by fuzzer", 
+                          record->syscall_name, i);
+            }
+        }
+        
+        if (fuzz_modified) {
+            RR_INFO("🎯 FUZZING: %s at index %u - parameters mutated", 
+                   record->syscall_name, syscall_index);
+        }
     }
     
     // 保存当前记录供POST-HOOK使用
     g_current_record = record;
     
-    RR_VERBOSE("Optimized hybrid mode: letting QEMU execute real syscall with replayed args");
-    return -1;  // 让QEMU执行真实系统调用
+    RR_VERBOSE("Hybrid replay+fuzz mode: executing real syscall with modified args");
+    return -1;  // 返回-1让QEMU执行真实系统调用
 }
 
 void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long ret, abi_long *args) {

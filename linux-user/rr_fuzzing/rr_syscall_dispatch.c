@@ -4,6 +4,7 @@
  */
 
 #include "rr_syscall_dispatch.h"
+#include "rr_mapping_manager.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -55,14 +56,32 @@ static void apply_file_io_fd_mapping(const char *syscall_name, abi_long *args) {
 static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
     
-    if (strcmp(record->syscall_name, "openat") == 0) {
-        if (ret >= 0 && record->ret_value >= 0) {
-            rr_fd_mapping_add(record->ret_value, ret);
-        }
-    } else if (strcmp(record->syscall_name, "close") == 0) {
-        if (ret == 0 && record->ret_value == 0) {
-            rr_fd_mapping_remove((int)record->args[0].value);
-        }
+    // openat/open 成功后，建立FD映射: recorded_fd → actual_fd
+    if ((strcmp(record->syscall_name, "openat") == 0 || 
+         strcmp(record->syscall_name, "open") == 0) && ret >= 0) {
+        
+        abi_long recorded_fd = record->ret_value;  // trace中的FD值
+        abi_long actual_fd = ret;                   // 真实返回的FD值
+        
+        // ✅ 建立映射: recorded_fd → actual_fd
+        rr_fd_mapping_add(recorded_fd, actual_fd);
+        
+        fprintf(stderr, "[FD-MAPPING] %s: recorded_fd=%ld -> actual_fd=%ld\n", 
+                record->syscall_name, (long)recorded_fd, (long)actual_fd);
+    } 
+    // dup/dup2 也需要处理
+    else if (strcmp(record->syscall_name, "dup") == 0 && ret >= 0) {
+        abi_long recorded_fd = record->ret_value;
+        abi_long actual_fd = ret;
+        rr_fd_mapping_add(recorded_fd, actual_fd);
+        fprintf(stderr, "[FD-MAPPING] dup: recorded_fd=%ld -> actual_fd=%ld\n", 
+                (long)recorded_fd, (long)actual_fd);
+    }
+    // close 时移除映射
+    else if (strcmp(record->syscall_name, "close") == 0 && ret == 0) {
+        abi_long recorded_fd = record->args[0].value;
+        rr_fd_mapping_remove((int)recorded_fd);
+        fprintf(stderr, "[FD-MAPPING] close: removed mapping for fd=%ld\n", (long)recorded_fd);
     }
 }
 
@@ -81,9 +100,22 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
 
 static void apply_memory_fd_mapping(const char *syscall_name, abi_long *args) {
     if (strcmp(syscall_name, "mmap") == 0) {
-        // mmap的参数4是FD，需要映射（除非是-1表示匿名映射）
+        // mmap的参数4是FD (-1表示匿名映射)
         if (args[4] != (abi_long)-1) {
-            args[4] = rr_fd_mapping_get(args[4]);
+            abi_long recorded_fd = args[4];  // trace中记录的FD
+            
+            // ✅ 查询映射表: recorded_fd → actual_fd
+            abi_long actual_fd = rr_fd_mapping_get(recorded_fd);
+            
+            if (actual_fd != -1) {
+                args[4] = actual_fd;  // 使用实际的FD
+                fprintf(stderr, "[FD-MAPPING] mmap: recorded_fd=%ld -> actual_fd=%ld\n", 
+                        (long)recorded_fd, (long)actual_fd);
+            } else {
+                fprintf(stderr, "[FD-MAPPING-WARN] mmap: No mapping for recorded_fd=%ld, using as-is\n", 
+                        (long)recorded_fd);
+                // 保持原值，让syscall尝试执行
+            }
         }
     }
 }
@@ -136,6 +168,19 @@ static void network_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
 /* 通用处理函数 */
 static void apply_generic_args(rr_strace_record_t *record, abi_long *args) {
     if (!record) return;
+    
+    // 特殊处理：某些系统调用不应该修改参数
+    // 这些调用的参数高度依赖于当前执行环境
+    if (record->syscall_name) {
+        if (strcmp(record->syscall_name, "arch_prctl") == 0 ||
+            strcmp(record->syscall_name, "brk") == 0 ||
+            strcmp(record->syscall_name, "set_tid_address") == 0 ||
+            strcmp(record->syscall_name, "set_robust_list") == 0) {
+            // 这些系统调用的参数不应该被重放
+            // 它们需要使用当前进程的实际地址
+            return;
+        }
+    }
     
     // 通用策略：对于数值参数使用记录值，对于指针参数保持原值
     for (int i = 0; i < record->arg_count && i < 8; i++) {

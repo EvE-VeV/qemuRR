@@ -300,6 +300,12 @@ int rr_config_init(void)
         g_rr_config.fork_point = (uint32_t)parse_int(fork_point_str, 0);
         g_rr_config.fork_server_enabled = (g_rr_config.fork_point > 0);
     }
+    
+    /* 如果设置了RR_FORK_SYSCALL，也启用Fork Server */
+    const char *fork_syscall = getenv("RR_FORK_SYSCALL");
+    if (fork_syscall) {
+        g_rr_config.fork_server_enabled = true;
+    }
 
     const char *shm_size = getenv("RR_SHARED_MEMORY_SIZE");
     if (shm_size) {

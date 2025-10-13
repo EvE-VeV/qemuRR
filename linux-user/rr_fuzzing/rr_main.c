@@ -72,6 +72,8 @@ static const char* get_syscall_name(int syscall_nr) {
  */
 int rr_framework_init(void)
 {
+    const char *strace_mode_env = NULL;  // 用于检测strace模式
+    
     /* 初始化配置系统 */
     if (rr_config_init() < 0) {
         error_report("RR-Fuzz: Failed to initialize configuration");
@@ -98,6 +100,7 @@ int rr_framework_init(void)
 
     /* 从配置获取运行模式 */
     g_rr_framework->mode = g_rr_config.mode;
+    g_rr_framework->enabled = g_rr_config.enabled;  // 设置enabled标志
 
     /* 初始化FD映射表 */
     g_rr_framework->fd_map = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -132,7 +135,7 @@ int rr_framework_init(void)
         case RR_MODE_REPLAY:
             /* 检查是否启用strace重放模式 */
             {
-                const char *strace_mode_env = getenv("RR_STRACE_MODE");
+                strace_mode_env = getenv("RR_STRACE_MODE");
                 RR_INFO("Starting replay mode, trace_file=%s", g_rr_config.trace_file);
                 RR_INFO("RR_STRACE_MODE environment variable: %s", strace_mode_env ? strace_mode_env : "NULL");
                 
@@ -156,14 +159,38 @@ int rr_framework_init(void)
         case RR_MODE_FUZZING:
             // Fuzzing模式需要先加载trace，然后启动fork server
             RR_INFO("Starting fuzzing mode, trace_file=%s", g_rr_config.trace_file);
-            if (rr_start_replay(g_rr_config.trace_file) < 0) {
-                RR_ERROR("Failed to load trace for fuzzing");
-                goto error;
+            
+            // 检查是否使用strace模式（与replay模式一致）
+            strace_mode_env = getenv("RR_STRACE_MODE");
+            if (strace_mode_env) {
+                RR_INFO("Starting strace replay mode for fuzzing");
+                if (rr_strace_replay_init(g_rr_config.trace_file) < 0) {
+                    RR_ERROR("Failed to start strace replay for fuzzing");
+                    goto error;
+                }
+                RR_INFO("Strace replay started successfully for fuzzing");
+            } else {
+                // 使用原生replay
+                if (rr_start_replay(g_rr_config.trace_file) < 0) {
+                    RR_ERROR("Failed to load trace for fuzzing");
+                    goto error;
+                }
             }
             /* 在Fuzzing模式下启动Fork Server（如果配置启用） */
             if (g_rr_config.fork_server_enabled) {
-                RR_INFO("Starting fork server at point %u", g_rr_config.fork_point);
-                if (rr_start_fork_server(g_rr_config.fork_point) < 0) {
+                // 使用新的系统调用模式启动Fork Server
+                const char *fork_syscall = getenv("RR_FORK_SYSCALL");
+                const char *fork_pattern = getenv("RR_FORK_PATTERN");
+                
+                if (!fork_syscall) {
+                    fork_syscall = "openat";  // 默认值
+                    RR_INFO("Using default fork syscall: %s", fork_syscall);
+                }
+                
+                RR_INFO("Starting fork server: syscall=%s, pattern=%s", 
+                       fork_syscall, fork_pattern ? fork_pattern : "none");
+                       
+                if (rr_start_fork_server(fork_syscall, fork_pattern) < 0) {
                     RR_ERROR("Failed to start fork server");
                     goto error;
                 }
@@ -216,7 +243,12 @@ void rr_framework_cleanup(void)
             break;
         case RR_MODE_FUZZING:
             rr_stop_fork_server();
-            rr_stop_replay(); // Fuzzing模式也需要停止replay
+            // Fuzzing模式也需要停止replay，检查是否使用strace模式
+            if (rr_strace_replay_enabled()) {
+                rr_strace_replay_cleanup();
+            } else {
+                rr_stop_replay();
+            }
             break;
         default:
             break;
@@ -341,17 +373,25 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
         case RR_MODE_FUZZING:
             /* 检查是否到达Fork点 */
-            if (rr_check_fork_point()) {
-                /* 进入Fork Server主循环 */
-                int fork_result = rr_fork_server_loop();
-                if (fork_result < 0) {
-                    exit(0); // 收到退出命令
-                } else if (fork_result > 0) {
-                    /* 子进程继续Fuzzing执行 */
+            {
+                const char *syscall_name = get_syscall_name(num);
+                if (rr_check_fork_point(num, syscall_name, args)) {
+                    /* 进入Fork Server主循环 */
+                    int fork_result = rr_fork_server_loop();
+                    if (fork_result < 0) {
+                        exit(0); // 收到退出命令
+                    } else if (fork_result > 0) {
+                        /* 子进程继续Fuzzing执行 */
+                    }
                 }
             }
             /* Fuzzing模式：可能修改参数，然后重放 */
-            ret = rr_replay_syscall(env, num, args);
+            /* 根据是否使用strace模式选择replay函数 */
+            if (rr_strace_replay_enabled()) {
+                ret = rr_replay_syscall_strace_optimized(env, num, args);
+            } else {
+                ret = rr_replay_syscall(env, num, args);
+            }
             break;
 
         default:

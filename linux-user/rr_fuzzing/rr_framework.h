@@ -37,20 +37,40 @@ typedef struct syscall_record {
 } syscall_record_t;
 
 /**
- * Fuzzing指令结构
+ * Fuzz命令类型枚举
+ */
+typedef enum {
+    FUZZ_CMD_NONE = 0,
+    FUZZ_CMD_MUTATE_ARG,            // 变异参数
+    FUZZ_CMD_REPLACE_BUFFER,        // 替换缓冲区
+    FUZZ_CMD_MUTATE_FLAGS,          // 变异标志位
+    FUZZ_CMD_BOUNDARY_VALUE         // 边界值测试
+} fuzz_cmd_type_t;
+
+/**
+ * Fuzzing指令结构 (固定大小版本，适合共享内存)
  */
 typedef struct {
-    enum {
-        FUZZ_CMD_NONE = 0,
-        FUZZ_CMD_MUTATE_ARG,            // 变异参数
-        FUZZ_CMD_REPLACE_BUFFER         // 替换缓冲区
-    } cmd;
-
-    int syscall_index;                  // 目标系统调用索引
-    int arg_index;                      // 目标参数索引
-    size_t data_len;                    // 新数据的长度
-    uint8_t data[];                     // 柔性数组，存放新数据
+    fuzz_cmd_type_t cmd;                // 命令类型
+    uint32_t syscall_index;             // 目标系统调用索引
+    uint32_t arg_index;                 // 目标参数索引
+    uint32_t data_len;                  // 数据长度
+    uint8_t data[256];                  // 固定大小数据数组
 } FuzzInstruction;
+
+/**
+ * 共享内存协议结构
+ */
+typedef struct {
+    uint32_t magic;                     // 魔数：0x46555A5A ("FUZZ")
+    uint32_t instruction_count;         // 指令数量
+    uint32_t flags;                     // 控制标志（预留）
+    uint32_t reserved;                  // 保留字段
+    FuzzInstruction instructions[32];   // 指令数组（最多32条）
+} FuzzSharedMemory;
+
+#define FUZZ_MAGIC 0x46555A5A
+#define FUZZ_MAX_INSTRUCTIONS 32
 
 /* ================= 运行模式定义 ================= */
 
@@ -81,7 +101,9 @@ typedef struct {
 
     /* Fork Server配置 */
     bool fork_server_enabled;           // 是否启用Fork Server
-    uint32_t fork_point;                // Fork点位置
+    char *fork_syscall_name;            // Fork点系统调用名称（如"openat", "read"）
+    char *fork_syscall_pattern;         // Fork点匹配模式（如"*/input.txt"）
+    uint32_t fork_point;                // Fork点位置（废弃，保留兼容性）
 
     /* IPC配置 */
     size_t shared_memory_size;          // 共享内存大小
@@ -187,9 +209,9 @@ int rr_start_replay(const char *trace_file);
 void rr_stop_replay(void);
 
 /* Fork Server模块 */
-int rr_start_fork_server(uint32_t fork_point);
+int rr_start_fork_server(const char *syscall_name, const char *pattern);
 void rr_stop_fork_server(void);
-bool rr_check_fork_point(void);
+bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_long *args);
 int rr_fork_server_loop(void);
 
 /* IPC模块 */
@@ -201,10 +223,20 @@ int rr_ipc_receive_command(void);
 /* Fuzz Engine模块 */
 int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count);
 void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr);
+int rr_fuzz_load_from_shared_memory(void *shm_ptr);
+void rr_fuzz_get_stats(uint64_t *total, uint64_t *arg_mut, uint64_t *buf_mut, uint64_t *boundary);
+void rr_fuzz_print_stats(void);
 FuzzInstruction *rr_fuzz_generate_mutations(uint32_t target_syscall, int target_arg,
                                           const uint8_t *seed_data, size_t seed_len,
                                           size_t *out_count);
 void rr_fuzz_cleanup(void);
+
+/* Strace Replay模块 */
+abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long *args);
+void rr_strace_set_mode_optimized(bool strict_mode, bool skip_unmatched, int max_lookahead);
+bool rr_strace_replay_enabled_optimized(void);
+void rr_strace_get_replay_stats_optimized(uint64_t *total, uint64_t *matched,
+                                         uint64_t *failed, uint64_t *skipped);
 
 /* Snapshot模块 */
 int rr_snapshot_save(uint32_t syscall_index);

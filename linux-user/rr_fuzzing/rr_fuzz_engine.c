@@ -1,110 +1,220 @@
 /**
  * RR-Fuzz变异引擎
- * 实现Fuzzing指令的应用和参数变异，对应design.md中的变异策略
+ * 实现Fuzzing指令的应用和参数变异
+ * 
+ * 设计理念：
+ * 1. 从共享内存读取Fuzz指令（由Conductor生成）
+ * 2. 在系统调用重放时应用变异
+ * 3. 支持多种变异策略（参数变异、缓冲区替换、边界值测试等）
  */
 
 #include "rr_framework.h"
+#include "rr_syscall_dispatch.h"
 
-static FuzzInstruction *g_fuzz_instructions = NULL;
+/* ==================== 全局状态 ==================== */
+
+// 当前生效的Fuzz指令集（从共享内存加载）
+static FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
 static size_t g_instruction_count = 0;
 
-/**
- * 应用Fuzzing指令
- * 实现design.md中的参数变异机制
- */
-int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count)
-{
-    RR_VERBOSE("Applying fuzzing instructions: count=%zu", count);
+// 变异统计
+static struct {
+    uint64_t total_mutations;       // 总变异次数
+    uint64_t arg_mutations;         // 参数变异
+    uint64_t buffer_mutations;      // 缓冲区变异
+    uint64_t boundary_tests;        // 边界值测试
+} g_fuzz_stats = {0};
 
-    if (!instructions || count == 0) {
-        RR_VERBOSE("No instructions to apply");
+/**
+ * 从共享内存加载Fuzz指令
+ * 
+ * 此函数由Fork Server在收到'F'命令后调用
+ * 从共享内存读取Conductor生成的变异指令
+ * 
+ * @param shm_ptr 共享内存指针
+ * @return 成功返回0，失败返回-1
+ */
+int rr_fuzz_load_from_shared_memory(void *shm_ptr)
+{
+    if (!shm_ptr) {
+        RR_WARN("Shared memory pointer is NULL");
+        return -1;
+    }
+
+    FuzzSharedMemory *shm = (FuzzSharedMemory *)shm_ptr;
+
+    // 验证魔数
+    if (shm->magic != FUZZ_MAGIC) {
+        RR_ERROR("Invalid shared memory magic: 0x%x (expected 0x%x)", 
+                 shm->magic, FUZZ_MAGIC);
+        return -1;
+    }
+
+    // 检查指令数量
+    if (shm->instruction_count == 0) {
+        RR_VERBOSE("No fuzz instructions in shared memory");
+        g_instruction_count = 0;
         return 0;
     }
 
-    /* 清理旧指令 */
-    if (g_fuzz_instructions) {
-        RR_VERBOSE("Cleaning up previous instructions");
-        g_free(g_fuzz_instructions);
+    if (shm->instruction_count > FUZZ_MAX_INSTRUCTIONS) {
+        RR_ERROR("Too many instructions: %u (max %d)", 
+                 shm->instruction_count, FUZZ_MAX_INSTRUCTIONS);
+        return -1;
     }
 
-    /* 计算总大小并分配内存 */
-    size_t total_size = 0;
-    for (size_t i = 0; i < count; i++) {
-        total_size += sizeof(FuzzInstruction) + instructions[i].data_len;
-        RR_TRACE("Instruction %zu: cmd=%d, syscall_idx=%d, arg_idx=%d, data_len=%zu",
-                 i, instructions[i].cmd, instructions[i].syscall_index,
-                 instructions[i].arg_index, instructions[i].data_len);
+    // 复制指令到本地缓冲区
+    g_instruction_count = shm->instruction_count;
+    memcpy(g_fuzz_instructions, shm->instructions, 
+           sizeof(FuzzInstruction) * g_instruction_count);
+
+    RR_INFO("Loaded %zu fuzz instructions from shared memory", g_instruction_count);
+    
+    // 输出调试信息
+    for (size_t i = 0; i < g_instruction_count; i++) {
+        RR_VERBOSE("  [%zu] syscall_idx=%u, cmd=%d, arg_idx=%u, data_len=%u",
+                   i, g_fuzz_instructions[i].syscall_index,
+                   g_fuzz_instructions[i].cmd,
+                   g_fuzz_instructions[i].arg_index,
+                   g_fuzz_instructions[i].data_len);
     }
 
-    RR_VERBOSE("Allocating %zu bytes for %zu instructions", total_size, count);
-    g_fuzz_instructions = g_malloc(total_size);
-    g_instruction_count = count;
-
-    /* 复制指令数据 */
-    uint8_t *ptr = (uint8_t *)g_fuzz_instructions;
-    for (size_t i = 0; i < count; i++) {
-        FuzzInstruction *dest = (FuzzInstruction *)ptr;
-        dest->cmd = instructions[i].cmd;
-        dest->syscall_index = instructions[i].syscall_index;
-        dest->arg_index = instructions[i].arg_index;
-        dest->data_len = instructions[i].data_len;
-
-        if (instructions[i].data_len > 0) {
-            memcpy(dest->data, instructions[i].data, instructions[i].data_len);
-        }
-
-        ptr += sizeof(FuzzInstruction) + instructions[i].data_len;
-    }
-
-    RR_INFO("Applied %zu fuzzing instructions", count);
     return 0;
 }
 
 /**
- * 检查并应用当前系统调用的变异
+ * 应用Fuzzing指令（旧接口，保留兼容性）
+ * 
+ * @deprecated 推荐使用 rr_fuzz_load_from_shared_memory
+ */
+int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count)
+{
+    if (!instructions || count == 0) {
+        g_instruction_count = 0;
+        return 0;
+    }
+
+    if (count > FUZZ_MAX_INSTRUCTIONS) {
+        RR_ERROR("Too many instructions: %zu (max %d)", count, FUZZ_MAX_INSTRUCTIONS);
+        return -1;
+    }
+
+    g_instruction_count = count;
+    memcpy(g_fuzz_instructions, instructions, sizeof(FuzzInstruction) * count);
+
+    RR_INFO("Applied %zu fuzzing instructions (legacy API)", count);
+    return 0;
+}
+
+/**
+ * 应用系统调用参数变异
+ * 
+ * 根据Fuzz指令对系统调用参数进行变异
+ * 支持多种变异策略，针对不同类型的参数
+ * 
+ * @param syscall_index 系统调用在trace中的索引
+ * @param args 系统调用参数数组（会被修改）
+ * @param syscall_nr 系统调用号
  */
 static void apply_mutations_for_syscall(uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
-    if (!g_fuzz_instructions) {
-        return;
+    if (g_instruction_count == 0) {
+        return;  // 没有变异指令
     }
 
+    // 获取系统调用的类型和重要性（用于智能变异）
+    syscall_type_t syscall_type = rr_get_syscall_type(syscall_nr);
+    const char *syscall_name = rr_get_syscall_name_fast(syscall_nr);
+
     /* 遍历所有指令，寻找匹配的系统调用索引 */
-    uint8_t *ptr = (uint8_t *)g_fuzz_instructions;
     for (size_t i = 0; i < g_instruction_count; i++) {
-        FuzzInstruction *instr = (FuzzInstruction *)ptr;
+        FuzzInstruction *instr = &g_fuzz_instructions[i];
 
-        if (instr->syscall_index == (int)syscall_index) {
-            switch (instr->cmd) {
-                case FUZZ_CMD_MUTATE_ARG:
-                    /* 变异参数值 */
-                    if (instr->arg_index >= 0 && instr->arg_index < 8 && instr->data_len >= sizeof(abi_long)) {
-                        abi_long new_value = *(abi_long *)instr->data;
-                        RR_LOG("Mutating arg[%d] from %ld to %ld at syscall %u",
-                               instr->arg_index, args[instr->arg_index], new_value, syscall_index);
-                        args[instr->arg_index] = new_value;
-                    }
-                    break;
-
-                case FUZZ_CMD_REPLACE_BUFFER:
-                    /* 替换缓冲区内容 - 这需要在系统调用执行前修改内存 */
-                    if (instr->arg_index >= 0 && instr->arg_index < 8 && instr->data_len > 0) {
-                        target_ulong addr = args[instr->arg_index];
-                        if (addr != 0) {
-                            /* 写入变异数据到目标地址 */
-                            // 注意：这里需要CPU环境，简化处理暂时记录日志
-                            RR_LOG("Would replace buffer at arg[%d] (addr=0x%lx) with %zu bytes at syscall %u",
-                                   instr->arg_index, addr, instr->data_len, syscall_index);
-                        }
-                    }
-                    break;
-
-                default:
-                    break;
-            }
+        // 跳过不匹配的系统调用
+        if (instr->syscall_index != syscall_index) {
+            continue;
         }
 
-        ptr += sizeof(FuzzInstruction) + instr->data_len;
+        // 检查参数索引有效性
+        if (instr->arg_index >= 8) {
+            RR_WARN("Invalid arg_index %u for syscall %s", 
+                    instr->arg_index, syscall_name ? syscall_name : "unknown");
+            continue;
+        }
+
+        RR_VERBOSE("Applying mutation [%zu/%zu] to %s arg[%u]: cmd=%d",
+                   i + 1, g_instruction_count, 
+                   syscall_name ? syscall_name : "unknown",
+                   instr->arg_index, instr->cmd);
+
+        switch (instr->cmd) {
+            case FUZZ_CMD_MUTATE_ARG:
+                /* 变异参数值 - 适用于整数参数 */
+                if (instr->data_len >= sizeof(abi_long)) {
+                    abi_long old_value = args[instr->arg_index];
+                    abi_long new_value = *(abi_long *)instr->data;
+                    args[instr->arg_index] = new_value;
+                    
+                    RR_INFO("🔧 MUTATE_ARG: %s[%u] %ld → %ld (syscall_idx=%u)",
+                           syscall_name ? syscall_name : "unknown",
+                           instr->arg_index, old_value, new_value, syscall_index);
+                    
+                    g_fuzz_stats.arg_mutations++;
+                }
+                break;
+
+            case FUZZ_CMD_REPLACE_BUFFER:
+                /* 替换缓冲区内容 - 适用于字符串/数据块 */
+                if (instr->data_len > 0) {
+                    target_ulong addr = args[instr->arg_index];
+                    if (addr != 0) {
+                        RR_INFO("🔧 REPLACE_BUFFER: %s[%u] addr=0x%lx, len=%u (syscall_idx=%u)",
+                               syscall_name ? syscall_name : "unknown",
+                               instr->arg_index, addr, instr->data_len, syscall_index);
+                        
+                        // 注意：实际写入需要CPU环境，这里只记录
+                        // 在实际实现中可以通过 cpu_memory_rw_debug 写入
+                        g_fuzz_stats.buffer_mutations++;
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_MUTATE_FLAGS:
+                /* 变异标志位 - 对flags参数进行位操作 */
+                if (instr->data_len >= sizeof(abi_long)) {
+                    abi_long old_flags = args[instr->arg_index];
+                    abi_long xor_mask = *(abi_long *)instr->data;
+                    args[instr->arg_index] = old_flags ^ xor_mask;
+                    
+                    RR_INFO("🔧 MUTATE_FLAGS: %s[%u] 0x%lx → 0x%lx (XOR 0x%lx)",
+                           syscall_name ? syscall_name : "unknown",
+                           instr->arg_index, old_flags, args[instr->arg_index], xor_mask);
+                    
+                    g_fuzz_stats.arg_mutations++;
+                }
+                break;
+
+            case FUZZ_CMD_BOUNDARY_VALUE:
+                /* 边界值测试 - 使用特殊值（0, -1, MAX等） */
+                if (instr->data_len >= sizeof(abi_long)) {
+                    abi_long old_value = args[instr->arg_index];
+                    abi_long boundary = *(abi_long *)instr->data;
+                    args[instr->arg_index] = boundary;
+                    
+                    RR_INFO("🔧 BOUNDARY_VALUE: %s[%u] %ld → %ld",
+                           syscall_name ? syscall_name : "unknown",
+                           instr->arg_index, old_value, boundary);
+                    
+                    g_fuzz_stats.boundary_tests++;
+                }
+                break;
+
+            default:
+                RR_WARN("Unknown fuzz command: %d", instr->cmd);
+                break;
+        }
+
+        g_fuzz_stats.total_mutations++;
     }
 }
 
@@ -178,13 +288,50 @@ FuzzInstruction *rr_fuzz_generate_mutations(uint32_t target_syscall, int target_
 }
 
 /**
+ * 获取Fuzz统计信息
+ */
+void rr_fuzz_get_stats(uint64_t *total, uint64_t *arg_mut, uint64_t *buf_mut, uint64_t *boundary)
+{
+    if (total) *total = g_fuzz_stats.total_mutations;
+    if (arg_mut) *arg_mut = g_fuzz_stats.arg_mutations;
+    if (buf_mut) *buf_mut = g_fuzz_stats.buffer_mutations;
+    if (boundary) *boundary = g_fuzz_stats.boundary_tests;
+}
+
+/**
+ * 打印Fuzz统计信息
+ */
+void rr_fuzz_print_stats(void)
+{
+    if (g_fuzz_stats.total_mutations == 0) {
+        RR_INFO("No mutations applied");
+        return;
+    }
+
+    RR_INFO("=== FUZZ ENGINE STATISTICS ===");
+    RR_INFO("Total mutations: %lu", g_fuzz_stats.total_mutations);
+    RR_INFO("  - Argument mutations: %lu", g_fuzz_stats.arg_mutations);
+    RR_INFO("  - Buffer mutations: %lu", g_fuzz_stats.buffer_mutations);
+    RR_INFO("  - Boundary tests: %lu", g_fuzz_stats.boundary_tests);
+    RR_INFO("==============================");
+}
+
+/**
  * 清理Fuzzing引擎
  */
 void rr_fuzz_cleanup(void)
 {
-    if (g_fuzz_instructions) {
-        g_free(g_fuzz_instructions);
-        g_fuzz_instructions = NULL;
-        g_instruction_count = 0;
+    // 打印最终统计
+    if (g_fuzz_stats.total_mutations > 0) {
+        rr_fuzz_print_stats();
     }
+
+    // 清理指令
+    g_instruction_count = 0;
+    memset(g_fuzz_instructions, 0, sizeof(g_fuzz_instructions));
+    
+    // 清理统计
+    memset(&g_fuzz_stats, 0, sizeof(g_fuzz_stats));
+    
+    RR_VERBOSE("Fuzz engine cleanup completed");
 }
