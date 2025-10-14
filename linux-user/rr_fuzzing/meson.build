@@ -16,8 +16,12 @@ rr_fuzz_sources = files(
   'rr_fuzz_engine.c',
   'rr_snapshot.c',
   'rr_debug.c',
-  'rr_config.c'
+  'rr_config.c',
+  'rr_syscall_info.c',  # 新增：系统调用分类
 )
+
+# 动态跟踪模块 - 已启用
+rr_fuzz_sources += files('rr_dynamic_trace.c')
 
 # RR-Fuzz configuration option
 rr_fuzzing = get_option('rr_fuzzing')

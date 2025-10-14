@@ -8,6 +8,7 @@
 #include "rr_replay_strace.h"
 #include "rr_syscall_dispatch.h"
 #include "rr_mapping_manager.h"
+#include "rr_dynamic_trace.h"  /* 动态跟踪API */
 #include "qemu.h"
 #include <sys/mman.h>
 #include <unistd.h>
@@ -23,6 +24,9 @@
 
 /* Strace解析器实例 */
 static rr_strace_parser_t *g_strace_parser = NULL;
+
+/* 全局系统调用索引（供fork server使用） */
+uint32_t g_strace_current_index = 0;
 
 /* 重放控制状态 - 简化版本 */
 typedef struct {
@@ -525,7 +529,19 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     g_strace_state.matched_syscalls++;
     
+    /* 更新全局索引 */
+    g_strace_current_index = g_strace_state.current_record_index;
+    
     RR_VERBOSE("Found matching record: %s, ret=%ld", record->syscall_name, record->ret_value);
+    
+    /* 动态跟踪：系统调用进入 */
+    rr_dynamic_trace_syscall_enter(
+        env, 
+        num, 
+        (uint64_t*)args, 
+        g_strace_state.current_record_index,
+        false  /* 尚未变异 */
+    );
     
     // 特殊处理: uname系统调用需要在修改参数前填充buffer
     // 因为参数修改会改变buffer地址，导致写入错误的位置
@@ -641,6 +657,17 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
     
     // 使用优化的POST处理
     rr_syscall_post_hook_optimized(num, g_current_record, ret, args);
+    
+    /* 动态跟踪：系统调用退出 */
+    bool was_fuzzed = (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING);
+    rr_dynamic_trace_syscall_exit(
+        env,
+        num,
+        (uint64_t*)args,
+        ret,
+        g_strace_state.current_record_index,
+        was_fuzzed
+    );
     
     // 清理当前记录
     g_current_record = NULL;

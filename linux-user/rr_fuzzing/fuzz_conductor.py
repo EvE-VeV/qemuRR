@@ -14,6 +14,9 @@ import struct
 import mmap
 import subprocess
 import argparse
+import select
+import threading
+import signal
 from pathlib import Path
 
 # ===== Fuzz指令类型定义（与C端保持一致）=====
@@ -25,6 +28,20 @@ FUZZ_CMD_BOUNDARY_VALUE = 4
 
 FUZZ_MAGIC = 0x46555A5A  # "FUZZ"
 FUZZ_MAX_INSTRUCTIONS = 32
+
+# 全局变量用于信号处理
+_conductor_instance = None
+_shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """处理Ctrl+C等信号"""
+    global _shutdown_requested, _conductor_instance
+    print(f"\n[Conductor] ⚠️  Signal {signum} received, shutting down gracefully...")
+    _shutdown_requested = True
+    
+    # 不在这里cleanup，让主循环自然退出后在finally中cleanup
+    # 这样避免重复cleanup和异常处理问题
 
 
 class FuzzInstruction:
@@ -102,26 +119,36 @@ class FuzzSharedMemory:
     
     def close(self):
         """关闭共享内存"""
-        if self.mem:
-            self.mem.close()
-        if self.shm_fd:
-            os.close(self.shm_fd)
+        try:
+            if self.mem:
+                self.mem.close()
+                self.mem = None
+        except:
+            pass
+        
+        try:
+            if self.shm_fd:
+                os.close(self.shm_fd)
+                self.shm_fd = None
+        except:
+            pass
         
         # 清理共享内存文件
-        shm_path = f"/dev/shm/{self.shm_name}"
-        if os.path.exists(shm_path):
-            os.unlink(shm_path)
+        try:
+            shm_path = f"/dev/shm/{self.shm_name}"
+            if os.path.exists(shm_path):
+                os.unlink(shm_path)
+        except:
+            pass
 
 
 class FuzzConductor:
     """Fuzz控制器 - 与QEMU进行IPC通信"""
     
-    def __init__(self, qemu_path, target_binary, trace_file, fork_syscall="openat", fork_pattern=None):
+    def __init__(self, qemu_path, target_binary, trace_file):
         self.qemu_path = qemu_path
         self.target_binary = target_binary
         self.trace_file = trace_file
-        self.fork_syscall = fork_syscall      # 新增：fork系统调用
-        self.fork_pattern = fork_pattern      # 新增：路径匹配模式
         
         # IPC管道
         self.cmd_pipe_read, self.cmd_pipe_write = os.pipe()
@@ -134,6 +161,22 @@ class FuzzConductor:
         self.qemu_process = None
         self.total_executions = 0
         self.crashes = []
+        self.qemu_stderr_thread = None
+    
+    def _read_qemu_stderr(self):
+        """在单独线程中读取QEMU的stderr输出，防止管道缓冲区满导致死锁"""
+        if not self.qemu_process or not self.qemu_process.stderr:
+            return
+        
+        try:
+            while True:
+                line = self.qemu_process.stderr.readline()
+                if not line:
+                    break
+                # 实时打印QEMU的调试输出
+                print(f"[QEMU] {line.decode('utf-8', errors='ignore').rstrip()}")
+        except Exception as e:
+            print(f"[Conductor] Error reading QEMU stderr: {e}")
     
     def start_qemu(self):
         """启动QEMU进程（Fuzzing模式）"""
@@ -144,15 +187,11 @@ class FuzzConductor:
             'RR_MODE': 'fuzzing',  # 关键：设置为fuzzing模式
             'RR_STRACE_MODE': 'True',  # 使用strace重放
             'RR_TRACE_FILE': self.trace_file,
-            'RR_FORK_SYSCALL': self.fork_syscall,   # 🔥 新增：基于系统调用的fork点
             'RR_CMD_PIPE': str(self.cmd_pipe_read),
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.shm_name,
         })
-        
-        # 如果有路径模式，添加到环境变量
-        if self.fork_pattern:
-            env['RR_FORK_PATTERN'] = self.fork_pattern
+        # 注意：不设置 RR_FORK_SYSCALL，启用自动检测
         
         # 构建QEMU命令
         cmd = [self.qemu_path, self.target_binary]
@@ -170,6 +209,25 @@ class FuzzConductor:
         )
         
         print(f"[Conductor] QEMU started (PID={self.qemu_process.pid})")
+        
+        # 启动线程读取QEMU的stderr，防止管道缓冲区满导致死锁
+        self.qemu_stderr_thread = threading.Thread(target=self._read_qemu_stderr, daemon=True)
+        self.qemu_stderr_thread.start()
+        
+        # 等待QEMU发送Ready状态
+        print("[Conductor] Waiting for QEMU Ready signal...")
+        ready, _, _ = select.select([self.status_pipe_read], [], [], 10.0)
+        if ready:
+            status_bytes = os.read(self.status_pipe_read, 4)
+            if status_bytes:
+                status = struct.unpack('i', status_bytes)[0]
+                if status == 1:  # Ready
+                    print("[Conductor] QEMU is Ready, sending initial 'F' command")
+                    os.write(self.cmd_pipe_write, b'F')  # 发送第一个'F'让QEMU开始执行
+                else:
+                    print(f"[Conductor] Unexpected status: {status}")
+        else:
+            print("[Conductor] ⚠️  Timeout waiting for QEMU Ready signal")
     
     def send_fuzz_command(self, instructions):
         """发送Fuzz命令"""
@@ -178,9 +236,27 @@ class FuzzConductor:
         
         # 2. 发送'F'命令触发fork
         os.write(self.cmd_pipe_write, b'F')
-        print(f"[Conductor] Sent 'F' command to QEMU")
+        print(f"[Conductor] ✅ Sent 'F' command to QEMU (pipe_fd={self.cmd_pipe_write})")
         
-        # 3. 等待执行结果
+        # 3. 等待执行结果 (添加超时保护)
+        # 使用select()实现超时读取 (30秒超时，给复杂执行更多时间)
+        ready, _, _ = select.select([self.status_pipe_read], [], [], 30.0)
+        
+        if not ready:
+            print("[Conductor] ⚠️  Timeout waiting for QEMU response (30s), retrying once...")
+            # 给一次重试机会
+            ready, _, _ = select.select([self.status_pipe_read], [], [], 10.0)
+            
+            if not ready:
+                print("[Conductor] ⚠️  Second timeout, terminating QEMU...")
+                if self.qemu_process and self.qemu_process.poll() is None:
+                    self.qemu_process.terminate()
+                    try:
+                        self.qemu_process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self.qemu_process.kill()
+                return None
+        
         status_bytes = os.read(self.status_pipe_read, 4)
         if not status_bytes:
             return None
@@ -212,9 +288,18 @@ class FuzzConductor:
     
     def run_fuzzing_campaign(self, num_iterations=100):
         """运行Fuzzing测试"""
+        global _shutdown_requested
         print(f"\n[Conductor] Starting fuzzing campaign ({num_iterations} iterations)")
         
+        consecutive_failures = 0
+        max_consecutive_failures = 3  # 允许连续3次失败
+        
         for i in range(num_iterations):
+            # 检查是否请求停止
+            if _shutdown_requested:
+                print(f"[Conductor] Shutdown requested, stopping at iteration {i}")
+                break
+            
             # 生成变异指令（示例：对第15个系统调用的第2个参数进行变异）
             instructions = self._generate_mutations(i)
             
@@ -222,12 +307,48 @@ class FuzzConductor:
             status = self.send_fuzz_command(instructions)
             
             if status is None:
-                print("[Conductor] QEMU process terminated unexpectedly")
-                break
+                consecutive_failures += 1
+                print(f"[Conductor] ⚠️  QEMU process issue (failure {consecutive_failures}/{max_consecutive_failures})")
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"[Conductor] ❌ Too many consecutive failures, stopping campaign")
+                    break
+                else:
+                    print(f"[Conductor] 🔄 Continuing fuzzing campaign...")
+                    continue
+            else:
+                consecutive_failures = 0  # 重置失败计数
             
+            # 处理不同的执行结果
             if status == 4:
-                print(f"[Conductor] Found crash! Saving testcase #{i}")
-                # 这里可以保存触发崩溃的指令
+                print(f"[Conductor] 💥 CRASH FOUND in iteration #{i}! Saving testcase...")
+                # 保存触发崩溃的指令
+                crash_file = f"crash_{self.total_executions}_{i}.txt"
+                try:
+                    with open(crash_file, 'w') as f:
+                        f.write(f"=== CRASH TESTCASE ===\n")
+                        f.write(f"Iteration: {i}\n")
+                        f.write(f"Execution: {self.total_executions}\n")
+                        f.write(f"Timestamp: {__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        f.write(f"\n=== FUZZ INSTRUCTIONS ===\n")
+                        for idx, instr in enumerate(instructions):
+                            f.write(f"Instruction {idx}:\n")
+                            f.write(f"  Command: {instr.cmd}\n")
+                            f.write(f"  Syscall Index: {instr.syscall_index}\n")
+                            f.write(f"  Arg Index: {instr.arg_index}\n")
+                            f.write(f"  Value: {instr.value}\n")
+                            f.write(f"  Size: {instr.size}\n")
+                            f.write(f"\n")
+                    print(f"[Conductor] 💾 Crash testcase saved: {crash_file}")
+                except Exception as e:
+                    print(f"[Conductor] ⚠️  Failed to save crash: {e}")
+            elif status == 3:
+                # Normal exit - 静默处理，避免日志噪音
+                pass
+            elif status == 5:
+                print(f"[Conductor] ⚠️  Child terminated by signal (iteration #{i})")
+            elif status == -1:
+                print(f"[Conductor] ❌ Error status received (iteration #{i})")
         
         print(f"\n[Conductor] Fuzzing campaign completed")
         print(f"[Conductor] Total executions: {self.total_executions}")
@@ -261,19 +382,25 @@ class FuzzConductor:
     
     def cleanup(self):
         """清理资源"""
-        if self.qemu_process:
-            # 发送退出命令
+        # 发送退出命令
+        if self.qemu_process and self.qemu_process.poll() is None:
             try:
                 os.write(self.cmd_pipe_write, b'Q')
                 self.qemu_process.wait(timeout=5)
             except:
-                self.qemu_process.kill()
+                self.qemu_process.terminate()
+                try:
+                    self.qemu_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.qemu_process.kill()
         
-        # 关闭管道
-        os.close(self.cmd_pipe_read)
-        os.close(self.cmd_pipe_write)
-        os.close(self.status_pipe_read)
-        os.close(self.status_pipe_write)
+        # 关闭管道（添加异常保护）
+        for fd in [self.cmd_pipe_read, self.cmd_pipe_write, 
+                   self.status_pipe_read, self.status_pipe_write]:
+            try:
+                os.close(fd)
+            except:
+                pass
         
         # 清理共享内存
         self.shm.close()
@@ -282,17 +409,17 @@ class FuzzConductor:
 
 
 def main():
+    global _conductor_instance
+    
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     parser = argparse.ArgumentParser(description='RR-Fuzz Conductor Example')
     parser.add_argument('--qemu', default='qemu-x86_64', help='QEMU binary path')
     parser.add_argument('--target', required=True, help='Target program to fuzz')
     parser.add_argument('--trace', required=True, help='Strace trace file')
     parser.add_argument('--iterations', type=int, default=100, help='Number of fuzz iterations')
-    
-    # 🔥 新增：Fork点配置参数
-    parser.add_argument('--fork-syscall', default='openat', 
-                       help='System call to fork on (default: openat)')
-    parser.add_argument('--fork-pattern', 
-                       help='Path pattern to match (e.g., "*/input*", "/tmp/*")')
     
     args = parser.parse_args()
     
@@ -305,14 +432,17 @@ def main():
         print(f"Error: Target binary not found: {args.target}")
         return 1
     
-    print(f"🎯 Fork Configuration:")
-    print(f"  - System call: {args.fork_syscall}")
-    print(f"  - Path pattern: {args.fork_pattern or 'none (match all)'}")
+    print("🚀 RR-Fuzz Conductor - Auto Detection Mode")
+    print(f"  - Target: {args.target}")
+    print(f"  - Trace: {args.trace}")
+    print(f"  - Mode: AUTO (智能检测所有 P_IO 系统调用)")
+    print(f"  - Iterations: {args.iterations}")
+    print(f"  - Press Ctrl+C to stop gracefully")
     print()
     
     # 创建Conductor并运行
-    conductor = FuzzConductor(args.qemu, args.target, args.trace, 
-                             args.fork_syscall, args.fork_pattern)
+    conductor = FuzzConductor(args.qemu, args.target, args.trace)
+    _conductor_instance = conductor  # 保存全局引用供信号处理器使用
     
     try:
         conductor.start_qemu()
@@ -321,6 +451,7 @@ def main():
         print("\n[Conductor] Interrupted by user")
     finally:
         conductor.cleanup()
+        _conductor_instance = None
     
     return 0
 

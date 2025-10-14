@@ -31,6 +31,8 @@ static const rr_config_t DEFAULT_CONFIG = {
     /* Fork Server配置 */
     .fork_server_enabled = false,
     .fork_point = 0,
+    .fork_strategy = RR_FORK_STRATEGY_AGGRESSIVE,  // 默认：激进模式（当前最实用）
+    .fork_fallback_threshold = 20,                  // Fallback阈值：20个syscall
 
     /* IPC配置 */
     .shared_memory_size = 4096,           // 4KB
@@ -301,10 +303,10 @@ int rr_config_init(void)
         g_rr_config.fork_server_enabled = (g_rr_config.fork_point > 0);
     }
     
-    /* 如果设置了RR_FORK_SYSCALL，也启用Fork Server */
-    const char *fork_syscall = getenv("RR_FORK_SYSCALL");
-    if (fork_syscall) {
+    /* 在 Fuzzing 模式下自动启用 Fork Server（新的自动检测模式） */
+    if (g_rr_config.mode == RR_MODE_FUZZING) {
         g_rr_config.fork_server_enabled = true;
+        RR_INFO("Auto-enabled Fork Server for fuzzing mode");
     }
 
     const char *shm_size = getenv("RR_SHARED_MEMORY_SIZE");

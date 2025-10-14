@@ -5,18 +5,34 @@
  * 新特性：
  * - 支持基于系统调用名称的Fork点（如"openat", "read"）
  * - Support path pattern matching
- * - 智能Fork点检测
+ * - 智能Fork点检测（自动P_IO分类）
  */
+
+/* 确保RR_DEBUG被定义，启用调试日志 */
+#ifndef RR_DEBUG
+#define RR_DEBUG 1
+#endif
 
 #include <sys/wait.h>
 #include <signal.h>
 #include <fnmatch.h>
 #include "rr_framework.h"
+#include "rr_syscall_info.h"  /* 新增：系统调用分类 */
+#include "rr_dynamic_trace.h"  /* 动态跟踪API */
 
 // Fork点配置
 static char *g_fork_syscall_name = NULL;      // 目标系统调用名称
 static char *g_fork_syscall_pattern = NULL;   // 路径匹配模式
 static bool g_at_fork_point = false;          // 是否已到达fork点
+
+/**
+ * 重置 Fork 点状态（用于新进程启动时）
+ */
+void rr_reset_fork_point(void)
+{
+    g_at_fork_point = false;
+    RR_VERBOSE("Reset fork point state for new process");
+}
 
 /**
  * 启动Fork Server
@@ -34,13 +50,13 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
         return -1;
     }
 
-    // 保存Fork点配置
+    // 自动检测模式：不需要手动配置
     if (syscall_name) {
         g_fork_syscall_name = strdup(syscall_name);
         RR_INFO("Fork Server: target syscall = %s", syscall_name);
     } else {
         g_fork_syscall_name = NULL;
-        RR_INFO("Fork Server: using legacy index-based fork point");
+        RR_INFO("Fork Server: AUTO-DETECTION mode (P_IO syscalls)");
     }
 
     if (pattern) {
@@ -48,7 +64,7 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
         RR_INFO("Fork Server: path pattern = %s", pattern);
     } else {
         g_fork_syscall_pattern = NULL;
-        RR_INFO("Fork Server: no path pattern (match all)");
+        RR_INFO("Fork Server: no path pattern (auto-detection)");
     }
 
     g_rr_framework->fork_server_active = true;
@@ -63,6 +79,25 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
     RR_IPC_TRACE("Sending Ready status to Conductor");
     if (rr_ipc_send_status(1) < 0) { // 1 = Ready
         RR_WARN("Failed to send Ready status");
+    }
+
+    /* 🔥 关键修复：等待第一个命令再开始执行 
+     * 这样可以防止程序在收到'F'命令前就开始执行并耗尽trace
+     */
+    RR_INFO("Waiting for first command from Conductor (cmd_pipe_fd=%d)...", 
+            g_rr_framework->cmd_pipe_fd);
+    int first_cmd = rr_ipc_receive_command();
+    RR_INFO("rr_ipc_receive_command() returned: %d", first_cmd);
+    
+    if (first_cmd == 'F') {
+        RR_INFO("Received first 'F' command, execution will proceed");
+        // 不做任何事，让执行继续
+        // 当到达fork点时，会调用 rr_check_auto_fork_point()
+    } else if (first_cmd == 'Q') {
+        RR_INFO("Received 'Q' command, exiting");
+        exit(0);
+    } else {
+        RR_WARN("Unexpected first command: %d, continuing anyway", first_cmd);
     }
 
     return 0;
@@ -217,13 +252,15 @@ bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_lon
  */
 int rr_fork_server_loop(void)
 {
-    if (!g_at_fork_point) {
-        return 0; // 还未到达Fork点
-    }
+    /* 
+     * 注意：不再检查 g_at_fork_point，因为调用此函数时
+     * 已经确认到达了 fork 点（通过 rr_check_auto_fork_point）
+     */
 
     while (g_rr_framework->fork_server_active) {
         /* 接收Conductor命令 */
         int cmd = rr_ipc_receive_command();
+        RR_INFO("🔧 Fork server loop: received command '%c' (%d)", cmd > 0 && cmd < 128 ? cmd : '?', cmd);
 
         switch (cmd) {
             case 'F': // Fork命令
@@ -250,7 +287,17 @@ int rr_fork_server_loop(void)
                     pid_t pid = fork();
                     
                     if (pid == 0) {
-                        /* 子进程：继续执行Fuzzing */
+                        /* 子进程：关闭继承的IPC FD，防止干扰父进程通信 */
+                        if (g_rr_framework->cmd_pipe_fd >= 0) {
+                            close(g_rr_framework->cmd_pipe_fd);
+                            g_rr_framework->cmd_pipe_fd = -1;
+                        }
+                        if (g_rr_framework->status_pipe_fd >= 0) {
+                            close(g_rr_framework->status_pipe_fd);
+                            g_rr_framework->status_pipe_fd = -1;
+                        }
+                        
+                        /* 继续执行Fuzzing */
                         g_rr_framework->child_pid = 0;
                         g_rr_framework->fork_server_active = false;  // 🔥 子进程不再是fork server
                         
@@ -266,10 +313,36 @@ int rr_fork_server_loop(void)
                         /* 父进程：等待子进程完成 */
                         g_rr_framework->child_pid = pid;
                         
+                        /* 动态跟踪：记录fork事件 */
+                        extern uint32_t g_strace_current_index;  /* 当前系统调用索引 */
+                        rr_dynamic_trace_fork(getpid(), pid, g_strace_current_index);
+                        
                         RR_VERBOSE("Parent process waiting for child PID=%d", pid);
                         
                         int status;
-                        waitpid(pid, &status, 0);
+                        
+                        /* 🔥 关键修复：添加超时机制，防止无限等待 */
+                        int wait_result = waitpid(pid, &status, WNOHANG);
+                        if (wait_result == 0) {
+                            // 子进程还在运行，等待一段时间
+                            RR_VERBOSE("Child still running, waiting with timeout...");
+                            
+                            int timeout_count = 0;
+                            while (wait_result == 0 && timeout_count < 100) { // 10秒超时
+                                usleep(100000); // 100ms
+                                wait_result = waitpid(pid, &status, WNOHANG);
+                                timeout_count++;
+                            }
+                            
+                            if (wait_result == 0) {
+                                RR_WARN("Child process timeout, forcibly terminating PID=%d", pid);
+                                kill(pid, SIGKILL);
+                                waitpid(pid, &status, 0); // 等待清理
+                                rr_ipc_send_status(3); // 发送Normal Exit而不是Error
+                                g_rr_framework->child_pid = 0;
+                                // 不break，继续正常流程，让Python继续下一轮
+                            }
+                        }
                         
                         /* 分析执行结果并发送给Conductor */
                         if (WIFEXITED(status)) {
@@ -297,6 +370,10 @@ int rr_fork_server_loop(void)
                         
                         g_rr_framework->child_pid = 0;
                         g_rr_framework->total_executions++;
+                        
+                        /* 重置 fork 点状态，准备下次迭代 */
+                        g_at_fork_point = false;
+                        RR_VERBOSE("Reset fork point for next iteration");
                         
                         RR_VERBOSE("Completed execution #%lu", g_rr_framework->total_executions);
                         
@@ -333,4 +410,89 @@ int rr_fork_server_loop(void)
     }
 
     return 0;
+}
+
+/**
+ * 自动检测 Fork 点（改进版，支持Fallback）
+ * 
+ * 改进点：
+ * 1. 支持多种fork策略（strict/relaxed/aggressive/fallback）
+ * 2. 添加fallback机制：如果N个syscall未fork，强制fork
+ * 
+ * @param syscall_nr 系统调用号
+ * @param syscall_name 系统调用名称（可选）
+ * @param ret 系统调用返回值
+ * @return true 表示应该进入 fork server loop
+ */
+bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long ret)
+{
+    static int syscalls_since_ready = 0;  // Fallback计数器
+    extern rr_config_t g_rr_config;
+    
+    if (!g_rr_framework->fork_server_active) {
+        return false;
+    }
+    
+    /* 如果已经在 fork point，发送状态并返回 */
+    if (g_at_fork_point) {
+        RR_IPC_TRACE("Sending At Fork Point status (already at fork point)");
+        if (rr_ipc_send_status(2) < 0) {
+            RR_WARN("Failed to send At Fork Point status");
+        }
+        return true;
+    }
+    
+    /* 增加计数器（用于fallback） */
+    syscalls_since_ready++;
+    
+    /* 策略1: 使用配置的fork策略检测 */
+    const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
+    bool should_fork = rr_should_auto_fork(syscall_nr, ret);
+    
+    RR_VERBOSE("Auto-fork check: %s (class=%s, ret=%ld, strategy=%d, should_fork=%d)",
+               info->name,
+               rr_get_syscall_class_name(info->class),
+               (long)ret,
+               g_rr_config.fork_strategy,
+               should_fork);
+    
+    if (should_fork) {
+        g_at_fork_point = true;
+        RR_INFO("🎯 Auto-detected fork point: %s (class=%s, ret=%ld, strategy=%d, after %d syscalls)",
+                info->name, 
+                rr_get_syscall_class_name(info->class),
+                (long)ret,
+                g_rr_config.fork_strategy,
+                syscalls_since_ready);
+        
+        RR_IPC_TRACE("Sending At Fork Point status (auto-detected)");
+        if (rr_ipc_send_status(2) < 0) {
+            RR_WARN("Failed to send At Fork Point status");
+        }
+        
+        syscalls_since_ready = 0;  // 重置计数器
+        return true;
+    }
+    
+    /* 策略2: Fallback机制 - 如果N个syscall后仍未fork，强制fork */
+    if (syscalls_since_ready >= g_rr_config.fork_fallback_threshold) {
+        const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
+        
+        /* 只在合适的syscall上fallback（I/O或FD类） */
+        if (info->class == SYSCALL_CLASS_IO || info->class == SYSCALL_CLASS_FD) {
+            g_at_fork_point = true;
+            RR_WARN("⚠️  Fallback fork triggered: %s after %d syscalls without fork",
+                    info->name, syscalls_since_ready);
+            
+            RR_IPC_TRACE("Sending At Fork Point status (fallback)");
+            if (rr_ipc_send_status(2) < 0) {
+                RR_WARN("Failed to send At Fork Point status");
+            }
+            
+            syscalls_since_ready = 0;
+            return true;
+        }
+    }
+    
+    return false;
 }

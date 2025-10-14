@@ -4,9 +4,15 @@
  * 对应design.md中的rr_ipc.c
  */
 
+#ifndef RR_DEBUG
+#define RR_DEBUG 1
+#endif
+
 #include "rr_framework.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /**
  * 初始化IPC系统
@@ -16,19 +22,24 @@ int rr_ipc_init(void)
 {
     RR_IPC_TRACE("Initializing IPC system");
 
-    /* 从配置获取管道路径，这里使用管道路径作为FD或路径 */
+    /* 从配置获取管道路径，支持FD数字或文件路径 */
     if (g_rr_config.cmd_pipe_path) {
         /* 尝试将路径作为FD数字解析 */
         char *endptr;
         long fd = strtol(g_rr_config.cmd_pipe_path, &endptr, 10);
         if (*endptr == '\0' && fd >= 0) {
-            /* 是数字，作为FD使用 */
+            /* 是数字，作为已打开的FD使用 */
             g_rr_framework->cmd_pipe_fd = (int)fd;
             RR_IPC_TRACE("Using command pipe FD: %d", g_rr_framework->cmd_pipe_fd);
         } else {
-            /* 不是数字，暂时设为-1（未来可以扩展为路径） */
-            g_rr_framework->cmd_pipe_fd = -1;
-            RR_WARN("Command pipe path not numeric: %s", g_rr_config.cmd_pipe_path);
+            /* 不是数字，作为文件路径打开（QEMU读取命令） */
+            g_rr_framework->cmd_pipe_fd = open(g_rr_config.cmd_pipe_path, O_RDONLY | O_NONBLOCK);
+            if (g_rr_framework->cmd_pipe_fd < 0) {
+                RR_WARN("Failed to open command pipe: %s (errno=%d)", g_rr_config.cmd_pipe_path, errno);
+            } else {
+                RR_IPC_TRACE("Opened command pipe: %s -> FD %d", 
+                             g_rr_config.cmd_pipe_path, g_rr_framework->cmd_pipe_fd);
+            }
         }
     } else {
         g_rr_framework->cmd_pipe_fd = -1;
@@ -40,13 +51,18 @@ int rr_ipc_init(void)
         char *endptr;
         long fd = strtol(g_rr_config.status_pipe_path, &endptr, 10);
         if (*endptr == '\0' && fd >= 0) {
-            /* 是数字，作为FD使用 */
+            /* 是数字，作为已打开的FD使用 */
             g_rr_framework->status_pipe_fd = (int)fd;
             RR_IPC_TRACE("Using status pipe FD: %d", g_rr_framework->status_pipe_fd);
         } else {
-            /* 不是数字，暂时设为-1 */
-            g_rr_framework->status_pipe_fd = -1;
-            RR_WARN("Status pipe path not numeric: %s", g_rr_config.status_pipe_path);
+            /* 不是数字，作为文件路径打开（QEMU写入状态） */
+            g_rr_framework->status_pipe_fd = open(g_rr_config.status_pipe_path, O_WRONLY | O_NONBLOCK);
+            if (g_rr_framework->status_pipe_fd < 0) {
+                RR_WARN("Failed to open status pipe: %s (errno=%d)", g_rr_config.status_pipe_path, errno);
+            } else {
+                RR_IPC_TRACE("Opened status pipe: %s -> FD %d", 
+                             g_rr_config.status_pipe_path, g_rr_framework->status_pipe_fd);
+            }
         }
     } else {
         g_rr_framework->status_pipe_fd = -1;
@@ -112,15 +128,20 @@ void rr_ipc_cleanup(void)
 int rr_ipc_send_status(int status)
 {
     if (g_rr_framework->status_pipe_fd < 0) {
+        RR_WARN("Cannot send status %d: status_pipe_fd is invalid", status);
         return 0; // 如果没有状态管道，直接返回成功
     }
 
-    if (write(g_rr_framework->status_pipe_fd, &status, sizeof(status)) != sizeof(status)) {
-        RR_LOG("Failed to send status: %d", status);
+    RR_INFO("📤 Sending status: %d (fd=%d, pid=%d)", status, g_rr_framework->status_pipe_fd, getpid());
+    
+    ssize_t written = write(g_rr_framework->status_pipe_fd, &status, sizeof(status));
+    if (written != sizeof(status)) {
+        RR_ERROR("Failed to send status %d: written=%zd, errno=%d (%s)", 
+                 status, written, errno, strerror(errno));
         return -1;
     }
 
-    RR_LOG("Sent status: %d", status);
+    RR_INFO("✅ Status %d sent successfully", status);
     return 0;
 }
 
@@ -131,12 +152,22 @@ int rr_ipc_send_status(int status)
 int rr_ipc_receive_command(void)
 {
     if (g_rr_framework->cmd_pipe_fd < 0) {
+        RR_WARN("cmd_pipe_fd is invalid (<0), returning 0");
         return 0; // 如果没有命令管道，返回无命令
     }
 
     char cmd;
+    RR_VERBOSE("Calling read() on cmd_pipe_fd=%d...", g_rr_framework->cmd_pipe_fd);
     ssize_t n = read(g_rr_framework->cmd_pipe_fd, &cmd, 1);
+    RR_INFO("📥 IPC read: fd=%d, n=%zd, cmd='%c' (%d)", g_rr_framework->cmd_pipe_fd, n, 
+            (n == 1 && cmd > 0 && cmd < 128) ? cmd : '?', (int)(unsigned char)cmd);
+    
     if (n != 1) {
+        if (n < 0) {
+            RR_WARN("read() failed with errno=%d (%s)", errno, strerror(errno));
+        } else {
+            RR_VERBOSE("read() returned %zd (no data or EOF)", n);
+        }
         return 0; // 无数据或错误
     }
 

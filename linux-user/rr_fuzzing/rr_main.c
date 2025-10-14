@@ -12,6 +12,8 @@
 #include "rr_replay_strace.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
+#include <fcntl.h>
+#include <errno.h>
 
 /* 全局框架状态 */
 rr_framework_t *g_rr_framework = NULL;
@@ -118,6 +120,24 @@ int rr_framework_init(void)
         goto error;
     }
     RR_INFO("IPC subsystem initialized");
+    
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+    /* 初始化动态跟踪管道（用于树可视化） */
+    const char *trace_pipe_path = getenv("RR_TRACE_PIPE");
+    if (trace_pipe_path) {
+        /* 使用阻塞模式打开，确保可视化器已经准备好 */
+        int trace_fd = open(trace_pipe_path, O_WRONLY);
+        if (trace_fd >= 0) {
+            rr_dynamic_trace_init(trace_fd);
+            RR_INFO("Dynamic trace pipe connected: %s (FD=%d)", trace_pipe_path, trace_fd);
+        } else {
+            RR_WARN("Failed to open dynamic trace pipe: %s (errno=%d)", trace_pipe_path, errno);
+        }
+    }
+#endif
+    
+    /* 重置 Fork Server 状态（每次新进程启动时） */
+    rr_reset_fork_point();
 
     /* 根据模式启动相应功能 */
     switch (g_rr_framework->mode) {
@@ -176,21 +196,11 @@ int rr_framework_init(void)
                     goto error;
                 }
             }
-            /* 在Fuzzing模式下启动Fork Server（如果配置启用） */
+            /* 在Fuzzing模式下启动Fork Server（自动检测模式） */
             if (g_rr_config.fork_server_enabled) {
-                // 使用新的系统调用模式启动Fork Server
-                const char *fork_syscall = getenv("RR_FORK_SYSCALL");
-                const char *fork_pattern = getenv("RR_FORK_PATTERN");
-                
-                if (!fork_syscall) {
-                    fork_syscall = "openat";  // 默认值
-                    RR_INFO("Using default fork syscall: %s", fork_syscall);
-                }
-                
-                RR_INFO("Starting fork server: syscall=%s, pattern=%s", 
-                       fork_syscall, fork_pattern ? fork_pattern : "none");
+                RR_INFO("Starting fork server in auto-detection mode");
                        
-                if (rr_start_fork_server(fork_syscall, fork_pattern) < 0) {
+                if (rr_start_fork_server(NULL, NULL) < 0) {
                     RR_ERROR("Failed to start fork server");
                     goto error;
                 }
@@ -257,6 +267,12 @@ void rr_framework_cleanup(void)
     /* 清理子系统 */
     RR_VERBOSE("Cleaning up subsystems");
     rr_ipc_cleanup();
+    
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+    /* 清理动态跟踪 */
+    rr_dynamic_trace_cleanup();
+#endif
+    
     rr_fuzz_cleanup();
     rr_snapshot_cleanup();
     rr_debug_cleanup();
@@ -372,25 +388,38 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             break;
 
         case RR_MODE_FUZZING:
-            /* 检查是否到达Fork点 */
-            {
-                const char *syscall_name = get_syscall_name(num);
-                if (rr_check_fork_point(num, syscall_name, args)) {
-                    /* 进入Fork Server主循环 */
-                    int fork_result = rr_fork_server_loop();
-                    if (fork_result < 0) {
-                        exit(0); // 收到退出命令
-                    } else if (fork_result > 0) {
-                        /* 子进程继续Fuzzing执行 */
-                    }
-                }
-            }
             /* Fuzzing模式：可能修改参数，然后重放 */
             /* 根据是否使用strace模式选择replay函数 */
             if (rr_strace_replay_enabled()) {
                 ret = rr_replay_syscall_strace_optimized(env, num, args);
             } else {
                 ret = rr_replay_syscall(env, num, args);
+            }
+            
+            /* 
+             * 自动检测 Fork 点（EnvFuzz 策略）
+             * 只对 P_IO 类的输入系统调用进行 fork
+             * 必须在执行后检查，因为需要返回值来判断是否有数据
+             */
+            {
+                const char *syscall_name = get_syscall_name(num);
+                extern bool rr_check_auto_fork_point(int, const char *, abi_long);
+                
+                if (rr_check_auto_fork_point(num, syscall_name, ret)) {
+                    /* 进入Fork Server主循环 */
+                    RR_INFO("🔄 Entering fork server loop after %s", syscall_name);
+                    int fork_result = rr_fork_server_loop();
+                    RR_INFO("🔄 Fork server loop returned: %d", fork_result);
+                    if (fork_result < 0) {
+                        RR_INFO("🔄 Exiting due to quit command");
+                        exit(0); // 收到退出命令
+                    } else if (fork_result > 0) {
+                        /* 子进程继续Fuzzing执行 */
+                        RR_INFO("🔄 Child process %d continuing fuzzing", getpid());
+                    } else {
+                        RR_INFO("🔄 Parent process %d continuing after fork", getpid());
+                    }
+                }
             }
             break;
 

@@ -81,6 +81,19 @@ typedef enum {
     RR_MODE_FUZZING = 3
 } rr_mode_t;
 
+/* ================= Fork策略定义 ================= */
+
+/**
+ * Fork点检测策略
+ * 控制在何时触发fork（用于fuzzing）
+ */
+typedef enum {
+    RR_FORK_STRATEGY_STRICT = 0,      // 严格模式：只有ret>0的I/O操作
+    RR_FORK_STRATEGY_RELAXED = 1,     // 宽松模式：允许ENOENT/EACCES等探测性错误
+    RR_FORK_STRATEGY_AGGRESSIVE = 2,  // 激进模式：任何I/O类syscall都fork
+    RR_FORK_STRATEGY_FALLBACK = 3     // Fallback模式：N个syscall后强制fork
+} rr_fork_strategy_t;
+
 /* ================= 统一配置系统 ================= */
 
 /**
@@ -102,6 +115,8 @@ typedef struct {
     /* Fork Server配置 */
     bool fork_server_enabled;           // 是否启用Fork Server
     char *fork_syscall_name;            // Fork点系统调用名称（如"openat", "read"）
+    rr_fork_strategy_t fork_strategy;   // Fork点检测策略
+    int fork_fallback_threshold;        // Fallback策略：多少个syscall后强制fork（默认20）
     char *fork_syscall_pattern;         // Fork点匹配模式（如"*/input.txt"）
     uint32_t fork_point;                // Fork点位置（废弃，保留兼容性）
 
@@ -213,6 +228,7 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern);
 void rr_stop_fork_server(void);
 bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_long *args);
 int rr_fork_server_loop(void);
+void rr_reset_fork_point(void);
 
 /* IPC模块 */
 int rr_ipc_init(void);
@@ -358,5 +374,12 @@ const char *rr_debug_level_name(rr_debug_level_t level);
 #define RR_LOG(fmt, ...) do {} while(0)
 
 #endif /* RR_DEBUG */
+
+/* ========== 动态跟踪API（用于实时树可视化） ========== */
+#define RR_ENABLE_DYNAMIC_TRACE 1
+
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+#include "rr_dynamic_trace.h"
+#endif
 
 #endif /* RR_FRAMEWORK_H */
