@@ -1,0 +1,70 @@
+# =========================================
+# RR-Fuzz配置文件 - Fuzzing模式
+# =========================================
+# 用于基于trace进行fuzzing测试
+#
+# 使用方法:
+#   # 1. 创建IPC管道
+#   mkfifo /tmp/rr_cmd_pipe /tmp/rr_status_pipe
+#
+#   # 2. 启动QEMU（mode会自动识别）
+#   RR_CONFIG_FILE=./rr_config.fuzzing.template \
+#   RR_STRACE_MODE=True \
+#   qemu-x86_64 /usr/bin/ls
+#
+# 注意：
+#   1. mode字段会自动识别，无需额外设置RR_MODE环境变量
+#   2. RR_STRACE_MODE=True 必须通过环境变量设置
+#   3. 需要外部fuzzer配合（如fuzz_conductor.py）
+# =========================================
+
+# === 核心配置 ===
+# 启用RR-Fuzz
+enabled=true
+
+# 运行模式（自动识别）
+mode=fuzzing
+
+# Trace文件输入路径（必须是已录制的文件）
+trace_file=./trace-record.txt
+
+# === IPC通信配置 ===
+# 共享内存名称
+shared_memory_name=rr_fuzzing_shm
+
+# 共享内存大小（字节）
+shared_memory_size=4096
+
+# IPC超时（毫秒）
+ipc_timeout=1000
+
+# 命令管道路径（fuzzer → QEMU）
+cmd_pipe_path=/tmp/rr_cmd_pipe
+
+# 状态管道路径（QEMU → fuzzer）
+status_pipe_path=/tmp/rr_status_pipe
+
+# === Fork Server配置 ===
+# Fork策略:
+#   0 = STRICT     - 严格模式：只在ret>0的I/O操作fork
+#   1 = RELAXED    - 宽松模式：允许ENOENT/EACCES等探测性错误
+#   2 = AGGRESSIVE - 激进模式：任何I/O类syscall都fork（推荐）
+#   3 = FALLBACK   - 降级模式：N个syscall后强制fork
+fork_strategy=2
+
+# Fallback阈值：多少个syscall后强制fork（仅在strategy=3时有效）
+fork_threshold=20
+
+# === Debug配置 ===
+# 调试级别: 0=off, 1=error, 2=warn, 3=info, 4=verbose, 5=trace
+debug_level=3
+
+# 调试日志输出文件 (默认: stderr)
+# debug_file=./debug-fuzzing.log
+
+# === 注意事项 ===
+# 1. Fuzzing模式需要外部fuzzer配合（如fuzz_conductor.py）
+# 2. 必须预先创建IPC管道: mkfifo /tmp/rr_cmd_pipe /tmp/rr_status_pipe
+# 3. trace_file必须是通过record模式生成的有效trace
+# 4. Fork Server会在首个I/O系统调用处自动启动
+

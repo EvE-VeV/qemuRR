@@ -1,0 +1,45 @@
+# =========================================
+# RR-Fuzz配置文件 - Replay模式
+# =========================================
+# 用于重放已录制的trace
+#
+# 使用方法:
+#   RR_CONFIG_FILE=./rr_config.replay.template \
+#   RR_STRACE_MODE=True \
+#   qemu-x86_64 /usr/bin/ls
+#
+# 注意：
+#   1. mode字段会自动识别，无需额外设置RR_MODE环境变量
+#   2. RR_STRACE_MODE=True 必须通过环境变量设置
+# =========================================
+
+# === 核心配置 ===
+# 启用RR-Fuzz
+enabled=true
+
+# 运行模式（自动识别）
+mode=replay
+
+# Trace文件输入路径（必须是已录制的文件）
+trace_file=./trace-record.txt
+
+# === Debug配置 ===
+# 调试级别: 0=off, 1=error, 2=warn, 3=info, 4=verbose, 5=trace
+debug_level=4
+
+# 调试日志输出文件 (默认: stderr)
+# debug_file=./debug-replay.log
+
+# === 注意事项 ===
+# 1. 必须设置环境变量 RR_STRACE_MODE=True 才能启用strace replay
+# 2. trace_file 必须是已经录制好的trace文件
+# 3. 可以通过 RR_STRACE_LOG_LEVEL 环境变量控制strace日志级别
+#    (0=error, 1=warn, 2=info, 3=verbose, 4=debug)
+
+# === 不需要的参数（Replay模式不使用） ===
+# shared_memory_name - Fuzzing模式专用
+# cmd_pipe_path - Fuzzing模式专用
+# status_pipe_path - Fuzzing模式专用
+# fork_strategy - Fuzzing模式专用
+# fork_threshold - Fuzzing模式专用
+

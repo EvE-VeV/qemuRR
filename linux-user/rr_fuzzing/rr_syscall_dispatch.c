@@ -224,7 +224,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     
     /* 内存管理类 */
     {"mmap", 9, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_CRITICAL,
-     apply_memory_args, apply_memory_fd_mapping, memory_post_hook, false, true, true},
+     apply_memory_args, apply_memory_fd_mapping, memory_post_hook, true, true, true},
     {"munmap", 11, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_memory_args, NULL, memory_post_hook, false, true, false},
     {"mprotect", 10, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,

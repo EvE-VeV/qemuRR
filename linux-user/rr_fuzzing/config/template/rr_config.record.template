@@ -1,0 +1,35 @@
+# =========================================
+# RR-Fuzz配置文件 - Record模式
+# =========================================
+# 用于录制程序执行trace
+#
+# 使用方法:
+#   RR_CONFIG_FILE=./rr_config.record.template qemu-x86_64 -strace /usr/bin/ls
+#
+# 注意：mode字段会自动识别，无需额外设置RR_MODE环境变量
+# =========================================
+
+# === 核心配置 ===
+# 启用RR-Fuzz
+enabled=true
+
+# 运行模式（自动识别）
+mode=record
+
+# Trace文件输出路径
+trace_file=./trace-record.txt
+
+# === Debug配置 ===
+# 调试级别: 0=off, 1=error, 2=warn, 3=info, 4=verbose, 5=trace
+debug_level=3
+
+# 调试日志输出文件 (默认: stderr)
+# debug_file=./debug-record.log
+
+# === 不需要的参数（Record模式不使用） ===
+# shared_memory_name - Fuzzing模式专用
+# cmd_pipe_path - Fuzzing模式专用
+# status_pipe_path - Fuzzing模式专用
+# fork_strategy - Fuzzing模式专用
+# fork_threshold - Fuzzing模式专用
+

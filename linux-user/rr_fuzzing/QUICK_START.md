@@ -18,7 +18,7 @@
 
 ```bash
 cd /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing
-./test_dynamic_trace.sh
+./fuzzing/test_dynamic_trace.sh
 ```
 
 这个脚本会：
@@ -34,7 +34,7 @@ cd /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing
 ```bash
 cd /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing
 
-python3 realtime_tree_visualizer.py \
+python3 fuzzing/realtime_tree_visualizer.py \
   --pipe /tmp/rr_trace_$$ \
   --output ~/fuzzing_tree.html \
   --update-interval 2
@@ -54,7 +54,7 @@ cd ~/Downloads
 export RR_TRACE_PIPE=/tmp/rr_trace_<PID>
 
 # 运行fuzzing
-python3 /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/fuzz_conductor.py \
+python3 /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/fuzzing/fuzz_conductor.py \
   --target /usr/bin/ls \
   --trace ./strace-ls.txt \
   --qemu /home/webfuzz/Documents/qemu/build/build-x86-arm-user/bin/qemu-x86_64 \
@@ -129,7 +129,7 @@ firefox ~/fuzzing_tree.html
 ### 可视化器选项
 
 ```bash
-python3 realtime_tree_visualizer.py --help
+python3 fuzzing/realtime_tree_visualizer.py --help
 
 options:
   --pipe PATH            IPC管道路径
@@ -213,7 +213,7 @@ echo $RR_TRACE_PIPE
 
 ## 🔥 下一步
 
-1. **运行测试**: `./test_dynamic_trace.sh`
+1. **运行测试**: `./fuzzing/test_dynamic_trace.sh`
 2. **查看树**: 用浏览器打开生成的HTML
 3. **调整参数**: 尝试不同的迭代次数
 4. **分析覆盖率**: 观察Fork分支模式

@@ -19,6 +19,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.txt
 
 # 编辑器临时文件
 *~

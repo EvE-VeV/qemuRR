@@ -66,6 +66,10 @@ const char* rr_get_syscall_name_fast(int syscall_nr);
 syscall_type_t rr_get_syscall_type(int syscall_nr);
 syscall_importance_t rr_get_syscall_importance(int syscall_nr);
 
-/* 优化的处理函数 - 内部实现，不对外暴露 */
+/* 优化的处理函数 */
+void rr_apply_syscall_args_optimized(rr_strace_record_t *record, abi_long *args);
+void rr_apply_fd_mapping_optimized(int syscall_nr, abi_long *args);
+void rr_syscall_post_hook_optimized(int syscall_nr, rr_strace_record_t *record, 
+                                    abi_long ret, abi_long *args);
 
 #endif /* RR_SYSCALL_DISPATCH_H */

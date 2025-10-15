@@ -13,11 +13,6 @@
 /* 全局调试配置 */
 rr_debug_config_t g_rr_debug = {
     .level = RR_DEBUG_INFO,          // 默认级别：基本信息
-    .syscall_trace = false,          // 默认关闭系统调用追踪
-    .fd_tracking = false,            // 默认关闭FD追踪
-    .memory_ops = false,             // 默认关闭内存操作追踪
-    .ipc_details = false,            // 默认关闭IPC详情
-    .performance_stats = false,      // 默认关闭性能统计
     .log_file = NULL                 // 默认输出到stderr
 };
 
@@ -97,22 +92,10 @@ void rr_debug_init(void)
 {
     /* 从环境变量读取调试配置 */
     const char *debug_level = getenv("RR_DEBUG_LEVEL");
-    const char *debug_syscall = getenv("RR_DEBUG_SYSCALL");
-    const char *debug_fd = getenv("RR_DEBUG_FD");
-    const char *debug_mem = getenv("RR_DEBUG_MEM");
-    const char *debug_ipc = getenv("RR_DEBUG_IPC");
-    const char *debug_perf = getenv("RR_DEBUG_PERF");
     const char *debug_file = getenv("RR_DEBUG_FILE");
 
     /* 设置调试级别 */
     g_rr_debug.level = parse_debug_level(debug_level);
-
-    /* 设置功能开关 */
-    g_rr_debug.syscall_trace = parse_bool(debug_syscall, false);
-    g_rr_debug.fd_tracking = parse_bool(debug_fd, false);
-    g_rr_debug.memory_ops = parse_bool(debug_mem, false);
-    g_rr_debug.ipc_details = parse_bool(debug_ipc, false);
-    g_rr_debug.performance_stats = parse_bool(debug_perf, false);
 
     /* 设置日志文件 */
     if (debug_file && strcmp(debug_file, "stderr") != 0 && strcmp(debug_file, "") != 0) {
@@ -129,11 +112,6 @@ void rr_debug_init(void)
     /* 输出初始化信息 */
     fprintf(stderr, "[RR-INFO] Debug system initialized:\n");
     fprintf(stderr, "  Level: %s (%d)\n", rr_debug_level_name(g_rr_debug.level), g_rr_debug.level);
-    fprintf(stderr, "  Syscall trace: %s\n", g_rr_debug.syscall_trace ? "ON" : "OFF");
-    fprintf(stderr, "  FD tracking: %s\n", g_rr_debug.fd_tracking ? "ON" : "OFF");
-    fprintf(stderr, "  Memory ops: %s\n", g_rr_debug.memory_ops ? "ON" : "OFF");
-    fprintf(stderr, "  IPC details: %s\n", g_rr_debug.ipc_details ? "ON" : "OFF");
-    fprintf(stderr, "  Performance: %s\n", g_rr_debug.performance_stats ? "ON" : "OFF");
     fprintf(stderr, "  Log file: %s\n", g_rr_debug.log_file ? debug_file : "stderr");
     fflush(stderr);
 }

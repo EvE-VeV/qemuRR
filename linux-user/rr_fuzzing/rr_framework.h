@@ -282,11 +282,6 @@ typedef enum {
 /* 调试配置结构 */
 typedef struct {
     rr_debug_level_t level;     // 全局调试级别
-    bool syscall_trace;         // 系统调用追踪
-    bool fd_tracking;           // 文件描述符追踪
-    bool memory_ops;            // 内存操作追踪
-    bool ipc_details;           // IPC通信详情
-    bool performance_stats;     // 性能统计
     FILE *log_file;             // 日志输出文件
 } rr_debug_config_t;
 
@@ -321,40 +316,12 @@ const char *rr_debug_level_name(rr_debug_level_t level);
 #define RR_TRACE(fmt, ...)   RR_LOG_LEVEL(RR_DEBUG_TRACE, fmt, ##__VA_ARGS__)
 
 /* 条件调试宏 */
-#define RR_SYSCALL_TRACE(fmt, ...) \
-    do { \
-        if (g_rr_debug.syscall_trace) { \
-            RR_VERBOSE("[SYSCALL] " fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
-
-#define RR_FD_TRACE(fmt, ...) \
-    do { \
-        if (g_rr_debug.fd_tracking) { \
-            RR_VERBOSE("[FD] " fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
-
-#define RR_MEM_TRACE(fmt, ...) \
-    do { \
-        if (g_rr_debug.memory_ops) { \
-            RR_TRACE("[MEM] " fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
-
-#define RR_IPC_TRACE(fmt, ...) \
-    do { \
-        if (g_rr_debug.ipc_details) { \
-            RR_VERBOSE("[IPC] " fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
-
-#define RR_PERF_TRACE(fmt, ...) \
-    do { \
-        if (g_rr_debug.performance_stats) { \
-            RR_VERBOSE("[PERF] " fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+/* 简化的trace宏 - 全部基于RR_DEBUG_LEVEL */
+#define RR_SYSCALL_TRACE(fmt, ...) RR_VERBOSE("[SYSCALL] " fmt, ##__VA_ARGS__)
+#define RR_FD_TRACE(fmt, ...) RR_VERBOSE("[FD] " fmt, ##__VA_ARGS__)
+#define RR_MEM_TRACE(fmt, ...) RR_TRACE("[MEM] " fmt, ##__VA_ARGS__)
+#define RR_IPC_TRACE(fmt, ...) RR_VERBOSE("[IPC] " fmt, ##__VA_ARGS__)
+#define RR_PERF_TRACE(fmt, ...) RR_VERBOSE("[PERF] " fmt, ##__VA_ARGS__)
 
 /* 保持向后兼容 */
 #define RR_LOG(fmt, ...) RR_INFO(fmt, ##__VA_ARGS__)

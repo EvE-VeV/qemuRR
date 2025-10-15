@@ -213,18 +213,12 @@ static int load_config_file(const char *config_file)
         } else if (strcmp(key, "debug_level") == 0) {
             /* 调试级别将在rr_debug_init中处理 */
             setenv("RR_DEBUG_LEVEL", value, 1);
-        } else if (strcmp(key, "debug_syscall") == 0) {
-            setenv("RR_DEBUG_SYSCALL", value, 1);
-        } else if (strcmp(key, "debug_fd") == 0) {
-            setenv("RR_DEBUG_FD", value, 1);
-        } else if (strcmp(key, "debug_mem") == 0) {
-            setenv("RR_DEBUG_MEM", value, 1);
-        } else if (strcmp(key, "debug_ipc") == 0) {
-            setenv("RR_DEBUG_IPC", value, 1);
-        } else if (strcmp(key, "debug_perf") == 0) {
-            setenv("RR_DEBUG_PERF", value, 1);
         } else if (strcmp(key, "debug_file") == 0) {
             setenv("RR_DEBUG_FILE", value, 1);
+        } else if (strcmp(key, "fork_strategy") == 0) {
+            g_rr_config.fork_strategy = parse_int(value, DEFAULT_CONFIG.fork_strategy);
+        } else if (strcmp(key, "fork_threshold") == 0) {
+            g_rr_config.fork_fallback_threshold = parse_int(value, DEFAULT_CONFIG.fork_fallback_threshold);
         } else {
             RR_WARN("Unknown config key '%s' at line %d", key, line_num);
         }
@@ -317,6 +311,17 @@ int rr_config_init(void)
     const char *ipc_timeout = getenv("RR_IPC_TIMEOUT");
     if (ipc_timeout) {
         g_rr_config.ipc_timeout = parse_int(ipc_timeout, DEFAULT_CONFIG.ipc_timeout);
+    }
+
+    /* Fork Server高级配置 */
+    const char *fork_strategy = getenv("RR_FORK_STRATEGY");
+    if (fork_strategy) {
+        g_rr_config.fork_strategy = parse_int(fork_strategy, DEFAULT_CONFIG.fork_strategy);
+    }
+
+    const char *fork_threshold = getenv("RR_FORK_THRESHOLD");
+    if (fork_threshold) {
+        g_rr_config.fork_fallback_threshold = parse_int(fork_threshold, DEFAULT_CONFIG.fork_fallback_threshold);
     }
 
     /* 设置默认路径 */
