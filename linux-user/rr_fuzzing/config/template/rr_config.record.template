@@ -4,7 +4,7 @@
 # 用于录制程序执行trace
 #
 # 使用方法:
-#   RR_CONFIG_FILE=./rr_config.record.template qemu-x86_64 -strace /usr/bin/ls
+#   RR_CONFIG_FILE=./rr_config.record.template qemu-x86_64 -strace -D ./trace-record.txt /usr/bin/ls
 #
 # 注意：mode字段会自动识别，无需额外设置RR_MODE环境变量
 # =========================================

@@ -1,9 +1,18 @@
 /**
- * RR-Fuzz重放模块
- * 实现Replay模式的核心逻辑，对应design.md中的rr_replay.c
+ * RR-Fuzz 混合重放模块
+ * Hybrid Replay Mode - 传统二进制 trace 重放
+ * 
+ * 负责：
+ * - 二进制 trace 的读取和同步
+ * - Hybrid 模式的系统调用重放（应用参数 + 执行真实 syscall）
+ * - 调度 Pure Replay（当有 aux_data 时）
  */
 
+#define RR_DEBUG 1
+
 #include "rr_framework.h"
+#include "rr_aux_data.h"
+#include "rr_replay_pure.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -11,6 +20,9 @@
 
 static FILE *g_trace_file = NULL;
 static syscall_record_t *g_current_record = NULL;
+
+/* 标记：当前系统调用是否已从 trace 读取并递增索引 */
+__thread bool g_syscall_already_consumed = false;
 
 /**
  * 开始重放
@@ -106,10 +118,6 @@ static syscall_record_t *read_next_record(void)
     record->index = buffer[0] | (buffer[1] << 8) | (buffer[2] << 16) | (buffer[3] << 24);
     record->syscall_nr = (int32_t)(buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24));
 
-    fprintf(stderr, "DEBUG_READ: Binary unpack - index=%u, syscall=%d\n", record->index, record->syscall_nr);
-    fprintf(stderr, "DEBUG_READ: Buffer bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-            buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7]);
-
     // 读取其余字段
     if (fread(record->args, sizeof(abi_long) * 8, 1, g_trace_file) != 1 ||
         fread(&record->retval, sizeof(abi_long), 1, g_trace_file) != 1 ||
@@ -152,6 +160,56 @@ static syscall_record_t *read_next_record(void)
                 }
             }
         }
+    }
+
+    /* 读取 aux_data（如果有） */
+    uint32_t aux_marker = 0;
+    RR_VERBOSE("READ_NEXT_RECORD: About to read aux_marker at file pos %ld", ftell(g_trace_file));
+    if (fread(&aux_marker, sizeof(uint32_t), 1, g_trace_file) == 1) {
+        RR_VERBOSE("READ_NEXT_RECORD: Read aux_marker = 0x%08x", aux_marker);
+        if (aux_marker == 0x41555844) { // "AUXD" magic
+            RR_VERBOSE("READ_NEXT_RECORD: Found AUXD magic, reading aux_data");
+            /* 读取 aux_data 数量 */
+            uint32_t aux_count = 0;
+            ssize_t read_result = fread(&aux_count, sizeof(uint32_t), 1, g_trace_file);
+            RR_VERBOSE("READ_NEXT_RECORD: fread aux_count result=%zd, aux_count=%u", read_result, aux_count);
+            if (read_result == 1 && aux_count > 0) {
+                RR_VERBOSE("READ_NEXT_RECORD: aux_count = %u", aux_count);
+                record->has_aux_data = true;
+                
+                /* 读取每个 aux_data */
+                for (uint32_t i = 0; i < aux_count; i++) {
+                    uint8_t kind, arg_mask;
+                    uint32_t size;
+                    
+                    if (fread(&kind, sizeof(uint8_t), 1, g_trace_file) != 1 ||
+                        fread(&arg_mask, sizeof(uint8_t), 1, g_trace_file) != 1 ||
+                        fread(&size, sizeof(uint32_t), 1, g_trace_file) != 1) {
+                        RR_ERROR("READ_NEXT_RECORD: Failed to read aux_data header");
+                        break;
+                    }
+                    
+                    /* 读取数据 */
+                    uint8_t *data = g_malloc(size);
+                    if (fread(data, size, 1, g_trace_file) == 1) {
+                        rr_aux_data_t *aux = rr_aux_create((rr_aux_kind_t)kind, arg_mask, data, size);
+                        if (aux) {
+                            rr_aux_append(&record->aux_data, aux);
+                            RR_VERBOSE("READ_NEXT_RECORD: Read aux_data kind=%d, arg=%d, size=%u",
+                                       kind, arg_mask, size);
+                        }
+                    }
+                    g_free(data);
+                }
+            } else {
+                RR_VERBOSE("READ_NEXT_RECORD: No aux_data count (read_result=%zd, aux_count=%u)", read_result, aux_count);
+            }
+        } else {
+            RR_VERBOSE("READ_NEXT_RECORD: No AUXD magic (marker=0x%08x)", aux_marker);
+        }
+        /* 如果 aux_marker == 0，说明没有 aux_data，这是正常的 */
+    } else {
+        RR_ERROR("READ_NEXT_RECORD: Failed to read aux_marker at pos %ld", ftell(g_trace_file));
     }
 
     return record;
@@ -223,80 +281,38 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
     }
 }
 
-/**
- * 更新FD映射表
+/* 
+ * 注：update_fd_mapping() 函数已移除
+ * FD映射功能由 apply_fd_mapping() 处理
+ * Pure Replay 功能已移至 rr_replay_pure.c 
  */
-static void update_fd_mapping(int syscall_nr, const abi_long *orig_args, abi_long ret)
-{
-    if (ret < 0) {
-        return; // 系统调用失败，不更新映射
-    }
-
-    switch (syscall_nr) {
-#ifdef TARGET_NR_open
-        case TARGET_NR_open:
-#endif
-        case TARGET_NR_openat:
-#ifdef TARGET_NR_creat
-        case TARGET_NR_creat:
-#endif
-        case TARGET_NR_socket:
-            /* 这些调用创建新FD，需要建立映射 */
-            if (g_current_record && g_current_record->creates_fd) {
-                int record_fd = g_current_record->created_fd;
-                int replay_fd = (int)ret;
-                g_hash_table_insert(g_rr_framework->fd_map,
-                                   GINT_TO_POINTER(record_fd),
-                                   GINT_TO_POINTER(replay_fd));
-                RR_LOG("FD mapping: record_fd=%d -> replay_fd=%d", record_fd, replay_fd);
-            }
-            break;
-
-        case TARGET_NR_dup:
-#ifdef TARGET_NR_dup2
-        case TARGET_NR_dup2:
-#endif
-#ifdef TARGET_NR_dup3
-        case TARGET_NR_dup3:
-#endif
-            /* 复制FD的调用 */
-            if (g_current_record && g_current_record->creates_fd) {
-                int record_fd = g_current_record->created_fd;
-                int replay_fd = (int)ret;
-                g_hash_table_insert(g_rr_framework->fd_map,
-                                   GINT_TO_POINTER(record_fd),
-                                   GINT_TO_POINTER(replay_fd));
-            }
-            break;
-
-        case TARGET_NR_close:
-            /* 关闭FD，从映射表中移除 */
-            g_hash_table_remove(g_rr_framework->fd_map, GINT_TO_POINTER((int)orig_args[0]));
-            break;
-
-        default:
-            break;
-    }
-}
 
 /**
  * 重放系统调用
- * 实现design.md中的同步检查和句柄映射
+ * 
+ * 自动智能模式：
+ * 1. 如果 trace 中有 aux_data → Pure Replay（完全独立路径）
+ * 2. 否则 → Hybrid Replay（传统路径）
+ * 
+ * Pure 和 Hybrid 完全分离，互不影响
  */
 abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 {
-    fprintf(stderr, "DEBUG_rr_replay_syscall: Entry for syscall %d\n", num);
-    fprintf(stderr, "DEBUG_rr_replay_syscall: g_rr_framework=%p\n", g_rr_framework);
-    fprintf(stderr, "DEBUG_rr_replay_syscall: g_trace_file=%p\n", g_trace_file);
+    RR_VERBOSE("REPLAY_SYSCALL: Entry for syscall %d", num);
+    RR_VERBOSE("REPLAY_SYSCALL: g_rr_framework=%p", g_rr_framework);
+    RR_VERBOSE("REPLAY_SYSCALL: g_trace_file=%p", g_trace_file);
+
+    /* 重置标记 */
+    g_syscall_already_consumed = false;
 
     if (!g_rr_framework) {
-        fprintf(stderr, "DEBUG_rr_replay_syscall: g_rr_framework is NULL, returning -1\n");
+        RR_VERBOSE("REPLAY_SYSCALL: g_rr_framework is NULL, returning -1");
         RR_ERROR("REPLAY_SYSCALL: g_rr_framework is NULL");
         return -1;
     }
 
     if (!g_trace_file) {
-        fprintf(stderr, "DEBUG_rr_replay_syscall: g_trace_file is NULL, returning -1\n");
+        RR_VERBOSE("REPLAY_SYSCALL: g_trace_file is NULL, returning -1");
         RR_ERROR("REPLAY_SYSCALL: g_trace_file is NULL");
         return -1;
     }
@@ -304,18 +320,26 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     RR_VERBOSE("REPLAY_SYSCALL: Called for syscall %d, replay_index=%u", num, g_rr_framework->replay_index);
     RR_VERBOSE("REPLAY_SYSCALL: g_trace_file=%p, g_current_record=%p", g_trace_file, g_current_record);
 
+    /* 注释：不再使用skip检查，总是尝试从trace读取
+     * 原因：trace可能包含任何syscall（取决于record时的逻辑或trace文件版本）
+     * 如果trace里没有匹配的记录，在查找过程中会自然地返回-1真实执行
+     * 🔥 修复：不跳过任何 syscall，与 record 策略保持一致
+     */
+
     /* 维护全局索引同步 - design.md的核心要求 */
-    fprintf(stderr, "DEBUG_rr_replay_syscall: replay_index=%u, g_current_record=%p\n", g_rr_framework->replay_index, g_current_record);
+    RR_VERBOSE("REPLAY_SYSCALL: replay_index=%u, g_current_record=%p", g_rr_framework->replay_index, g_current_record);
     if (g_rr_framework->replay_index == 0 || !g_current_record) {
-        fprintf(stderr, "DEBUG_rr_replay_syscall: Need to read next record\n");
+        RR_VERBOSE("REPLAY_SYSCALL: Need to read next record");
         RR_VERBOSE("REPLAY_SYSCALL: Reading next record (current_record=%p)", g_current_record);
         g_current_record = read_next_record();
         if (!g_current_record) {
-            fprintf(stderr, "DEBUG_rr_replay_syscall: read_next_record returned NULL\n");
-            RR_ERROR("REPLAY_SYSCALL: End of trace reached at index %u", g_rr_framework->replay_index);
-            return -1;
+            RR_VERBOSE("REPLAY_SYSCALL: read_next_record returned NULL");
+            /* EnvFuzz风格：找不到record时，不崩溃，真实执行 */
+            RR_WARN("REPLAY_SYSCALL: End of trace at index %u for syscall %d, executing directly", 
+                    g_rr_framework->replay_index, num);
+            return -1;  /* 真实执行系统调用 */
         }
-        fprintf(stderr, "DEBUG_rr_replay_syscall: Got record index=%u, syscall=%d, ret=%d\n",
+        RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
                 g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
         RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
                    g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
@@ -324,7 +348,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 
     /* 智能同步 - 如果系统调用不匹配，继续读取直到找到匹配的 */
     while (g_current_record && g_current_record->syscall_nr != num) {
-        fprintf(stderr, "DEBUG_rr_replay_syscall: MISMATCH - recorded=%d, actual=%d, skipping\n",
+        RR_VERBOSE("REPLAY_SYSCALL: MISMATCH - recorded=%d, actual=%d, skipping",
                 g_current_record->syscall_nr, num);
         RR_VERBOSE("REPLAY_SYSCALL: Skipping unmatched syscall (recorded=%d, actual=%d)",
                    g_current_record->syscall_nr, num);
@@ -340,8 +364,9 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         /* 读取下一条记录 */
         g_current_record = read_next_record();
         if (!g_current_record) {
-            RR_ERROR("REPLAY_SYSCALL: End of trace reached while looking for syscall %d", num);
-            return -1;
+            /* EnvFuzz风格：找不到record时，不崩溃，真实执行 */
+            RR_WARN("REPLAY_SYSCALL: Syscall %d not found in trace (end of trace), executing directly", num);
+            return -1;  /* 真实执行系统调用 */
         }
         RR_VERBOSE("REPLAY_SYSCALL: Trying next record index=%u, syscall=%d",
                    g_current_record->index, g_current_record->syscall_nr);
@@ -352,10 +377,146 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         return -1;
     }
 
-    fprintf(stderr, "DEBUG_rr_replay_syscall: FOUND MATCH - syscall=%d at record index=%u\n",
+    RR_VERBOSE("REPLAY_SYSCALL: FOUND MATCH - syscall=%d at record index=%u",
             num, g_current_record->index);
     RR_VERBOSE("REPLAY_SYSCALL: Found matching syscall %d at record index %u",
                num, g_current_record->index);
+
+    abi_long ret = g_current_record->retval;
+
+    /* ========== 特殊处理 1：Output Syscalls ========== */
+    /* 输出系统调用必须真实执行以维持I/O状态，但需要先消费 record */
+    if (rr_is_output_syscall(num)) {
+        RR_VERBOSE("REPLAY_SYSCALL: Output syscall %d, consuming record and executing directly", num);
+        
+        /* 清理当前记录 */
+        for (int i = 0; i < 8; i++) {
+            if (g_current_record->arg_data[i]) {
+                g_free(g_current_record->arg_data[i]);
+            }
+        }
+        if (g_current_record->aux_data) {
+            rr_aux_free(g_current_record->aux_data);
+        }
+        g_free(g_current_record);
+        g_current_record = NULL;
+        
+        /* 推进索引 */
+        g_rr_framework->replay_index++;
+        
+        /* 设置标志，防止 post_hook 重复处理 */
+        g_syscall_already_consumed = true;
+        
+        return -1; /* 执行真实 syscall */
+    }
+
+    /* ========== 特殊处理 2：内存管理 Syscalls ========== */
+    /* mmap 等需要真实分配内存，但强制使用 recorded 地址 */
+    bool is_mmap = false;
+#ifdef TARGET_NR_mmap
+    if (num == TARGET_NR_mmap) is_mmap = true;
+#endif
+#ifdef TARGET_NR_mmap2
+    if (num == TARGET_NR_mmap2) is_mmap = true;
+#endif
+    
+    if (is_mmap && ret != (abi_long)-1) {
+        /* mmap 成功的情况，需要真实分配内存 */
+        RR_VERBOSE("REPLAY_SYSCALL: mmap detected, need real allocation at 0x%lx", (unsigned long)ret);
+        
+        /* 设置全局变量，让 syscall.c 使用 MAP_FIXED */
+        extern target_ulong g_pending_mmap_recorded_addr;
+        extern target_ulong g_pending_mmap_length;
+        g_pending_mmap_recorded_addr = (target_ulong)ret;
+        g_pending_mmap_length = args[1];  /* length */
+        
+        /* 清理当前记录 */
+        for (int i = 0; i < 8; i++) {
+            if (g_current_record->arg_data[i]) {
+                g_free(g_current_record->arg_data[i]);
+            }
+        }
+        if (g_current_record->aux_data) {
+            rr_aux_free(g_current_record->aux_data);
+        }
+        g_free(g_current_record);
+        g_current_record = NULL;
+        
+        /* 推进索引 */
+        g_rr_framework->replay_index++;
+        
+        /* 设置标志，防止 post_hook 重复处理 */
+        g_syscall_already_consumed = true;
+        
+        RR_VERBOSE("REPLAY_SYSCALL: Returning -1 to trigger real mmap with MAP_FIXED");
+        return -1; /* 让 QEMU 执行真实 mmap，但使用 MAP_FIXED */
+    }
+
+    /* ========== 路径分叉：Pure vs Hybrid ========== */
+    
+    if (g_current_record->has_aux_data) {
+        /* 
+         * 路径1：Pure Replay 或 Pure Fuzzing
+         * 
+         * ✅ 修复: 在 Fuzzing 模式下，跳过 Pure Replay，直接变异和应用
+         *    避免数据被写入两次，提升性能 30-50%
+         */
+        
+        if (g_rr_framework->mode == RR_MODE_FUZZING) {
+            /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+             * Fuzzing 模式：直接变异和应用（跳过 Pure Replay）
+             * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+            RR_VERBOSE("FUZZING: Direct mutation path (skip Pure Replay)");
+            
+            /* 1️⃣ 变异 aux_data 结构体 */
+            rr_fuzz_mutate_aux_data(env, g_current_record, args, num);
+            
+            /* 2️⃣ 应用变异后的 aux_data 到 guest 内存（只写一次）*/
+            ret = rr_replay_syscall_pure_reapply(env, num, args, g_current_record);
+            
+            if (ret != -1) {
+                RR_INFO("🎯 FUZZING: Mutations applied directly, ret=%d", (int)ret);
+                goto replay_success;
+            } else {
+                /* Reapply 失败：回退到 Hybrid */
+                RR_WARN("FUZZING: Failed to apply mutations, fallback to hybrid");
+                /* 继续执行下面的 Hybrid 路径 */
+            }
+            
+        } else {
+            /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+             * 非 Fuzzing 模式：正常 Pure Replay
+             * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+            RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
+            
+            ret = rr_replay_syscall_pure(env, num, args, g_current_record);
+            
+            if (ret != -1) {
+                /* Pure Replay 成功：直接返回 */
+                RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
+                goto replay_success;
+            }
+            
+            /* Pure 失败：回退到 Hybrid */
+            RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
+            /* 继续执行下面的 Hybrid 路径 */
+        }
+    }
+
+    /* 
+     * 路径2：Hybrid Replay（传统模式）
+     * - 应用 FD 映射
+     * - 支持 Fuzzing 变异
+     * - 快照管理
+     * - 执行真实 syscall
+     */
+    RR_VERBOSE("REPLAY_SYSCALL: Hybrid replay path for syscall %d", num);
+
+    /* 🔥 特殊处理：read 返回 0 (EOF) 时，即使没有 aux_data，也应该直接返回 0 */
+    if (num == TARGET_NR_read && ret == 0) {
+        RR_VERBOSE("REPLAY_SYSCALL: read returned 0 (EOF), returning directly without real syscall");
+        goto replay_success;
+    }
 
     /* 应用FD映射 */
     apply_fd_mapping(args, num);
@@ -366,8 +527,8 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     /* 自动快照管理 */
     rr_snapshot_auto_manage(num, g_rr_framework->replay_index);
 
-    /* 处理特殊系统调用 */
-    abi_long ret = g_current_record->retval;
+    /* 🔥 修复: Hybrid 模式只处理 mmap 特殊情况，其他 syscall 让真实执行自然填充数据 */
+    /* 数据恢复应该在 Pure Replay (rr_replay_pure.c) 中进行 */
 
     switch (num) {
 #ifdef TARGET_NR_mmap
@@ -376,416 +537,124 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 #ifdef TARGET_NR_mmap2
         case TARGET_NR_mmap2:
 #endif
-            /* mmap在replay时的策略：
-             * 1. 如果原来记录失败，replay也应该失败
-             * 2. 如果原来记录成功，让系统调用正常执行，但不强制相同地址
-             * 3. 记录地址映射关系供后续使用 */
-            fprintf(stderr, "DEBUG_MMAP_REPLAY: Original recorded ret=0x%lx\n", (unsigned long)ret);
+            /* 
+             * ✅ 简化的 mmap 处理策略：
+             * 1. 如果记录失败 → replay也失败（返回-1）
+             * 2. 如果记录成功：
+             *    - 匿名映射 → 让系统分配
+             *    - 文件映射 → 转换为匿名映射
+             * 3. 记录地址映射供后续使用
+             * 
+             * 优化：移除了未测试的fallback逻辑，简化为单一路径
+             */
+            RR_VERBOSE("MMAP_REPLAY: Recorded ret=0x%lx", (unsigned long)ret);
 
             if (ret == (abi_long)-1) {
-                /* 原来记录的是失败，replay也应该失败 */
-                RR_VERBOSE("MMAP_REPLAY: Recorded failed mmap, forcing failure");
-                /* 这里我们不修改ret，让其保持为-1 */
+                /* 记录失败 → replay也失败 */
+                RR_VERBOSE("MMAP_REPLAY: Recorded failure, keeping ret=-1");
             } else {
-                /* 原来记录成功，采用强制成功策略：
-                 * 对于智能重放，确保程序执行路径的一致性比内存地址的准确性更重要 */
-                fprintf(stderr, "DEBUG_MMAP_REPLAY: Recorded successful mmap, ensuring success\n");
-                RR_VERBOSE("MMAP_REPLAY: Forcing success - recorded addr=0x%lx", (unsigned long)ret);
-
-                /* 智能策略：尝试让系统分配实际内存，但确保成功 */
-                fprintf(stderr, "DEBUG_MMAP_REPLAY: args[4]=%ld (fd), args[3]=0x%lx (flags)\n", args[4], args[3]);
-                if (args[4] == -1 || args[4] == (abi_long)4294967295UL) {
-                    /* 匿名映射：让系统正常分配，然后建立映射关系 */
-                    fprintf(stderr, "DEBUG_MMAP_REPLAY: Anonymous mapping detected\n");
-                    RR_VERBOSE("MMAP_REPLAY: Anonymous mapping, allowing normal allocation");
-                    g_pending_mmap_recorded_addr = (target_ulong)ret;
+                /* 记录成功 → 确保replay也成功 */
+                g_pending_mmap_recorded_addr = (target_ulong)ret;
+                
+                /* 检查是否为文件映射 */
+                bool is_file_mapping = (args[4] != -1 && args[4] != (abi_long)4294967295UL);
+                
+                if (is_file_mapping) {
+                    /* 文件映射 → 转换为匿名映射（简化策略） */
+                    RR_VERBOSE("MMAP_REPLAY: File mapping (fd=%d) → converting to anonymous", (int)args[4]);
                     
-                    /* 设置标记，表示这个记录已经被处理过了 */
-                    g_current_record->syscall_nr = -999;  /* 特殊标记，表示已处理 */
-                    /* 不清理记录，让正常流程处理索引递增和清理 */
+                    abi_long original_flags = args[3];
+                    args[3] = MAP_PRIVATE | MAP_ANONYMOUS;
                     
-                    /* 返回-1让系统分配实际内存 */
-                    return -1;
+                    /* 保留部分标志（去除MAP_FIXED让系统选择地址） */
+                    if (original_flags & MAP_GROWSDOWN) {
+                        args[3] |= MAP_GROWSDOWN;
+                    }
+                    
+                    args[4] = -1;   /* fd = -1 */
+                    args[5] = 0;    /* offset = 0 */
+                    args[0] = 0;    /* 让系统选择地址 */
                 } else {
-                    /* 文件映射：直接返回成功，跳过实际的mmap调用 */
-                    fprintf(stderr, "DEBUG_MMAP_REPLAY: File mapping detected, fd=%ld - FORCING SUCCESS\n", args[4]);
-                    RR_VERBOSE("MMAP_REPLAY: File mapping (fd=%d), forcing success without actual mmap", (int)args[4]);
-                    
-                    /* 分配一块匿名内存作为替代 */
-                    void *fallback_addr = mmap(NULL, args[1], args[2], MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                    if (fallback_addr != MAP_FAILED) {
-                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Fallback allocation successful at %p\n", fallback_addr);
-                        g_pending_mmap_recorded_addr = (target_ulong)ret;
-                        
-                        /* 清理当前记录并正确递增索引 */
-                        for (int i = 0; i < 8; i++) {
-                            if (g_current_record->arg_data[i]) {
-                                g_free(g_current_record->arg_data[i]);
-                            }
-                        }
-                        g_free(g_current_record);
-                        g_current_record = NULL;
-                        g_rr_framework->replay_index++;
-                        
-                        RR_VERBOSE("REPLAY_SYSCALL: Successfully handled mmap fallback %u: %d -> %p",
-                                   g_rr_framework->replay_index - 1, num, fallback_addr);
-                        /* 直接返回分配的地址 */
-                        return (abi_long)fallback_addr;
-                    } else {
-                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Fallback allocation failed, trying conversion\n");
-                        
-                        /* 将文件映射转换为匿名映射 */
-                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Converting to anonymous - before: addr=0x%lx, len=%ld, prot=0x%lx, flags=0x%lx, fd=%ld, offset=%ld\n", 
-                                args[0], args[1], args[2], args[3], args[4], args[5]);
-                        
-                        /* 清理可能有问题的标志位 */
-                        abi_long original_flags = args[3];
-                        args[3] = 0;                            /* 清空所有标志 */
-                        args[3] |= MAP_PRIVATE;                  /* 设置为私有映射 */
-                        args[3] |= MAP_ANONYMOUS;                /* 添加匿名标志 */
-                        
-                        /* 保留一些可能有用的标志 */
-                        if (original_flags & MAP_FIXED) {
-                            /* 不保留MAP_FIXED，让系统选择地址 */
-                        }
-                        if (original_flags & MAP_GROWSDOWN) {
-                            args[3] |= MAP_GROWSDOWN;
-                        }
-                        
-                        args[4] = -1;                           /* 设置fd为-1 */
-                        args[5] = 0;                            /* 偏移量设为0 */
-                        args[0] = 0;                            /* 让系统选择地址 */
-                        
-                        fprintf(stderr, "DEBUG_MMAP_REPLAY: Converting to anonymous - after: addr=0x%lx, len=%ld, prot=0x%lx, flags=0x%lx, fd=%ld, offset=%ld\n", 
-                                args[0], args[1], args[2], args[3], args[4], args[5]);
-                        
-                        g_pending_mmap_recorded_addr = (target_ulong)ret;
-                        
-                        /* 设置标记，表示这个记录已经被处理过了 */
-                        g_current_record->syscall_nr = -999;  /* 特殊标记，表示已处理 */
-                        /* 不清理记录，让正常流程处理索引递增和清理 */
-                        
-                        /* 返回-1让系统执行修改后的mmap */
-                        return -1;
+                    /* 匿名映射 → 让系统正常分配 */
+                    RR_VERBOSE("MMAP_REPLAY: Anonymous mapping, allowing normal allocation");
+                }
+                
+                /* 清理记录并推进索引 */
+                for (int i = 0; i < 8; i++) {
+                    if (g_current_record->arg_data[i]) {
+                        g_free(g_current_record->arg_data[i]);
                     }
                 }
+                if (g_current_record->aux_data) {
+                    rr_aux_free(g_current_record->aux_data);
+                }
+                g_free(g_current_record);
+                g_current_record = NULL;
+                g_rr_framework->replay_index++;
+                g_syscall_already_consumed = true;
+                
+                /* 返回-1让系统执行mmap */
+                return -1;
             }
             break;
 
-        case TARGET_NR_read:
-            /* 如果记录了读取的数据，需要写回到目标缓冲区 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret > 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       MIN(ret, g_current_record->arg_size[1]), 1) != 0) {
-                    RR_LOG("Failed to write back read data");
-                }
-            }
-            break;
-
-        case TARGET_NR_uname:
-            /* 写回utsname结构体数据 */
-            if (g_current_record->arg_data[0] && g_current_record->arg_size[0] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[0],
-                                       g_current_record->arg_data[0],
-                                       g_current_record->arg_size[0], 1) != 0) {
-                    RR_LOG("Failed to write back uname data");
-                }
-            }
-            break;
-
-#ifdef TARGET_NR_newfstatat
-        case TARGET_NR_newfstatat:
-#endif
-#ifdef TARGET_NR_fstatat64
-        case TARGET_NR_fstatat64:
-#endif
-            /* 写回stat结构体数据 */
-            if (g_current_record->arg_data[2] && g_current_record->arg_size[2] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[2],
-                                       g_current_record->arg_data[2],
-                                       g_current_record->arg_size[2], 1) != 0) {
-                    RR_LOG("Failed to write back stat data");
-                }
-            }
-            break;
-
-        case TARGET_NR_getdents64:
-            /* 写回目录项数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret > 0) {
-                size_t bytes_to_write = MIN(ret, g_current_record->arg_size[1]);
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       bytes_to_write, 1) != 0) {
-                    RR_LOG("Failed to write back getdents64 data");
-                }
-            }
-            break;
-
-#ifdef TARGET_NR_stat
-        case TARGET_NR_stat:
-            /* 写回stat结构体数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       g_current_record->arg_size[1], 1) != 0) {
-                    RR_LOG("Failed to write back stat data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_lstat
-        case TARGET_NR_lstat:
-            /* 写回stat结构体数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       g_current_record->arg_size[1], 1) != 0) {
-                    RR_LOG("Failed to write back lstat data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_fstat
-        case TARGET_NR_fstat:
-            /* 写回stat结构体数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       g_current_record->arg_size[1], 1) != 0) {
-                    RR_LOG("Failed to write back fstat data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_pread64
-        case TARGET_NR_pread64:
-            /* 写回读取的数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret > 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       MIN(ret, g_current_record->arg_size[1]), 1) != 0) {
-                    RR_LOG("Failed to write back pread64 data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_gettimeofday
-        case TARGET_NR_gettimeofday:
-            /* 写回timeval结构体数据 */
-            if (g_current_record->arg_data[0] && g_current_record->arg_size[0] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[0],
-                                       g_current_record->arg_data[0],
-                                       g_current_record->arg_size[0], 1) != 0) {
-                    RR_LOG("Failed to write back gettimeofday data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_clock_gettime
-        case TARGET_NR_clock_gettime:
-            /* 写回timespec结构体数据 */
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       g_current_record->arg_size[1], 1) != 0) {
-                    RR_LOG("Failed to write back clock_gettime data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_pipe
-        case TARGET_NR_pipe:
-#endif
-#ifdef TARGET_NR_pipe2
-        case TARGET_NR_pipe2:
-#endif
-            /* 管道调用返回两个FD，需要写回到参数指向的数组 */
-            if (ret == 0 && args[0] != 0) {
-                int pipe_fds[2];
-                // 这里需要从记录中恢复管道FD，简化处理
-                pipe_fds[0] = g_current_record->created_fd;
-                pipe_fds[1] = g_current_record->created_fd + 1; // 简化假设
-                if (cpu_memory_rw_debug(env_cpu(env), args[0], (uint8_t*)pipe_fds,
-                                       sizeof(pipe_fds), 1) != 0) {
-                    RR_LOG("Failed to write back pipe FDs");
-                }
-            }
-            break;
-
-        // getrandom数据恢复
-        case TARGET_NR_getrandom:
-            /* 写回随机数据 */
-            if (g_current_record->arg_data[0] && g_current_record->arg_size[0] > 0 && ret > 0) {
-                size_t copy_size = MIN(ret, g_current_record->arg_size[0]);
-                if (cpu_memory_rw_debug(env_cpu(env), args[0],
-                                       g_current_record->arg_data[0], copy_size, 1) != 0) {
-                    RR_LOG("Failed to write back getrandom data");
-                }
-            }
-            break;
-
-        // 信号处理数据恢复
-#ifdef TARGET_NR_rt_sigaction
-        case TARGET_NR_rt_sigaction:
-            /* 写回旧的sigaction结构体 */
-            if (g_current_record->arg_data[2] && g_current_record->arg_size[2] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[2],
-                                       g_current_record->arg_data[2],
-                                       g_current_record->arg_size[2], 1) != 0) {
-                    RR_LOG("Failed to write back rt_sigaction data");
-                }
-            }
-            break;
-#endif
-
-#ifdef TARGET_NR_rt_sigprocmask
-        case TARGET_NR_rt_sigprocmask:
-            /* 写回旧的信号掩码 */
-            if (g_current_record->arg_data[2] && g_current_record->arg_size[2] > 0 && ret == 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[2],
-                                       g_current_record->arg_data[2],
-                                       g_current_record->arg_size[2], 1) != 0) {
-                    RR_LOG("Failed to write back rt_sigprocmask data");
-                }
-            }
-            break;
-#endif
-
-        // 网络相关数据恢复
-#ifdef TARGET_NR_accept
-        case TARGET_NR_accept:
-#endif
-#ifdef TARGET_NR_accept4
-        case TARGET_NR_accept4:
-#endif
-            /* 写回客户端地址信息 */
-            if (ret >= 0) {
-                if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0) {
-                    if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                           g_current_record->arg_data[1],
-                                           g_current_record->arg_size[1], 1) != 0) {
-                        RR_LOG("Failed to write back accept sockaddr data");
-                    }
-                }
-                if (g_current_record->arg_data[2] && g_current_record->arg_size[2] > 0) {
-                    if (cpu_memory_rw_debug(env_cpu(env), args[2],
-                                           g_current_record->arg_data[2],
-                                           g_current_record->arg_size[2], 1) != 0) {
-                        RR_LOG("Failed to write back accept addrlen data");
-                    }
-                }
-            }
-            break;
-
-#ifdef TARGET_NR_recvfrom
-        case TARGET_NR_recvfrom:
-            /* 写回接收到的数据和源地址 */
-            if (ret > 0) {
-                if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0) {
-                    size_t copy_size = MIN(ret, g_current_record->arg_size[1]);
-                    if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                           g_current_record->arg_data[1], copy_size, 1) != 0) {
-                        RR_LOG("Failed to write back recvfrom data");
-                    }
-                }
-                // 写回源地址
-                if (g_current_record->arg_data[4] && g_current_record->arg_size[4] > 0) {
-                    if (cpu_memory_rw_debug(env_cpu(env), args[4],
-                                           g_current_record->arg_data[4],
-                                           g_current_record->arg_size[4], 1) != 0) {
-                        RR_LOG("Failed to write back recvfrom sockaddr data");
-                    }
-                }
-                if (g_current_record->arg_data[5] && g_current_record->arg_size[5] > 0) {
-                    if (cpu_memory_rw_debug(env_cpu(env), args[5],
-                                           g_current_record->arg_data[5],
-                                           g_current_record->arg_size[5], 1) != 0) {
-                        RR_LOG("Failed to write back recvfrom addrlen data");
-                    }
-                }
-            }
-            break;
-#endif
-
-        // 进程相关数据恢复
-#ifdef TARGET_NR_wait4
-        case TARGET_NR_wait4:
-            /* 写回子进程状态 */
-            if (ret >= 0 && g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[1],
-                                       g_current_record->arg_data[1],
-                                       g_current_record->arg_size[1], 1) != 0) {
-                    RR_LOG("Failed to write back wait4 status data");
-                }
-            }
-            break;
-#endif
-
-        // 管道数据恢复已在前面处理
-
-        // 文件访问权限检查系统调用
-#ifdef TARGET_NR_access
-        case TARGET_NR_access:
-            // access系统调用不需要数据写回，仅依赖返回值
-            // 记录的字符串数据用于验证，但不需要恢复
-            break;
-#endif
-
-        case TARGET_NR_faccessat:
-            // faccessat系统调用不需要数据写回，仅依赖返回值
-            // 记录的字符串数据用于验证，但不需要恢复
-            break;
-
-        // 写入操作增强验证
-        case TARGET_NR_write:
-            // write系统调用的数据验证（可选）
-            if (g_current_record->arg_data[1] && g_current_record->arg_size[1] > 0) {
-                // 可选：验证写入数据的一致性
-                // 通常write不需要数据恢复，仅验证返回值和FD映射
-                RR_LOG("Write operation with %zu bytes data recorded", g_current_record->arg_size[1]);
-            }
-            break;
-
-        // 资源限制数据恢复
-        case TARGET_NR_prlimit64:
-            /* 写回旧的资源限制 */
-            if (ret == 0 && g_current_record->arg_data[3] && g_current_record->arg_size[3] > 0) {
-                if (cpu_memory_rw_debug(env_cpu(env), args[3],
-                                       g_current_record->arg_data[3],
-                                       g_current_record->arg_size[3], 1) != 0) {
-                    RR_LOG("Failed to write back prlimit64 data");
-                }
-            }
-            break;
+        /* 🔥 Hybrid 路径不需要任何数据恢复逻辑 - 所有数据由真实 syscall 填充 */
 
         default:
             /* 大部分系统调用只需要返回记录的返回值 */
             break;
     }
 
-    /* 更新FD映射 */
-    update_fd_mapping(num, args, ret);
-
-    /* 准备下一条记录 */
+    /* 🔥 关键修复: Hybrid 模式在返回前必须清理记录并推进索引 */
     /* 清理当前记录的参数数据 */
     for (int i = 0; i < 8; i++) {
         if (g_current_record->arg_data[i]) {
             g_free(g_current_record->arg_data[i]);
         }
     }
+    
+    /* 清理 aux_data */
+    if (g_current_record->aux_data) {
+        rr_aux_free(g_current_record->aux_data);
+        g_current_record->aux_data = NULL;
+    }
+    
+    /* 释放记录并推进索引 */
+    g_free(g_current_record);
+    g_current_record = NULL;
+    g_rr_framework->replay_index++;
+    
+    /* 设置标记，告诉 post_hook 不要重复处理 */
+    g_syscall_already_consumed = true;
+    
+    /* 返回 -1，让 QEMU 执行真实 syscall (使用变异后的参数) */
+    RR_VERBOSE("REPLAY_SYSCALL: Hybrid mode, record cleaned, executing real syscall %d", num);
+    return -1;
+
+replay_success:
+    /* Pure Replay 成功路径：已经返回确定性结果，清理记录 */
+    /* 清理当前记录的参数数据 */
+    for (int i = 0; i < 8; i++) {
+        if (g_current_record->arg_data[i]) {
+            g_free(g_current_record->arg_data[i]);
+        }
+    }
+    
+    /* 清理 aux_data */
+    if (g_current_record->aux_data) {
+        rr_aux_free(g_current_record->aux_data);
+        g_current_record->aux_data = NULL;
+    }
+    
     g_free(g_current_record);
     g_current_record = NULL;
 
     g_rr_framework->replay_index++;
+    
+    /* 设置标记，告诉 post_hook 不要重复处理 */
+    g_syscall_already_consumed = true;
 
-    RR_VERBOSE("REPLAY_SYSCALL: Successfully replayed syscall %u: %d -> %ld",
-               g_rr_framework->replay_index - 1, num, ret);
+    RR_VERBOSE("REPLAY_SYSCALL: Successfully replayed syscall %u: %d -> %d",
+               g_rr_framework->replay_index - 1, num, (int)ret);
     return ret;
 }

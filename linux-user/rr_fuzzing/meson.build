@@ -5,19 +5,22 @@
 rr_fuzz_sources = files(
   'rr_main.c',
   'rr_record.c',
-  'rr_replay.c',
-  # 'rr_replay_strace.c',  # 禁用原版，使用优化版本
-  'rr_replay_strace_optimized.c',  # 启用优化版本
+  'rr_replay.c',              # 二进制 trace Hybrid 重放
+  'rr_replay_pure.c',         # 二进制 trace Pure 重放（EnvFuzz 风格）
+  'rr_replay_strace_optimized.c',  # Strace 文本重放
   'rr_syscall_dispatch.c',
   'rr_mapping_manager.c',
   'rr_syscallparser.c',
   'rr_ipc.c',
   'rr_fork_server.c',
   'rr_fuzz_engine.c',
+  'rr_fuzz_aux_mutations.c',  # Phase 1: aux_data 变异引擎
+  'rr_replay_pure_reapply.c', # Phase 1: Pure Replay 重新应用
   'rr_snapshot.c',
   'rr_debug.c',
   'rr_config.c',
-  'rr_syscall_info.c',  # 新增：系统调用分类
+  'rr_syscall_info.c',        # 系统调用分类
+  'rr_aux_data.c',            # EnvFuzz 风格的 AUX 数据系统
 )
 
 # 动态跟踪模块 - 已启用

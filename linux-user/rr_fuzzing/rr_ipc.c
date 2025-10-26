@@ -134,15 +134,33 @@ int rr_ipc_send_status(int status)
 
     RR_INFO("📤 Sending status: %d (fd=%d, pid=%d)", status, g_rr_framework->status_pipe_fd, getpid());
     
-    ssize_t written = write(g_rr_framework->status_pipe_fd, &status, sizeof(status));
-    if (written != sizeof(status)) {
-        RR_ERROR("Failed to send status %d: written=%zd, errno=%d (%s)", 
-                 status, written, errno, strerror(errno));
-        return -1;
+    /* 🔥 修复：添加重试机制，处理非阻塞写入 */
+    int retry_count = 0;
+    const int max_retries = 3;
+    ssize_t written;
+    
+    while (retry_count < max_retries) {
+        written = write(g_rr_framework->status_pipe_fd, &status, sizeof(status));
+        if (written == sizeof(status)) {
+            RR_INFO("✅ Status %d sent successfully", status);
+            return 0;
+        }
+        
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* 管道缓冲区满，短暂等待后重试 */
+            retry_count++;
+            RR_WARN("Status pipe full, retrying (%d/%d)...", retry_count, max_retries);
+            usleep(10000); // 10ms
+            continue;
+        }
+        
+        /* 其他错误 */
+        break;
     }
-
-    RR_INFO("✅ Status %d sent successfully", status);
-    return 0;
+    
+    RR_ERROR("Failed to send status %d after %d retries: written=%zd, errno=%d (%s)", 
+             status, retry_count, written, errno, strerror(errno));
+    return -1;
 }
 
 /**
@@ -165,10 +183,15 @@ int rr_ipc_receive_command(void)
     if (n != 1) {
         if (n < 0) {
             RR_WARN("read() failed with errno=%d (%s)", errno, strerror(errno));
+            return 0;
+        } else if (n == 0) {
+            /* 🔥 修复：管道关闭（EOF），应返回退出命令 */
+            RR_WARN("Command pipe closed (EOF), conductor disconnected");
+            return 'Q'; // 返回退出命令，让 fork server 安全停机
         } else {
-            RR_VERBOSE("read() returned %zd (no data or EOF)", n);
+            RR_VERBOSE("read() returned %zd (partial read)", n);
+            return 0;
         }
-        return 0; // 无数据或错误
     }
 
     RR_LOG("Received command: %c", cmd);

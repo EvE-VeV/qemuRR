@@ -14,16 +14,20 @@
 /* ==================== 全局状态 ==================== */
 
 // 当前生效的Fuzz指令集（从共享内存加载）
-static FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
-static size_t g_instruction_count = 0;
+// ✅ Phase 1: 改为非 static，供 rr_fuzz_aux_mutations.c 使用
+FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
+size_t g_instruction_count = 0;
 
 // 变异统计
-static struct {
+typedef struct {
     uint64_t total_mutations;       // 总变异次数
     uint64_t arg_mutations;         // 参数变异
     uint64_t buffer_mutations;      // 缓冲区变异
     uint64_t boundary_tests;        // 边界值测试
-} g_fuzz_stats = {0};
+} fuzz_stats_t;
+
+// ✅ Phase 1: 改为非 static，供 rr_fuzz_aux_mutations.c 使用
+fuzz_stats_t g_fuzz_stats = {0};
 
 /**
  * 从共享内存加载Fuzz指令
@@ -112,11 +116,12 @@ int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count
  * 根据Fuzz指令对系统调用参数进行变异
  * 支持多种变异策略，针对不同类型的参数
  * 
+ * @param env CPU环境（用于写入guest内存）
  * @param syscall_index 系统调用在trace中的索引
  * @param args 系统调用参数数组（会被修改）
  * @param syscall_nr 系统调用号
  */
-static void apply_mutations_for_syscall(uint32_t syscall_index, abi_long *args, int syscall_nr)
+static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
     if (g_instruction_count == 0) {
         return;  // 没有变异指令
@@ -172,9 +177,14 @@ static void apply_mutations_for_syscall(uint32_t syscall_index, abi_long *args, 
                                syscall_name ? syscall_name : "unknown",
                                instr->arg_index, addr, instr->data_len, syscall_index);
                         
-                        // 注意：实际写入需要CPU环境，这里只记录
-                        // 在实际实现中可以通过 cpu_memory_rw_debug 写入
-                        g_fuzz_stats.buffer_mutations++;
+                        /* 🔥 修复：真正写入 guest 内存 */
+                        if (cpu_memory_rw_debug(env_cpu(env), addr, instr->data, instr->data_len, 1) == 0) {
+                            g_fuzz_stats.buffer_mutations++;
+                            RR_VERBOSE("REPLACE_BUFFER: Successfully wrote %u bytes to guest addr 0x%lx",
+                                      instr->data_len, addr);
+                        } else {
+                            RR_WARN("REPLACE_BUFFER: Failed to write to guest memory at 0x%lx", addr);
+                        }
                     }
                 }
                 break;
@@ -228,7 +238,7 @@ void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long 
         return;
     }
 
-    apply_mutations_for_syscall(syscall_index, args, syscall_nr);
+    apply_mutations_for_syscall(env, syscall_index, args, syscall_nr);
 }
 
 /**

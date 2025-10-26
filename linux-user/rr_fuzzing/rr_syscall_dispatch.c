@@ -90,11 +90,45 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
     if (strcmp(record->syscall_name, "mmap") == 0) {
-        if (record->arg_count > 0) args[0] = record->args[0].value; // addr
+        // ✅ 修复：应用地址映射
+        if (record->arg_count > 0) {
+            target_ulong recorded_addr = (target_ulong)record->args[0].value;
+            target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
+            args[0] = (abi_long)mapped_addr;
+            
+            if (recorded_addr != 0 && mapped_addr != recorded_addr) {
+                fprintf(stderr, "[ADDR-MAPPING] mmap: recorded_addr=0x%lx -> mapped_addr=0x%lx\n",
+                        (unsigned long)recorded_addr, (unsigned long)mapped_addr);
+            }
+        }
         if (record->arg_count > 4) args[4] = record->args[4].value; // fd (将在apply_memory_fd_mapping中映射)
     } else if (strcmp(record->syscall_name, "mprotect") == 0) {
+        // ✅ 修复：mprotect也需要地址映射
+        if (record->arg_count > 0) {
+            target_ulong recorded_addr = (target_ulong)record->args[0].value;
+            target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
+            
+            // 🔧 关键修复：如果找不到映射，不要强制使用trace中的地址
+            // 对于无法映射的地址（如VDSO、动态链接器区域），直接跳过不修改参数
+            if (recorded_addr != 0 && mapped_addr != recorded_addr) {
+                args[0] = (abi_long)mapped_addr;
+                fprintf(stderr, "[ADDR-MAPPING] mprotect: recorded_addr=0x%lx -> mapped_addr=0x%lx\n",
+                        (unsigned long)recorded_addr, (unsigned long)mapped_addr);
+            } else {
+                // 找不到映射，保持当前参数不变（让syscall自然执行）
+                fprintf(stderr, "[ADDR-MAPPING-SKIP] mprotect: addr=0x%lx not in mapping table, using current value\n",
+                        (unsigned long)recorded_addr);
+            }
+        }
         if (record->arg_count > 1) args[1] = record->args[1].value; // len
         if (record->arg_count > 2) args[2] = record->args[2].value; // prot
+    } else if (strcmp(record->syscall_name, "munmap") == 0) {
+        // ✅ 新增：munmap也需要地址映射  
+        if (record->arg_count > 0) {
+            target_ulong recorded_addr = (target_ulong)record->args[0].value;
+            target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
+            args[0] = (abi_long)mapped_addr;
+        }
     }
 }
 
@@ -124,15 +158,26 @@ static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long 
     if (!record) return;
     
     if (strcmp(record->syscall_name, "mmap") == 0) {
+        fprintf(stderr, "[MEMORY-POST-HOOK] mmap: ret=%ld, recorded_ret=%lu, MAP_FAILED=%ld\n",
+                (long)ret, (unsigned long)record->ret_value, (long)MAP_FAILED);
+        
         if (ret != (abi_long)MAP_FAILED && record->ret_value != (target_ulong)MAP_FAILED) {
             target_ulong recorded_addr = (target_ulong)record->ret_value;
             target_ulong actual_addr = (target_ulong)ret;
             size_t size = (size_t)record->args[1].value;
+            
+            fprintf(stderr, "[ADDR-MAPPING-ADD] mmap: recorded=0x%lx -> actual=0x%lx, size=%zu\n",
+                    (unsigned long)recorded_addr, (unsigned long)actual_addr, size);
+            
             rr_addr_mapping_add(recorded_addr, actual_addr, size);
+        } else {
+            fprintf(stderr, "[MEMORY-POST-HOOK] mmap: SKIPPED address mapping (failed)\n");
         }
     } else if (strcmp(record->syscall_name, "munmap") == 0) {
         if (ret == 0 && record->ret_value == 0) {
             target_ulong recorded_addr = (target_ulong)record->args[0].value;
+            fprintf(stderr, "[ADDR-MAPPING-REMOVE] munmap: recorded=0x%lx\n",
+                    (unsigned long)recorded_addr);
             rr_addr_mapping_remove(recorded_addr);
         }
     }
@@ -380,10 +425,15 @@ void rr_apply_fd_mapping_optimized(int syscall_nr, abi_long *args) {
 }
 
 void rr_syscall_post_hook_optimized(int syscall_nr, rr_strace_record_t *record, 
-                                   abi_long ret, abi_long *args) {
-    if (!record || !args) return;
+                                  abi_long ret, abi_long *args) {
+    /* 🔥 修复：删除了所有冗余的 stderr 输出 */
+    
+    if (!record || !args) {
+        return;
+    }
     
     rr_syscall_handler_t *handler = rr_get_syscall_handler(syscall_nr);
+    
     if (handler && handler->post_hook) {
         handler->post_hook(record, ret, args);
     }

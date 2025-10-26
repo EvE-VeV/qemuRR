@@ -15,6 +15,9 @@
 
 /* ================= 基础数据结构 ================= */
 
+/* Forward declaration for aux data */
+struct rr_aux_data;
+
 /**
  * 系统调用记录结构 - 核心数据
  */
@@ -24,9 +27,13 @@ typedef struct syscall_record {
     abi_long args[8];                   // 参数值
     abi_long retval;                    // 返回值
 
-    /* 参数数据存储 */
+    /* 参数数据存储 (传统方式 - 保持向后兼容) */
     uint8_t *arg_data[8];               // 参数指向的数据
     size_t arg_size[8];                 // 每个参数数据的大小
+
+    /* EnvFuzz风格的辅助数据 (新增) */
+    struct rr_aux_data *aux_data;       // 辅助数据链表
+    bool has_aux_data;                  // 是否有辅助数据
 
     /* 元数据 */
     bool creates_fd;                    // 是否创建文件描述符
@@ -44,7 +51,14 @@ typedef enum {
     FUZZ_CMD_MUTATE_ARG,            // 变异参数
     FUZZ_CMD_REPLACE_BUFFER,        // 替换缓冲区
     FUZZ_CMD_MUTATE_FLAGS,          // 变异标志位
-    FUZZ_CMD_BOUNDARY_VALUE         // 边界值测试
+    FUZZ_CMD_BOUNDARY_VALUE,        // 边界值测试
+    
+    /* ━━━━ Phase 1: 新增针对 aux_data 的变异命令 ━━━━ */
+    FUZZ_CMD_MUTATE_AUX_BUFFER = 5, // 变异 aux_data 缓冲区内容
+    FUZZ_CMD_FLIP_BITS = 6,         // 位翻转（随机翻转某些位）
+    FUZZ_CMD_TRUNCATE = 7,          // 截断数据（减少大小）
+    FUZZ_CMD_EXTEND = 8,            // 扩展数据（增加大小）
+    FUZZ_CMD_INTERESTING_VALUES = 9 // 特殊值注入（边界值、魔数等）
 } fuzz_cmd_type_t;
 
 /**
@@ -118,11 +132,16 @@ typedef struct {
     rr_fork_strategy_t fork_strategy;   // Fork点检测策略
     int fork_fallback_threshold;        // Fallback策略：多少个syscall后强制fork（默认20）
     char *fork_syscall_pattern;         // Fork点匹配模式（如"*/input.txt"）
-    uint32_t fork_point;                // Fork点位置（废弃，保留兼容性）
+    
+    /* @deprecated 废弃字段 - 仅保留向后兼容 */
+    uint32_t fork_point;                // Fork点位置（已废弃，请使用fork_strategy自动检测）
 
     /* IPC配置 */
     size_t shared_memory_size;          // 共享内存大小
     int ipc_timeout;                    // IPC超时(毫秒)
+    
+    /* 高级配置 */
+    bool use_legacy_capture;            // 是否使用传统捕获方式（默认false，仅用aux_data）
 } rr_config_t;
 
 extern rr_config_t g_rr_config;
@@ -155,7 +174,6 @@ typedef struct {
 
     /* 统计信息 */
     uint64_t total_syscalls;            // 总系统调用数
-    uint64_t total_executions;          // 总执行数
 } rr_framework_t;
 
 /* ================= 全局变量 ================= */
@@ -218,15 +236,21 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
 int rr_start_recording(const char *trace_file);
 void rr_stop_recording(void);
 
-/* Replay模块 */
+/* Replay模块 - Hybrid 模式（传统二进制 trace） */
 abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args);
 int rr_start_replay(const char *trace_file);
 void rr_stop_replay(void);
 
+/* Replay状态标记 - 用于协调 replay 和 post_hook */
+extern __thread bool g_syscall_already_consumed;
+
+/* Replay模块 - Pure 模式（EnvFuzz 风格） */
+/* 声明已移至 rr_replay_pure.h */
+
 /* Fork Server模块 */
 int rr_start_fork_server(const char *syscall_name, const char *pattern);
 void rr_stop_fork_server(void);
-bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_long *args);
+bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_name, const abi_long *args);
 int rr_fork_server_loop(void);
 void rr_reset_fork_point(void);
 
@@ -247,6 +271,21 @@ FuzzInstruction *rr_fuzz_generate_mutations(uint32_t target_syscall, int target_
                                           size_t *out_count);
 void rr_fuzz_cleanup(void);
 
+/* ━━━━ Phase 1: Pure Replay + Fuzzing 集成 ━━━━ */
+/**
+ * 变异 aux_data 中的数据
+ * 
+ * 此函数用于在 Pure Replay 路径中对 aux_data 进行变异
+ * 支持多种变异策略：缓冲区替换、位翻转、截断、扩展、特殊值注入
+ * 
+ * @param env CPU 环境
+ * @param record 系统调用记录（包含 aux_data）
+ * @param args 系统调用参数
+ * @param syscall_nr 系统调用号
+ */
+void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
+                              abi_long *args, int syscall_nr);
+
 /* Strace Replay模块 */
 abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long *args);
 void rr_strace_set_mode_optimized(bool strict_mode, bool skip_unmatched, int max_lookahead);
@@ -254,14 +293,21 @@ bool rr_strace_replay_enabled_optimized(void);
 void rr_strace_get_replay_stats_optimized(uint64_t *total, uint64_t *matched,
                                          uint64_t *failed, uint64_t *skipped);
 
-/* Snapshot模块 */
-int rr_snapshot_save(uint32_t syscall_index);
-int rr_snapshot_restore(uint32_t syscall_index);
-uint32_t rr_snapshot_get_latest(void);
-int rr_snapshot_list(uint32_t *snapshots, size_t max_count);
-bool rr_snapshot_should_save(int syscall_nr, uint32_t syscall_index);
-void rr_snapshot_auto_manage(int syscall_nr, uint32_t syscall_index);
-void rr_snapshot_cleanup(void);
+/* 
+ * Snapshot模块 
+ * 
+ * ⚠️ 注意：大部分API为预留接口，当前仅为stub实现
+ * 实际使用的API: rr_snapshot_auto_manage(), rr_snapshot_cleanup()
+ * 
+ * TODO: 实现完整的快照功能（保存/恢复CPU状态、内存状态等）
+ */
+int rr_snapshot_save(uint32_t syscall_index);              /* @stub 未实现 */
+int rr_snapshot_restore(uint32_t syscall_index);           /* @stub 未实现 */
+uint32_t rr_snapshot_get_latest(void);                     /* @stub 部分实现 */
+int rr_snapshot_list(uint32_t *snapshots, size_t max_count); /* @unimplemented 未定义 */
+bool rr_snapshot_should_save(int syscall_nr, uint32_t syscall_index); /* @unimplemented 未定义 */
+void rr_snapshot_auto_manage(int syscall_nr, uint32_t syscall_index); /* ✓ 已实现（空操作） */
+void rr_snapshot_cleanup(void);                            /* ✓ 已实现 */
 
 /* 工具函数 */
 uint8_t *rr_capture_string(CPUArchState *env, target_ulong addr, size_t *len);
@@ -341,6 +387,87 @@ const char *rr_debug_level_name(rr_debug_level_t level);
 #define RR_LOG(fmt, ...) do {} while(0)
 
 #endif /* RR_DEBUG */
+
+/* ========== EnvFuzz 风格：系统调用过滤 ========== */
+
+/**
+ * 判断系统调用是否应该被跳过（不记录/不重放，直接执行）
+ * 
+ * EnvFuzz 核心思想：只记录/重放需要确定性的系统调用
+ * 对于内存管理、进程管理等系统调用，让它们自然执行
+ */
+static inline bool rr_should_skip_syscall(int syscall_nr)
+{
+    switch (syscall_nr) {
+        /* 内存管理系统调用 - 应该实时执行 */
+        case TARGET_NR_brk:
+#ifdef TARGET_NR_mmap
+        case TARGET_NR_mmap:
+#endif
+#ifdef TARGET_NR_mmap2
+        case TARGET_NR_mmap2:
+#endif
+        case TARGET_NR_munmap:
+        case TARGET_NR_mremap:
+        case TARGET_NR_mprotect:
+        case TARGET_NR_madvise:
+            
+        /* 架构特定的系统调用 */
+#ifdef TARGET_NR_arch_prctl
+        case TARGET_NR_arch_prctl:
+#endif
+            
+        /* 线程/进程管理 - 实时执行（但不跳过record/replay getpid等） */
+        case TARGET_NR_set_robust_list:
+        case TARGET_NR_rseq:
+        case TARGET_NR_clone:
+#ifdef TARGET_NR_fork
+        case TARGET_NR_fork:
+#endif
+#ifdef TARGET_NR_vfork
+        case TARGET_NR_vfork:
+#endif
+#ifdef TARGET_NR_tgkill
+        case TARGET_NR_tgkill:
+#endif
+            return true;
+            
+        default:
+            return false;
+    }
+}
+
+/**
+ * 判断系统调用是否是输出类系统调用
+ * 
+ * 输出类系统调用必须真实执行以维持程序的I/O状态
+ * 在Pure Replay模式下，这些系统调用不能被"重放"
+ */
+static inline bool rr_is_output_syscall(int syscall_nr)
+{
+    switch (syscall_nr) {
+        case TARGET_NR_write:
+#ifdef TARGET_NR_writev
+        case TARGET_NR_writev:
+#endif
+#ifdef TARGET_NR_pwrite64
+        case TARGET_NR_pwrite64:
+#endif
+#ifdef TARGET_NR_send
+        case TARGET_NR_send:
+#endif
+#ifdef TARGET_NR_sendto
+        case TARGET_NR_sendto:
+#endif
+#ifdef TARGET_NR_sendmsg
+        case TARGET_NR_sendmsg:
+#endif
+            return true;
+            
+        default:
+            return false;
+    }
+}
 
 /* ========== 动态跟踪API（用于实时树可视化） ========== */
 #define RR_ENABLE_DYNAMIC_TRACE 1

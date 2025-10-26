@@ -20,6 +20,7 @@ rr_framework_t *g_rr_framework = NULL;
 
 /* 用于mmap地址映射的临时存储 */
 target_ulong g_pending_mmap_recorded_addr = 0;
+target_ulong g_pending_mmap_length = 0;
 
 /**
  * 获取系统调用名称
@@ -333,35 +334,16 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             g_rr_framework->mode == RR_MODE_REPLAY ? "REPLAY" :
             g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN");
 
-    /* 特殊处理deterministic系统调用，直接返回固定值，不需要记录/重放 */
-    switch (num) {
-        case 39: /* getpid */
-            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getpid");
-            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 12345L);
-            RR_INFO("===============================================================");    
-            return 12345; // 返回固定的PID
-        case 102: /* getuid */
-            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getuid");
-            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 1000L);
-            RR_INFO("===============================================================");    
-            return 1000; // 返回固定的UID
-        case 104: /* getgid */
-            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall getgid");
-            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 1000L);
-            RR_INFO("===============================================================");    
-            return 1000; // 返回固定的GID
-        case 218: /* set_tid_address */
-            RR_VERBOSE("RR_DO_SYSCALL: Handling deterministic syscall set_tid_address");
-            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, 12345L);
-            RR_INFO("===============================================================");    
-            return 12345; // 返回与getpid一致的固定值
-        case 231: /* exit_group */
-            RR_VERBOSE("RR_DO_SYSCALL: Handling exit_group syscall, allowing normal exit");
-            RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %ld ===", syscall_name, num, -1L);
-            RR_INFO("===============================================================");    
-            return -1; // 让系统正常退出
-        default:
-            break; // 继续正常的record/replay逻辑
+    /* 退出系统调用需要记录结果，但仍交由宿主执行 */
+    if (num == 231 || num == 60) {
+        RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num);
+        if (g_rr_framework->mode == RR_MODE_RECORD) {
+            abi_long args[8] = {
+                *arg1, *arg2, *arg3, *arg4,
+                *arg5, *arg6, *arg7, *arg8
+            };
+            rr_record_syscall(env, num, args, *arg1);
+        }
     }
 
     abi_long args[8] = {*arg1, *arg2, *arg3, *arg4, *arg5, *arg6, *arg7, *arg8};
@@ -513,10 +495,18 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
     if (g_rr_framework->mode == RR_MODE_REPLAY || g_rr_framework->mode == RR_MODE_FUZZING) {
         /* 重放模式：处理句柄映射 */
         
-        // 调用strace replay的POST-HOOK（新增）
+        /* 🔥 修复：先让 strace post_hook 运行，再检查标志 */
         if (rr_strace_replay_enabled()) {
             abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
             rr_strace_syscall_post_hook(env, num, ret, args);
+        }
+        
+        /* 检查：如果这个系统调用已经在 rr_replay_syscall 中被消费（读取记录并递增索引），
+         * 就不要再做记录处理，避免重复 */
+        if (g_syscall_already_consumed) {
+            RR_VERBOSE("POST_HOOK: Syscall %d already consumed in replay, skipping record handling", num);
+            g_syscall_already_consumed = false; /* 重置标记 */
+            return;
         }
         
         // 原有的mmap地址映射处理（保留）

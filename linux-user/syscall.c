@@ -10675,6 +10675,16 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         }
 #else
         /* mmap pointers are always untagged */
+#ifdef CONFIG_RR_FUZZING
+        /* RRfuzz: 检查是否需要使用 MAP_FIXED 到 recorded 地址 */
+        extern target_ulong g_pending_mmap_recorded_addr;
+        if (g_pending_mmap_recorded_addr != 0) {
+            target_ulong recorded_addr = g_pending_mmap_recorded_addr;
+            g_pending_mmap_recorded_addr = 0; /* 清除标志 */
+            /* 强制使用 MAP_FIXED 到 recorded 地址 */
+            return do_mmap(recorded_addr, arg2, arg3, arg4 | MAP_FIXED, arg5, arg6);
+        }
+#endif
         return do_mmap(arg1, arg2, arg3, arg4, arg5, arg6);
 #endif
 #endif
@@ -10682,6 +10692,17 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_mmap2:
 #ifndef MMAP_SHIFT
 #define MMAP_SHIFT 12
+#endif
+#ifdef CONFIG_RR_FUZZING
+        /* RRfuzz: 检查是否需要使用 MAP_FIXED 到 recorded 地址 */
+        extern target_ulong g_pending_mmap_recorded_addr;
+        if (g_pending_mmap_recorded_addr != 0) {
+            target_ulong recorded_addr = g_pending_mmap_recorded_addr;
+            g_pending_mmap_recorded_addr = 0; /* 清除标志 */
+            /* 强制使用 MAP_FIXED 到 recorded 地址 */
+            return do_mmap(recorded_addr, arg2, arg3, arg4 | MAP_FIXED, arg5,
+                          (off_t)(abi_ulong)arg6 << MMAP_SHIFT);
+        }
 #endif
         return do_mmap(arg1, arg2, arg3, arg4, arg5,
                        (off_t)(abi_ulong)arg6 << MMAP_SHIFT);

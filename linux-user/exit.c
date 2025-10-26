@@ -27,6 +27,10 @@
 extern void __gcov_dump(void);
 #endif
 
+#ifdef CONFIG_RR_FUZZING
+extern void rr_framework_cleanup(void);
+#endif
+
 void preexit_cleanup(CPUArchState *env, int code)
 {
 #ifdef CONFIG_GCOV
@@ -35,4 +39,9 @@ void preexit_cleanup(CPUArchState *env, int code)
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
+
+#ifdef CONFIG_RR_FUZZING
+        /* Cleanup RR-Fuzz framework before exit */
+        rr_framework_cleanup();
+#endif
 }

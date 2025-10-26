@@ -187,6 +187,7 @@ target_ulong rr_addr_mapping_get(target_ulong recorded_addr) {
     
     g_stats.addr_lookups++;
     
+    // 首先尝试精确匹配（快速路径）
     size_t bucket = hash_addr(recorded_addr, g_addr_table->bucket_count);
     rr_addr_mapping_t *current = g_addr_table->buckets[bucket];
     
@@ -197,6 +198,33 @@ target_ulong rr_addr_mapping_get(target_ulong recorded_addr) {
             return current->actual_addr;
         }
         current = current->next;
+    }
+    
+    // 精确匹配失败，尝试范围查询（慢速路径）
+    // 遍历所有bucket查找包含此地址的映射
+    for (size_t i = 0; i < g_addr_table->bucket_count; i++) {
+        current = g_addr_table->buckets[i];
+        while (current) {
+            target_ulong range_start = current->recorded_addr;
+            target_ulong range_end = current->recorded_addr + current->size;
+            
+            if (recorded_addr >= range_start && recorded_addr < range_end) {
+                // 找到包含此地址的映射，计算偏移
+                target_ulong offset = recorded_addr - range_start;
+                target_ulong mapped_addr = current->actual_addr + offset;
+                
+                current->timestamp = ++g_addr_table->access_counter;
+                g_stats.addr_hits++;
+                
+                fprintf(stderr, "[ADDR-RANGE-MAPPING] addr=0x%lx in range [0x%lx-0x%lx], offset=0x%lx, mapped=0x%lx\n",
+                        (unsigned long)recorded_addr,
+                        (unsigned long)range_start, (unsigned long)range_end,
+                        (unsigned long)offset, (unsigned long)mapped_addr);
+                
+                return mapped_addr;
+            }
+            current = current->next;
+        }
     }
     
     g_stats.addr_misses++;

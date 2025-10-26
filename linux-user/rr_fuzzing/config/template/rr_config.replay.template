@@ -21,7 +21,7 @@ enabled=true
 mode=replay
 
 # Trace文件输入路径（必须是已录制的文件）
-trace_file=./trace-record.txt
+trace_file=/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/strace-record-ls.txt
 
 # === Debug配置 ===
 # 调试级别: 0=off, 1=error, 2=warn, 3=info, 4=verbose, 5=trace

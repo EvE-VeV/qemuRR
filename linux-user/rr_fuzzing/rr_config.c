@@ -36,7 +36,10 @@ static const rr_config_t DEFAULT_CONFIG = {
 
     /* IPC配置 */
     .shared_memory_size = 4096,           // 4KB
-    .ipc_timeout = 1000                   // 1秒
+    .ipc_timeout = 1000,                  // 1秒
+    
+    /* 高级配置 */
+    .use_legacy_capture = false           // 默认只使用aux_data，避免双重捕获
 };
 
 /**
@@ -219,6 +222,8 @@ static int load_config_file(const char *config_file)
             g_rr_config.fork_strategy = parse_int(value, DEFAULT_CONFIG.fork_strategy);
         } else if (strcmp(key, "fork_threshold") == 0) {
             g_rr_config.fork_fallback_threshold = parse_int(value, DEFAULT_CONFIG.fork_fallback_threshold);
+        } else if (strcmp(key, "use_legacy_capture") == 0) {
+            g_rr_config.use_legacy_capture = parse_bool(value, DEFAULT_CONFIG.use_legacy_capture);
         } else {
             RR_WARN("Unknown config key '%s' at line %d", key, line_num);
         }
@@ -322,6 +327,12 @@ int rr_config_init(void)
     const char *fork_threshold = getenv("RR_FORK_THRESHOLD");
     if (fork_threshold) {
         g_rr_config.fork_fallback_threshold = parse_int(fork_threshold, DEFAULT_CONFIG.fork_fallback_threshold);
+    }
+
+    /* 高级配置 */
+    const char *use_legacy_capture = getenv("RR_USE_LEGACY_CAPTURE");
+    if (use_legacy_capture) {
+        g_rr_config.use_legacy_capture = parse_bool(use_legacy_capture, DEFAULT_CONFIG.use_legacy_capture);
     }
 
     /* 设置默认路径 */

@@ -138,12 +138,12 @@ void rr_stop_fork_server(void)
 /**
  * 提取系统调用的路径参数
  * 
+ * @param env CPU环境（用于读取内存）- 必需参数
  * @param syscall_name 系统调用名称
  * @param args 系统调用参数
- * @param env CPU环境（用于读取内存）
  * @return 提取的路径字符串，需要调用者释放；失败返回NULL
  */
-static char *extract_path_from_syscall(const char *syscall_name, const abi_long *args, CPUArchState *env)
+static char *extract_path_from_syscall(CPUArchState *env, const char *syscall_name, const abi_long *args)
 {
     if (!syscall_name || !args) {
         return NULL;
@@ -164,21 +164,45 @@ static char *extract_path_from_syscall(const char *syscall_name, const abi_long 
         return NULL;
     }
 
-    // 从目标内存读取字符串
-    // 注意：这里简化处理，实际应该使用cpu_memory_rw_debug
-    // 但为了兼容性，我们先返回一个占位符
-    return strdup("(path_extraction_not_implemented)");
+    /* 🔥 修复：真实读取 guest 内存中的路径字符串 */
+    if (!env) {
+        RR_WARN("Cannot extract path without CPU env");
+        return NULL;
+    }
+    
+    /* 从 guest 内存读取字符串（最多4KB） */
+    char path_buffer[4096];
+    size_t len = 0;
+    
+    while (len < sizeof(path_buffer) - 1) {
+        uint8_t byte;
+        if (cpu_memory_rw_debug(env_cpu(env), path_addr + len, &byte, 1, 0) != 0) {
+            break; // 内存访问失败
+        }
+        if (byte == 0) {
+            break; // 字符串结束
+        }
+        path_buffer[len++] = byte;
+    }
+    path_buffer[len] = '\0';
+    
+    if (len == 0) {
+        return NULL;
+    }
+    
+    return strdup(path_buffer);
 }
 
 /**
  * 检查是否到达Fork点（新实现）
  * 
+ * @param env CPU环境（用于读取路径）
  * @param syscall_nr 系统调用号
  * @param syscall_name 系统调用名称
  * @param args 系统调用参数
  * @return true表示到达fork点，false表示未到达
  */
-bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_long *args)
+bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_name, const abi_long *args)
 {
     if (!g_rr_framework->fork_server_active) {
         return false;
@@ -217,7 +241,7 @@ bool rr_check_fork_point(int syscall_nr, const char *syscall_name, const abi_lon
     }
 
     // 有路径模式，需要进一步检查路径
-    char *path = extract_path_from_syscall(syscall_name, args, NULL);
+    char *path = extract_path_from_syscall(env, syscall_name, args);
     if (!path) {
         RR_VERBOSE("Could not extract path from %s, skipping pattern match", syscall_name);
         return false;
@@ -369,13 +393,11 @@ int rr_fork_server_loop(void)
                         }
                         
                         g_rr_framework->child_pid = 0;
-                        g_rr_framework->total_executions++;
                         
                         /* 重置 fork 点状态，准备下次迭代 */
                         g_at_fork_point = false;
                         RR_VERBOSE("Reset fork point for next iteration");
-                        
-                        RR_VERBOSE("Completed execution #%lu", g_rr_framework->total_executions);
+                        RR_VERBOSE("Completed execution (child process finished)");
                         
                     } else {
                         /* Fork失败 */
