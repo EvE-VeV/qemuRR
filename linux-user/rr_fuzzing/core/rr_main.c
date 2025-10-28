@@ -9,9 +9,10 @@
 #endif
 
 #include "rr_framework.h"
-#include "rr_replay_strace.h"
-#include "rr_aux_data.h"
-#include "rr_dynamic_trace.h"
+#include "../replay/rr_replay_strace.h"
+#include "../record/rr_aux_data.h"
+#include "../utils/rr_dynamic_trace.h"
+#include "rr_constants.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
 #include <fcntl.h>
@@ -119,9 +120,22 @@ static int align_fd_state(void) {
     
     RR_INFO("Aligning FD state for replay/fuzzing mode...");
     
+    /* 获取 IPC FD，确保不会关闭它们 */
+    int ipc_cmd_fd = -1, ipc_status_fd = -1;
+    const char *cmd_fd_str = getenv("RR_CMD_PIPE");
+    const char *status_fd_str = getenv("RR_STATUS_PIPE");
+    if (cmd_fd_str) {
+        ipc_cmd_fd = atoi(cmd_fd_str);
+        RR_VERBOSE("Protecting IPC command FD %d from alignment", ipc_cmd_fd);
+    }
+    if (status_fd_str) {
+        ipc_status_fd = atoi(status_fd_str);
+        RR_VERBOSE("Protecting IPC status FD %d from alignment", ipc_status_fd);
+    }
+    
     /* 1. 查找最小的可用 FD (跳过 0,1,2 标准流) */
     int min_available_fd = -1;
-    for (int fd = 3; fd < 1024; fd++) {
+    for (int fd = RR_FIRST_USER_FD; fd < RR_MAX_CHECKED_FD; fd++) {
         if (fcntl(fd, F_GETFD) == -1) {
             /* FD 不存在,这是第一个可用的 */
             min_available_fd = fd;
@@ -130,7 +144,8 @@ static int align_fd_state(void) {
     }
     
     if (min_available_fd == -1) {
-        RR_WARN("No available FD found in range 3-1024, cannot align");
+        RR_WARN("No available FD found in range %d-%d, cannot align",
+                RR_FIRST_USER_FD, RR_MAX_CHECKED_FD);
         return 0; /* 不阻塞初始化 */
     }
     
@@ -149,6 +164,12 @@ static int align_fd_state(void) {
             int flags = fcntl(fd, F_GETFL);
             if (flags == -1) {
                 continue; /* FD 已经不存在 */
+            }
+            
+            /* 跳过 IPC FD - 这些是fuzzing模式必需的 */
+            if (fd == ipc_cmd_fd || fd == ipc_status_fd) {
+                RR_VERBOSE("Keeping FD %d (IPC pipe)", fd);
+                continue;
             }
             
             /* 保守策略: 只关闭以读模式打开的 FD (更安全) */
@@ -171,7 +192,7 @@ static int align_fd_state(void) {
     }
     
     /* 3. 重新检查第一个可用 FD */
-    for (int fd = 3; fd < 1024; fd++) {
+    for (int fd = RR_FIRST_USER_FD; fd < RR_MAX_CHECKED_FD; fd++) {
         if (fcntl(fd, F_GETFD) == -1) {
             RR_INFO("After alignment, first available FD: %d", fd);
             
@@ -223,7 +244,7 @@ int rr_framework_init(void)
     g_rr_framework->enabled = g_rr_config.enabled;  // 设置enabled标志
 
     /* 初始化映射管理器（FD/地址映射） */
-    if (rr_mapping_manager_init(256, 128) < 0) {
+    if (rr_mapping_manager_init(RR_FD_MAPPING_BUCKETS, RR_ADDR_MAPPING_BUCKETS) < 0) {
         RR_ERROR("Failed to initialize mapping manager");
         goto error;
     }
@@ -410,7 +431,7 @@ void rr_framework_cleanup(void)
     while (record) {
         syscall_record_t *next = record->next;
         /* 清理参数数据 */
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (record->arg_data[i]) {
                 g_free(record->arg_data[i]);
             }

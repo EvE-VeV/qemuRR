@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <fnmatch.h>
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_syscall_info.h"  /* 新增：系统调用分类 */
 #include "rr_dynamic_trace.h"  /* 动态跟踪API */
 

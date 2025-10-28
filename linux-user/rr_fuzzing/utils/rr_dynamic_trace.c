@@ -10,8 +10,9 @@
 
 #include "qemu/osdep.h"  // 必须首先include
 #include "rr_dynamic_trace.h"
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_syscall_dispatch.h"  /* for rr_get_syscall_name_fast */
+#include "../core/rr_constants.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -153,7 +154,7 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
     
     /* 复制参数 */
     if (args) {
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             msg.syscall_info.args[i] = args[i];
         }
     }
@@ -227,7 +228,7 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
     
     /* 复制参数 */
     if (args) {
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             msg.syscall_info.args[i] = args[i];
         }
     }

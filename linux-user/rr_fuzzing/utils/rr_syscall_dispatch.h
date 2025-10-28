@@ -6,7 +6,7 @@
 #ifndef RR_SYSCALL_DISPATCH_H
 #define RR_SYSCALL_DISPATCH_H
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_syscallparser.h"
 
 /* 系统调用类型枚举 */

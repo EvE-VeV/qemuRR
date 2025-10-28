@@ -58,7 +58,7 @@
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
 #ifdef CONFIG_RR_FUZZING
-#include "rr_fuzzing/rr_framework.h"
+#include "rr_fuzzing/core/rr_framework.h"
 #endif
 
 #ifdef CONFIG_SEMIHOSTING

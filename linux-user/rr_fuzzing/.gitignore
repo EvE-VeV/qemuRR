@@ -37,6 +37,5 @@ __pycache__/
 /tmp/rr_status_pipe*
 
 # 调试文件
-core
 vgcore.*
 

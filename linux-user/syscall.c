@@ -26,8 +26,8 @@
 #include "tcg/startup.h"
 
 #ifdef CONFIG_RR_FUZZING
-#include "rr_fuzzing/rr_framework.h"
-#include "rr_fuzzing/rr_replay_strace.h"
+#include "rr_fuzzing/core/rr_framework.h"
+#include "rr_fuzzing/replay/rr_replay_strace.h"
 #endif
 #include "target_mman.h"
 #include "exec/page-protection.h"

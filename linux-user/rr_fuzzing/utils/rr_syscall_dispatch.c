@@ -4,6 +4,7 @@
  */
 
 #include "rr_syscall_dispatch.h"
+#include "../core/rr_constants.h"
 #include "rr_mapping_manager.h"
 #include <string.h>
 #include <stdlib.h>
@@ -228,7 +229,7 @@ static void apply_generic_args(rr_strace_record_t *record, abi_long *args) {
     }
     
     // 通用策略：对于数值参数使用记录值，对于指针参数保持原值
-    for (int i = 0; i < record->arg_count && i < 8; i++) {
+    for (int i = 0; i < record->arg_count && i < RR_MAX_SYSCALL_ARGS; i++) {
         if (record->args[i].type == RR_STRACE_ARG_TYPE_INT) {
             args[i] = record->args[i].value;
         }

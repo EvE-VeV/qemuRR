@@ -8,8 +8,8 @@
  * 3. 支持多种变异策略（参数变异、缓冲区替换、边界值测试等）
  */
 
-#include "rr_framework.h"
-#include "rr_syscall_dispatch.h"
+#include "../core/rr_framework.h"
+#include "../utils/rr_syscall_dispatch.h"
 
 /* ==================== 全局状态 ==================== */
 

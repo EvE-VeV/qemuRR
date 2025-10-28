@@ -17,6 +17,9 @@ import argparse
 import select
 import threading
 import signal
+import json
+import time
+from datetime import datetime
 from pathlib import Path
 from trace_analyzer import TraceAnalyzer
 
@@ -27,8 +30,24 @@ FUZZ_CMD_REPLACE_BUFFER = 2
 FUZZ_CMD_MUTATE_FLAGS = 3
 FUZZ_CMD_BOUNDARY_VALUE = 4
 
-FUZZ_MAGIC = 0x46555A5A  # "FUZZ"
-FUZZ_MAX_INSTRUCTIONS = 32
+# === 常量定义（对应 rr_constants.h）===
+# 注意：这些值必须与 C 端保持严格一致！
+
+FUZZ_MAGIC = 0x46555A5A  # "FUZZ" - 共享内存魔数
+FUZZ_MAX_INSTRUCTIONS = 32  # 指令队列最大长度
+FUZZ_INSTRUCTION_DATA = 256  # 每条指令的数据负载大小
+FUZZ_SHM_SIZE = 64 * 1024  # 共享内存大小：64KB（⚠️ 必须与 rr_constants.h 一致）
+
+# === Phase 1: 初始化阶段过滤配置 ===
+# 这些系统调用在初始化阶段不应被变异，以避免破坏内存布局
+INIT_SYSCALLS = {'mmap', 'brk', 'set_tid_address', 'set_robust_list', 'arch_prctl',
+                 'munmap', 'mprotect', 'rt_sigprocmask', 'rt_sigaction'}
+
+# 初始化阶段阈值：前 N 个 syscall 中的初始化调用将被跳过
+# 来源：rr_constants.h 中的 RR_INIT_PHASE_THRESHOLD
+# 注意：这是一个启发式值，未来应该改为自适应检测
+# TODO: 从配置文件读取，支持运行时覆盖
+INIT_PHASE_THRESHOLD = 10
 
 # 全局变量用于信号处理
 _conductor_instance = None
@@ -78,7 +97,7 @@ class FuzzInstruction:
 
 class FuzzSharedMemory:
     """共享内存管理器"""
-    def __init__(self, shm_name, size=64 * 1024):
+    def __init__(self, shm_name, size=FUZZ_SHM_SIZE):
         self.shm_name = shm_name
         self.size = size
         self.shm_fd = None
@@ -163,23 +182,95 @@ class SmartMutator:
         self.syscalls = self.analyzer.analyze()
         self.pure_candidates = self.analyzer.get_pure_candidates()
         self.hybrid_candidates = self.analyzer.get_hybrid_candidates()
-
+        
+        # Phase 1: 过滤不可变异的 syscall
+        self.mutable_candidates = self._filter_mutable_candidates()
+    
+    def _should_skip_mutation(self, syscall_info, index):
+        """判断是否应跳过该 syscall 的变异
+        
+        Args:
+            syscall_info: 系统调用信息对象
+            index: 在 trace 中的索引位置
+        
+        Returns:
+            bool: True 表示应跳过，False 表示可以变异
+        """
+        # 1. 跳过初始化阶段的关键 syscall
+        if index < INIT_PHASE_THRESHOLD:
+            syscall_name = getattr(syscall_info, 'name', '').lower()
+            if any(init_sc in syscall_name for init_sc in INIT_SYSCALLS):
+                return True
+        
+        # 2. 跳过没有可变异数据的 syscall（将来可扩展）
+        # 目前 TraceAnalyzer 已经筛选出 pure/hybrid candidates
+        
+        return False
+    
+    def _filter_mutable_candidates(self):
+        """过滤出真正可变异的 candidate
+        
+        Returns:
+            list: 可安全变异的 syscall 候选列表
+        """
+        mutable = []
+        
+        # 合并 pure 和 hybrid candidates
+        all_candidates = list(self.pure_candidates) + list(self.hybrid_candidates)
+        
+        for candidate in all_candidates:
+            if not self._should_skip_mutation(candidate, candidate.index):
+                mutable.append(candidate)
+        
+        return mutable
+    
     def build_instructions(self, iteration):
+        """构建 Fuzz 指令
+        
+        Phase 1 改进：单次变异策略（每次迭代只变异一个 syscall）
+        
+        Args:
+            iteration: 当前迭代次数
+        
+        Returns:
+            list: FuzzInstruction 列表
+        """
         instrs = []
-        for sc in self.pure_candidates:
-            instrs.append(FuzzInstruction(sc.index, FUZZ_CMD_REPLACE_BUFFER, 1, b'A' * 16))
-        for sc in self.hybrid_candidates:
-            instrs.append(FuzzInstruction(sc.index, FUZZ_CMD_MUTATE_FLAGS, 0, struct.pack('q', 0xFFFFFFFF)))
+        
+        if not self.mutable_candidates:
+            print("[Mutator] ⚠️  No mutable candidates found!")
+            return instrs
+        
+        # Phase 1: 单次变异 - 轮询选择一个 candidate
+        target_candidate = self.mutable_candidates[iteration % len(self.mutable_candidates)]
+        
+        # 根据类型生成轻量级变异指令
+        if target_candidate in self.pure_candidates:
+            # Pure syscall: 轻量级缓冲区变异（少量数据）
+            # 改为翻转几个字节，而不是完全替换
+            mutation_data = bytes([0xFF ^ (iteration % 256)] * 4)  # 只变异 4 字节
+            instrs.append(FuzzInstruction(target_candidate.index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data))
+        else:
+            # Hybrid syscall: 标志位变异
+            flag_mutation = struct.pack('q', (1 << (iteration % 32)))  # 单个 bit 翻转
+            instrs.append(FuzzInstruction(target_candidate.index, FUZZ_CMD_MUTATE_FLAGS, 0, flag_mutation))
+        
         return instrs
 
 
 class FuzzConductor:
     """Fuzz控制器 - 与QEMU进行IPC通信"""
     
-    def __init__(self, qemu_path, target_binary, trace_file):
+    def __init__(self, qemu_path, target_binary, trace_file, output_format='all'):
         self.qemu_path = qemu_path
         self.target_binary = target_binary
         self.trace_file = trace_file
+        self.output_format = output_format
+        
+        # 树可视化器（用于接收完整的 syscall 树）
+        self.visualizer_proc = None
+        self.trace_pipe_path = f"/tmp/rr_dynamic_trace_{os.getpid()}"
+        self.tree_html_path = None
         
         # IPC管道
         self.cmd_pipe_read, self.cmd_pipe_write = os.pipe()
@@ -195,6 +286,10 @@ class FuzzConductor:
         self.total_executions = 0
         self.crashes = []
         self.qemu_stderr_thread = None
+        
+        # Fuzzing日志（用于输出摘要）
+        self.fuzzing_log = []
+        self.start_time = None
     
     def _read_qemu_stderr(self):
         """在单独线程中读取QEMU的stderr输出，防止管道缓冲区满导致死锁"""
@@ -211,20 +306,127 @@ class FuzzConductor:
         except Exception as e:
             print(f"[Conductor] Error reading QEMU stderr: {e}")
     
+    def start_tree_visualizer(self):
+        """启动实时树可视化器（后台进程）"""
+        if self.output_format not in ['html', 'all']:
+            return  # 只有需要 HTML 输出时才启动
+        
+        # 生成输出文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.tree_html_path = f"fuzzing_tree_{timestamp}.html"
+        
+        # 查找 realtime_tree_visualizer.py
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        visualizer_script = os.path.join(script_dir, "realtime_tree_visualizer.py")
+        
+        if not os.path.exists(visualizer_script):
+            print(f"[Conductor] ⚠️  Tree visualizer not found: {visualizer_script}")
+            return
+        
+        try:
+            print(f"[Conductor] 🌳 Starting tree visualizer...")
+            print(f"[Conductor]    Pipe: {self.trace_pipe_path}")
+            print(f"[Conductor]    Output: {self.tree_html_path}")
+            
+            # 启动可视化器（后台进程）
+            self.visualizer_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    visualizer_script,
+                    '--pipe', self.trace_pipe_path,
+                    '--output', self.tree_html_path,
+                    '--update-interval', '1.0'
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True  # 独立进程组
+            )
+            
+            # 等待管道创建
+            max_wait = 5
+            for _ in range(max_wait * 10):
+                if os.path.exists(self.trace_pipe_path):
+                    print(f"[Conductor] ✅ Tree visualizer ready")
+                    return
+                time.sleep(0.1)
+            
+            print(f"[Conductor] ⚠️  Tree visualizer pipe not created")
+        
+        except Exception as e:
+            print(f"[Conductor] ❌ Failed to start tree visualizer: {e}")
+            self.visualizer_proc = None
+    
+    def stop_tree_visualizer(self):
+        """停止树可视化器"""
+        if self.visualizer_proc:
+            try:
+                print(f"[Conductor] Stopping tree visualizer...")
+                self.visualizer_proc.terminate()
+                self.visualizer_proc.wait(timeout=5)
+                print(f"[Conductor] ✅ Tree visualizer stopped")
+                
+                # 修改HTML文件，添加fuzzing session统计信息
+                if self.tree_html_path and os.path.exists(self.tree_html_path):
+                    self._update_tree_html_stats()
+                    print(f"[Conductor] 🌳 Tree visualization saved to: {self.tree_html_path}")
+            
+            except subprocess.TimeoutExpired:
+                print(f"[Conductor] Killing tree visualizer (timeout)...")
+                self.visualizer_proc.kill()
+            except Exception as e:
+                print(f"[Conductor] Error stopping tree visualizer: {e}")
+            finally:
+                self.visualizer_proc = None
+    
+    def _update_tree_html_stats(self):
+        """更新树形HTML中的fuzzing统计信息"""
+        try:
+            with open(self.tree_html_path, 'r') as f:
+                html_content = f.read()
+            
+            # 计算fuzzing统计
+            duration = time.time() - self.start_time if self.start_time else 0
+            mutable_count = len(self.smart_mutator.mutable_candidates)
+            total_mutations = sum(1 for log in self.fuzzing_log if log.get('instructions'))
+            
+            # 在HTML中添加fuzzing session信息
+            fuzzing_stats = f'''
+        <div style="position: fixed; bottom: 20px; right: 20px; background: rgba(102, 126, 234, 0.95); color: white; padding: 15px 20px; border-radius: 10px; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 300;">
+            <div style="font-weight: bold; margin-bottom: 8px; font-size: 14px;">🎯 Fuzzing Session</div>
+            <div style="margin-bottom: 4px;">Iterations: <strong>{self.total_executions}</strong></div>
+            <div style="margin-bottom: 4px;">Mutations: <strong>{total_mutations}</strong></div>
+            <div style="margin-bottom: 4px;">Crashes: <strong>{len(self.crashes)}</strong></div>
+            <div style="margin-bottom: 4px;">Duration: <strong>{duration:.2f}s</strong></div>
+            <div>Mutable Syscalls: <strong>{mutable_count}</strong></div>
+        </div>'''
+            
+            # 在 </body> 标签前插入
+            html_content = html_content.replace('</body>', fuzzing_stats + '\n</body>')
+            
+            with open(self.tree_html_path, 'w') as f:
+                f.write(html_content)
+        
+        except Exception as e:
+            print(f"[Conductor] Warning: Failed to update tree HTML stats: {e}")
+    
     def start_qemu(self):
         """启动QEMU进程（Fuzzing模式）"""
         env = os.environ.copy()
         env.update({
             'RR_DEBUG_LEVEL': '4',
             'RR_FUZZING_ENABLED': 'True',
-            'RR_TRACE_PIPE': '/tmp/rr_dynamic_trace',  # 启用 dynamic trace
             'RR_MODE': 'fuzzing',  # 关键：设置为fuzzing模式
-            # 'RR_STRACE_MODE': 'True',  # ❌ 移除！binary trace 不需要 strace 模式
             'RR_TRACE_FILE': self.trace_file,
             'RR_CMD_PIPE': str(self.cmd_pipe_read),
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.shm_name,
         })
+        
+        # 如果树可视化器已启动，启用动态跟踪
+        if self.visualizer_proc and os.path.exists(self.trace_pipe_path):
+            env['RR_DYNAMIC_TRACE'] = '1'
+            env['RR_TRACE_PIPE'] = self.trace_pipe_path
+            print(f"[Conductor] ✅ Dynamic trace enabled -> {self.trace_pipe_path}")
         # 注意：不设置 RR_FORK_SYSCALL，启用自动检测
         
         # 构建QEMU命令
@@ -265,6 +467,8 @@ class FuzzConductor:
     
     def send_fuzz_command(self, instructions):
         """发送Fuzz命令"""
+        iteration_start = time.time()
+        
         # 1. 写入共享内存
         self.shm.write_instructions(instructions)
         
@@ -289,16 +493,40 @@ class FuzzConductor:
                         self.qemu_process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         self.qemu_process.kill()
+                
+                # 记录超时
+                self.fuzzing_log.append({
+                    'iteration': self.total_executions + 1,
+                    'instructions': [{'syscall_index': i.syscall_index, 'cmd': i.cmd} for i in instructions],
+                    'status': 'timeout',
+                    'duration': time.time() - iteration_start
+                })
                 return None
         
         status_bytes = os.read(self.status_pipe_read, 4)
         if not status_bytes:
+            self.fuzzing_log.append({
+                'iteration': self.total_executions + 1,
+                'instructions': [{'syscall_index': i.syscall_index, 'cmd': i.cmd} for i in instructions],
+                'status': 'no_response',
+                'duration': time.time() - iteration_start
+            })
             return None
         
         status = struct.unpack('i', status_bytes)[0]
         self.total_executions += 1
         
-        return self._parse_status(status)
+        status_name = self._parse_status(status)
+        
+        # 记录本次迭代
+        self.fuzzing_log.append({
+            'iteration': self.total_executions,
+            'instructions': [{'syscall_index': i.syscall_index, 'cmd': i.cmd} for i in instructions],
+            'status': status_name,
+            'duration': time.time() - iteration_start
+        })
+        
+        return status_name
     
     def _parse_status(self, status):
         """解析执行状态"""
@@ -322,6 +550,7 @@ class FuzzConductor:
     
     def run(self, rounds):
         """运行Fuzz主循环"""
+        self.start_time = time.time()
         print(f"[Conductor] Starting fuzzing loop for {rounds} rounds")
         for i in range(rounds):
             if _shutdown_requested:
@@ -340,6 +569,123 @@ class FuzzConductor:
                 print("[Conductor] Crash detected! Stopping fuzzing loop")
                 break
         print("[Conductor] Fuzzing loop completed")
+    
+    def save_trace_file(self, output_file=None):
+        """保存可读的 syscall trace 文件"""
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"fuzzing_trace_{timestamp}.txt"
+        
+        analyzer = self.smart_mutator.analyzer
+        
+        with open(output_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("RR-Fuzz Syscall Trace\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Target:     {self.target_binary}\n")
+            f.write(f"Trace File: {self.trace_file}\n")
+            f.write(f"Timestamp:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Iterations: {self.total_executions}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # 1. Original Trace Summary
+            f.write("📋 ORIGINAL TRACE SUMMARY\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Total syscalls: {len(analyzer.syscalls)}\n")
+            f.write(f"Pure replay candidates: {len(self.smart_mutator.pure_candidates)}\n")
+            f.write(f"Hybrid replay candidates: {len(self.smart_mutator.hybrid_candidates)}\n")
+            f.write(f"Mutable syscalls: {len(self.smart_mutator.mutable_candidates)}\n\n")
+            
+            # 2. Syscall List with Details
+            f.write("📜 SYSCALL SEQUENCE\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"{'Index':<6} {'Syscall':<20} {'Category':<12} {'Aux Data':<10} {'Mutable':<8}\n")
+            f.write("-" * 80 + "\n")
+            
+            for sc in analyzer.syscalls:
+                is_mutable = sc in self.smart_mutator.mutable_candidates
+                aux_info = f"{sc.aux_data_size}B" if sc.has_aux_data else "No"
+                f.write(f"{sc.index:<6} {sc.name:<20} {sc.category:<12} {aux_info:<10} {'✓' if is_mutable else '✗':<8}\n")
+            
+            f.write("\n")
+            
+            # 3. Fuzzing Iterations Detail
+            if self.fuzzing_log:
+                f.write("🎯 FUZZING ITERATIONS\n")
+                f.write("-" * 80 + "\n")
+                for log_entry in self.fuzzing_log:
+                    f.write(f"\nIteration #{log_entry['iteration']} - Status: {log_entry['status']} - Duration: {log_entry['duration']:.3f}s\n")
+                    
+                    for instr in log_entry['instructions']:
+                        syscall_idx = instr['syscall_index']
+                        cmd_type = instr['cmd']
+                        cmd_name_map = {
+                            0: 'NONE',
+                            1: 'MUTATE_ARG',
+                            2: 'REPLACE_BUFFER',
+                            3: 'MUTATE_FLAGS',
+                            4: 'BOUNDARY_VALUE',
+                            10: 'LIGHT_MUTATION'
+                        }
+                        cmd_name = cmd_name_map.get(cmd_type, f'UNKNOWN({cmd_type})')
+                        
+                        # Find syscall name
+                        syscall_name = "unknown"
+                        for sc in analyzer.syscalls:
+                            if sc.index == syscall_idx:
+                                syscall_name = sc.name
+                                break
+                        
+                        f.write(f"  ⚡ Mutated: syscall[{syscall_idx}] {syscall_name} - Command: {cmd_name}\n")
+            
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+            f.write("End of Trace\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"[Conductor] 📝 Syscall trace saved to: {output_file}")
+        return output_file
+    
+    def save_summary(self, output_file=None):
+        """保存fuzzing摘要到JSON文件"""
+        if output_file is None:
+            # 默认输出到当前目录
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"fuzzing_summary_{timestamp}.json"
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        
+        summary = {
+            'fuzzing_session': {
+                'target': self.target_binary,
+                'trace_file': self.trace_file,
+                'start_time': datetime.fromtimestamp(self.start_time).isoformat() if self.start_time else None,
+                'duration_seconds': round(duration, 2),
+                'total_iterations': self.total_executions
+            },
+            'statistics': {
+                'total_executions': self.total_executions,
+                'crashes_found': len(self.crashes),
+                'crash_iterations': self.crashes,
+                'avg_iteration_time': round(duration / self.total_executions, 3) if self.total_executions > 0 else 0
+            },
+            'mutable_syscalls': {
+                'total': len(self.smart_mutator.mutable_candidates),
+                'pure_replay_total': len(self.smart_mutator.pure_candidates),
+                'hybrid_replay_total': len(self.smart_mutator.hybrid_candidates)
+            },
+            'iterations': self.fuzzing_log
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\n[Conductor] 📊 Fuzzing summary saved to: {output_file}")
+        print(f"[Conductor]    Total iterations: {self.total_executions}")
+        print(f"[Conductor]    Crashes found: {len(self.crashes)}")
+        print(f"[Conductor]    Duration: {round(duration, 2)}s")
+        
+        return output_file
     
     def cleanup(self):
         """清理资源"""
@@ -366,6 +712,9 @@ class FuzzConductor:
         # 清理共享内存
         self.shm.close()
         
+        # 停止树可视化器
+        self.stop_tree_visualizer()
+        
         print("[Conductor] Cleanup completed")
 
 
@@ -381,6 +730,9 @@ def main():
     parser.add_argument('--target', required=True, help='Target program to fuzz')
     parser.add_argument('--trace', required=True, help='Strace trace file')
     parser.add_argument('--iterations', type=int, default=100, help='Number of fuzz iterations')
+    parser.add_argument('--output-format', type=str, default='all', 
+                       choices=['html', 'txt', 'json', 'all', 'none'],
+                       help='Output format: html=tree only, txt=text only, json=summary only, all=everything, none=no output (default: all)')
     
     args = parser.parse_args()
     
@@ -398,19 +750,45 @@ def main():
     print(f"  - Trace: {args.trace}")
     print(f"  - Mode: AUTO (智能检测所有 P_IO 系统调用)")
     print(f"  - Iterations: {args.iterations}")
+    print(f"  - Output: {args.output_format}")
     print(f"  - Press Ctrl+C to stop gracefully")
     print()
     
     # 创建Conductor并运行
-    conductor = FuzzConductor(args.qemu, args.target, args.trace)
+    conductor = FuzzConductor(args.qemu, args.target, args.trace, args.output_format)
     _conductor_instance = conductor  # 保存全局引用供信号处理器使用
     
     try:
+        # 1. 启动树可视化器（如果需要HTML输出）
+        conductor.start_tree_visualizer()
+        
+        # 2. 启动QEMU（会自动连接到树可视化器）
         conductor.start_qemu()
+        
+        # 3. 运行fuzzing
         conductor.run(args.iterations)
     except KeyboardInterrupt:
         print("\n[Conductor] Interrupted by user")
     finally:
+        # 保存fuzzing摘要和trace（根据output_format配置）
+        if conductor.total_executions > 0:
+            output_fmt = args.output_format
+            
+            # 检查是否需要生成输出文件
+            if output_fmt != 'none':
+                # JSON summary
+                if output_fmt in ['json', 'all']:
+                    conductor.save_summary()
+                
+                # HTML tree已由 realtime_tree_visualizer.py 生成（在cleanup中停止）
+                # 不再需要手动调用 save_html_trace()
+                
+                # Text trace
+                if output_fmt in ['txt', 'all']:
+                    conductor.save_trace_file()
+            else:
+                print("[Conductor] ⚠️  Output disabled (--output-format none)")
+        
         conductor.cleanup()
         _conductor_instance = None
     

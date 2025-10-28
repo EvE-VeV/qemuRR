@@ -9,9 +9,9 @@
  * 3. 支持多种变异策略，覆盖不同的测试场景
  */
 
-#include "rr_framework.h"
-#include "rr_aux_data.h"
-#include "rr_syscall_dispatch.h"
+#include "../core/rr_framework.h"
+#include "../record/rr_aux_data.h"
+#include "../utils/rr_syscall_dispatch.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -205,6 +205,40 @@ static void extend_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
 }
 
 /**
+ * Phase 1 策略: 轻量级变异
+ * 
+ * 只翻转 1-2 个 bit，最小化破坏性
+ * 适用于初期 Fuzzing，避免程序立即崩溃
+ */
+static void mutate_light(rr_aux_data_t *aux, const FuzzInstruction *instr) {
+    if (!aux || !aux->data || aux->size == 0) {
+        return;
+    }
+    
+    // 默认只翻转 1 个 bit
+    uint32_t flip_count = 1;
+    
+    // 如果指令提供了数据，第一个字节指定翻转数量（1-3）
+    if (instr->data_len > 0 && instr->data[0] > 0) {
+        flip_count = (instr->data[0] % 3) + 1;  // 1-3 bits
+    }
+    
+    // 翻转指定数量的 bit
+    for (uint32_t i = 0; i < flip_count; i++) {
+        // 随机选择一个字节
+        uint32_t byte_idx = rand() % aux->size;
+        // 随机选择一个 bit
+        uint8_t bit_idx = rand() % 8;
+        // 翻转
+        aux->data[byte_idx] ^= (1 << bit_idx);
+    }
+    
+    RR_INFO("🔧 FUZZ_AUX: Light mutation - flipped %u bits in %u bytes", 
+            flip_count, aux->size);
+    g_fuzz_stats.arg_mutations++;
+}
+
+/**
  * 策略 5: 特殊值注入
  * 
  * 注入特定的"有趣"值，如边界值、魔数等
@@ -345,6 +379,10 @@ void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
                 
             case FUZZ_CMD_INTERESTING_VALUES:
                 inject_interesting_values(aux, instr, syscall_nr);
+                break;
+            
+            case FUZZ_CMD_LIGHT_MUTATION:
+                mutate_light(aux, instr);
                 break;
                 
             default:

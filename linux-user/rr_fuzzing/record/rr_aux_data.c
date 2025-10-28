@@ -7,7 +7,7 @@
  */
 
 #include "rr_aux_data.h"
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>

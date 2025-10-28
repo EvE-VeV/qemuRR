@@ -5,7 +5,7 @@
 #ifndef RR_MAPPING_MANAGER_H
 #define RR_MAPPING_MANAGER_H
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include <stdint.h>
 #include <stdbool.h>
 

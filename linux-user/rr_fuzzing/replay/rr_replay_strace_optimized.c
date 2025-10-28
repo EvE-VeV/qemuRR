@@ -3,12 +3,13 @@
  * 使用模块化设计和优化的数据结构
  */
 
-#include "rr_framework.h"
-#include "rr_syscallparser.h"
+#include "../core/rr_framework.h"
+#include "../core/rr_constants.h"
+#include "../utils/rr_syscallparser.h"
 #include "rr_replay_strace.h"
-#include "rr_syscall_dispatch.h"
-#include "rr_mapping_manager.h"
-#include "rr_dynamic_trace.h"  /* 动态跟踪API */
+#include "../utils/rr_syscall_dispatch.h"
+#include "../utils/rr_mapping_manager.h"
+#include "../utils/rr_dynamic_trace.h"  /* 动态跟踪API */
 #include "qemu.h"
 #include <sys/mman.h>
 #include <unistd.h>
@@ -557,10 +558,11 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     /* 🔥 修复：uname 不使用固定字符串，从 trace 获取或返回 -1 让宿主执行 */
     
     // 保存原始参数用于比较
-    abi_long orig_args[8];
-    for (int i = 0; i < 8; i++) {
+    abi_long orig_args[RR_MAX_SYSCALL_ARGS];
+    for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         orig_args[i] = args[i];
     }
+    (void)orig_args;  /* 可能在调试关闭时未使用 */
     
     // 使用优化的参数处理
     // 步骤1: 应用记录的参数和FD映射（来自trace）
@@ -569,7 +571,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     // 输出trace参数修改信息
     bool args_modified = false;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         if (orig_args[i] != args[i]) {
             args_modified = true;
             STRACE_DEBUG("TRACE_REPLAY: %s arg[%d] %ld -> %ld", 
@@ -600,17 +602,18 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
                    syscall_index, record->syscall_name);
         
         /* 🔥 修复：保存当前参数，应用变异后再检测 */
-        abi_long pre_fuzz_args[8];
-        for (int i = 0; i < 8; i++) {
+        abi_long pre_fuzz_args[RR_MAX_SYSCALL_ARGS];
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             pre_fuzz_args[i] = args[i];
         }
+        (void)pre_fuzz_args;  /* 可能在调试关闭时未使用 */
         
         // 调用Fuzz引擎应用变异
         rr_fuzz_mutate_syscall(env, syscall_index, args, num);
         
         // 检测参数是否被Fuzz变异
         bool fuzz_modified = false;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (pre_fuzz_args[i] != args[i]) {
                 fuzz_modified = true;
                 STRACE_VERBOSE("FUZZ_MUTATED: %s arg[%d] %ld -> %ld", 

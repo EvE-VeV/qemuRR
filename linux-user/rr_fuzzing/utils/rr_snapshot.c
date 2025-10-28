@@ -7,7 +7,7 @@
 #define RR_DEBUG 1
 #endif
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 
 /* 全局快照状态（预留） */
 static uint32_t g_latest_snapshot_index = 0;

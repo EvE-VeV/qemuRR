@@ -9,7 +9,7 @@
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
 #include "cpu.h"
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 
 /**
  * 纯确定性重放单个系统调用

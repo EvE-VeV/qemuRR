@@ -2,7 +2,7 @@
  * RR-Fuzz 系统调用分类信息实现
  */
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_syscall_info.h"
 
 /* 系统调用号定义 */

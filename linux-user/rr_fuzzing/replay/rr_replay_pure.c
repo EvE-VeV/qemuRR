@@ -11,9 +11,9 @@
 
 #define RR_DEBUG 1
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_replay_pure.h"
-#include "rr_aux_data.h"
+#include "../record/rr_aux_data.h"
 #include <sys/mman.h>
 #include <unistd.h>
 

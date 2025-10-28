@@ -35,8 +35,8 @@ trace_file=./trace-record.txt
 # 共享内存名称
 shared_memory_name=rr_fuzzing_shm
 
-# 共享内存大小（字节）
-shared_memory_size=4096
+# 共享内存大小（字节）- 必须与 Python 端一致
+shared_memory_size=65536
 
 # IPC超时（毫秒）
 ipc_timeout=1000

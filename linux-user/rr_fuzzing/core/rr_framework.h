@@ -58,7 +58,8 @@ typedef enum {
     FUZZ_CMD_FLIP_BITS = 6,         // 位翻转（随机翻转某些位）
     FUZZ_CMD_TRUNCATE = 7,          // 截断数据（减少大小）
     FUZZ_CMD_EXTEND = 8,            // 扩展数据（增加大小）
-    FUZZ_CMD_INTERESTING_VALUES = 9 // 特殊值注入（边界值、魔数等）
+    FUZZ_CMD_INTERESTING_VALUES = 9,// 特殊值注入（边界值、魔数等）
+    FUZZ_CMD_LIGHT_MUTATION = 10    // 轻量级变异（只翻转 1-2 bits，最小破坏性）
 } fuzz_cmd_type_t;
 
 /**
@@ -450,7 +451,7 @@ static inline bool rr_is_output_syscall(int syscall_nr)
 #define RR_ENABLE_DYNAMIC_TRACE 1
 
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-#include "rr_dynamic_trace.h"
+#include "../utils/rr_dynamic_trace.h"
 #endif
 
 #endif /* RR_FRAMEWORK_H */

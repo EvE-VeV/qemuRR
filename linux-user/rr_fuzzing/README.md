@@ -4,6 +4,38 @@ QEMU-based Record-Replay-Fuzzing 框架
 
 ---
 
+## 📂 目录结构
+
+项目采用模块化组织，按功能分类：
+
+```
+rr_fuzzing/
+├── core/          # 核心框架（初始化、配置、常量）
+├── record/        # 录制模块（syscall捕获、aux_data）
+├── replay/        # 重放模块（pure/hybrid/strace）
+├── fuzzing/       # Fuzzing引擎（变异、覆盖率、Python工具）
+├── utils/         # 工具模块（映射、IPC、跟踪、快照）
+├── config/        # 配置模板
+├── docs/          # 文档
+├── analysis/      # 分析报告和实施计划
+└── paper/         # 论文相关
+```
+
+**核心模块说明**：
+- **core/** (5文件) - 框架初始化、配置管理、常量定义
+- **record/** (3文件) - 系统调用录制、aux_data捕获
+- **replay/** (6文件) - 4个重放引擎（binary/pure/reapply/strace）
+- **fuzzing/** (4个C文件 + 5个Python工具) - 变异引擎、覆盖率追踪、conductor
+- **utils/** (13文件) - 映射管理、IPC、动态跟踪、快照等
+
+**重组信息**：
+- 重组日期：2025-10-28
+- 重组前：扁平化结构（40+个文件混杂）
+- 重组后：模块化结构（5个功能目录）
+- 代码质量：魔数完成度 78% → 87%
+
+---
+
 ## 📊 当前状态
 
 | 组件 | 状态 |

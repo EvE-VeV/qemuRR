@@ -10,10 +10,11 @@
 
 #define RR_DEBUG 1
 
-#include "rr_framework.h"
-#include "rr_aux_data.h"
+#include "../core/rr_framework.h"
+#include "../record/rr_aux_data.h"
 #include "rr_replay_pure.h"
-#include "rr_dynamic_trace.h"
+#include "../core/rr_constants.h"
+#include "../utils/rr_dynamic_trace.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -149,9 +150,9 @@ static syscall_record_t *read_next_record(void)
             break;
         }
 
-        if (arg_index >= 0 && arg_index < 8) {
+        if (arg_index >= 0 && arg_index < RR_MAX_SYSCALL_ARGS) {
             size_t size;
-            if (fread(&size, sizeof(size), 1, g_trace_file) == 1 && size > 0 && size <= 64 * 1024) {
+            if (fread(&size, sizeof(size), 1, g_trace_file) == 1 && size > 0 && size <= RR_MAX_BUFFER_TOTAL) {
                 record->arg_data[arg_index] = g_malloc(size);
                 if (fread(record->arg_data[arg_index], size, 1, g_trace_file) == 1) {
                     record->arg_size[arg_index] = size;
@@ -396,7 +397,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         RR_VERBOSE("REPLAY_SYSCALL: Output syscall %d, consuming record and executing directly", num);
         
         /* 清理当前记录 */
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (g_current_record->arg_data[i]) {
                 g_free(g_current_record->arg_data[i]);
             }

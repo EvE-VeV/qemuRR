@@ -10,9 +10,9 @@
  * 4. 程序使用变异后的数据继续执行
  */
 
-#include "rr_framework.h"
+#include "../core/rr_framework.h"
 #include "rr_replay_pure.h"
-#include "rr_aux_data.h"
+#include "../record/rr_aux_data.h"
 
 /**
  * 重新应用 Pure Replay（在 aux_data 变异后）
