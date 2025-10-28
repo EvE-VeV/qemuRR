@@ -10,6 +10,8 @@
 
 #include "rr_framework.h"
 #include "rr_replay_strace.h"
+#include "rr_aux_data.h"
+#include "rr_dynamic_trace.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
 #include <fcntl.h>
@@ -71,6 +73,121 @@ static const char* get_syscall_name(int syscall_nr) {
 }
 
 /**
+ * 判断某个 syscall 的返回值偏离是否为预期行为
+ * 
+ * @param syscall_nr syscall 编号
+ * @param recorded 记录的返回值
+ * @param actual 实际返回值
+ * @return true 如果偏离是预期的 (如 ASLR 导致的地址偏离)
+ */
+static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long actual) {
+    /* mmap 地址偏离是预期的 (ASLR) */
+#ifdef TARGET_NR_mmap
+    if (syscall_nr == TARGET_NR_mmap) {
+        return true;
+    }
+#endif
+#ifdef TARGET_NR_mmap2
+    if (syscall_nr == TARGET_NR_mmap2) {
+        return true;
+    }
+#endif
+    
+    /* brk 地址偏离也是预期的 */
+    if (syscall_nr == TARGET_NR_brk) {
+        return true;
+    }
+    
+    /* mremap 地址偏离也是预期的 */
+#ifdef TARGET_NR_mremap
+    if (syscall_nr == TARGET_NR_mremap) {
+        return true;
+    }
+#endif
+    
+    return false;
+}
+
+/**
+ * FD 环境对齐 (任务3)
+ * 在 replay 模式下,尽量让 guest 程序的 FD 分配与 record 时一致
+ */
+static int align_fd_state(void) {
+    if (g_rr_config.mode != RR_MODE_REPLAY && g_rr_config.mode != RR_MODE_FUZZING) {
+        return 0;
+    }
+    
+    RR_INFO("Aligning FD state for replay/fuzzing mode...");
+    
+    /* 1. 查找最小的可用 FD (跳过 0,1,2 标准流) */
+    int min_available_fd = -1;
+    for (int fd = 3; fd < 1024; fd++) {
+        if (fcntl(fd, F_GETFD) == -1) {
+            /* FD 不存在,这是第一个可用的 */
+            min_available_fd = fd;
+            break;
+        }
+    }
+    
+    if (min_available_fd == -1) {
+        RR_WARN("No available FD found in range 3-1024, cannot align");
+        return 0; /* 不阻塞初始化 */
+    }
+    
+    RR_INFO("First available FD: %d", min_available_fd);
+    
+    /* 2. 如果第一个可用 FD > 3,说明有 FD 被 qemu 占用 */
+    /*    尝试关闭非关键的 FD (但要小心,避免关闭重要的 FD) */
+    if (min_available_fd > 3) {
+        int closed_count = 0;
+        for (int fd = 3; fd < min_available_fd; fd++) {
+            /* 尝试检查 FD 是否可关闭 */
+            /* 注意: 我们无法直接访问 g_trace_file (它在其他模块中) */
+            /*       所以采用保守策略: 只关闭可以确认不重要的 FD */
+            
+            /* 尝试获取 FD 状态 */
+            int flags = fcntl(fd, F_GETFL);
+            if (flags == -1) {
+                continue; /* FD 已经不存在 */
+            }
+            
+            /* 保守策略: 只关闭以读模式打开的 FD (更安全) */
+            /* 因为 trace 文件通常是写模式 */
+            if ((flags & O_ACCMODE) == O_RDONLY) {
+                if (close(fd) == 0) {
+                    closed_count++;
+                    RR_VERBOSE("Closed read-only FD %d for alignment", fd);
+                }
+            } else {
+                RR_VERBOSE("Keeping FD %d (write/rdwr mode)", fd);
+            }
+        }
+        
+        if (closed_count > 0) {
+            RR_INFO("Closed %d FDs for environment alignment", closed_count);
+        } else {
+            RR_WARN("Could not close any FDs - alignment may be incomplete");
+        }
+    }
+    
+    /* 3. 重新检查第一个可用 FD */
+    for (int fd = 3; fd < 1024; fd++) {
+        if (fcntl(fd, F_GETFD) == -1) {
+            RR_INFO("After alignment, first available FD: %d", fd);
+            
+            /* 如果还不是 fd=3,打开 dummy FDs */
+            if (fd > 3) {
+                RR_WARN("Cannot fully align FDs, guest's first open() will return fd=%d", fd);
+                /* 注意: 这会导致 FD 映射,但至少现在有映射机制来处理 */
+            }
+            return 0;
+        }
+    }
+    
+    return 0;
+}
+
+/**
  * 初始化RR框架
  */
 int rr_framework_init(void)
@@ -105,11 +222,17 @@ int rr_framework_init(void)
     g_rr_framework->mode = g_rr_config.mode;
     g_rr_framework->enabled = g_rr_config.enabled;  // 设置enabled标志
 
-    /* 初始化FD映射表 */
-    g_rr_framework->fd_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    /* 初始化映射管理器（FD/地址映射） */
+    if (rr_mapping_manager_init(256, 128) < 0) {
+        RR_ERROR("Failed to initialize mapping manager");
+        goto error;
+    }
 
-    /* 初始化地址映射表 */
-    g_rr_framework->addr_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    /* 任务3: FD 环境对齐 - 在 replay/fuzzing 模式下对齐 FD 状态 */
+    if (align_fd_state() < 0) {
+        RR_ERROR("Failed to align FD state");
+        goto error;
+    }
 
     /* 注册退出清理函数 */
     atexit(rr_framework_cleanup);
@@ -279,15 +402,8 @@ void rr_framework_cleanup(void)
     rr_debug_cleanup();
     rr_config_cleanup();
 
-    /* 清理FD映射表 */
-    if (g_rr_framework->fd_map) {
-        g_hash_table_destroy(g_rr_framework->fd_map);
-    }
-
-    /* 清理地址映射表 */
-    if (g_rr_framework->addr_map) {
-        g_hash_table_destroy(g_rr_framework->addr_map);
-    }
+    /* 清理映射管理器 */
+    rr_mapping_manager_cleanup();
 
     /* 清理轨迹 */
     syscall_record_t *record = g_rr_framework->trace_head;
@@ -384,12 +500,11 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
              * 必须在执行后检查，因为需要返回值来判断是否有数据
              */
             {
-                const char *syscall_name = get_syscall_name(num);
-                extern bool rr_check_auto_fork_point(int, const char *, abi_long);
+                const char *syscall_name_auto = get_syscall_name(num);
                 
-                if (rr_check_auto_fork_point(num, syscall_name, ret)) {
+                if (rr_check_auto_fork_point(num, syscall_name_auto, ret)) {
                     /* 进入Fork Server主循环 */
-                    RR_INFO("🔄 Entering fork server loop after %s", syscall_name);
+                    RR_INFO("🔄 Entering fork server loop after %s", syscall_name_auto);
                     int fork_result = rr_fork_server_loop();
                     RR_INFO("🔄 Fork server loop returned: %d", fork_result);
                     if (fork_result < 0) {
@@ -423,41 +538,22 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 /**
  * 地址映射管理函数
  */
-void rr_add_addr_mapping(target_ulong recorded_addr, target_ulong actual_addr)
-{
-    if (!g_rr_framework || !g_rr_framework->addr_map) {
-        return;
-    }
-    
-    g_hash_table_insert(g_rr_framework->addr_map,
-                       GSIZE_TO_POINTER((gsize)recorded_addr),
-                       GSIZE_TO_POINTER((gsize)actual_addr));
-    
-    RR_VERBOSE("Address mapping: recorded=0x%lx -> actual=0x%lx", 
-               (unsigned long)recorded_addr, (unsigned long)actual_addr);
-}
-
-target_ulong rr_get_mapped_addr(target_ulong recorded_addr)
-{
-    if (!g_rr_framework || !g_rr_framework->addr_map) {
-        return recorded_addr; // 没有映射表，返回原地址
-    }
-    
-    gpointer mapped = g_hash_table_lookup(g_rr_framework->addr_map,
-                                         GSIZE_TO_POINTER((gsize)recorded_addr));
-    if (mapped) {
-        return (target_ulong)GPOINTER_TO_SIZE(mapped);
-    }
-    
-    return recorded_addr; // 没找到映射，返回原地址
-}
-
 void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr)
 {
     if (recorded_addr != actual_addr) {
-        rr_add_addr_mapping(recorded_addr, actual_addr);
-        RR_INFO("mmap address remapped: 0x%lx -> 0x%lx", 
-                (unsigned long)recorded_addr, (unsigned long)actual_addr);
+        /* 检查是否已存在映射 (可能是重复使用record导致的bug) */
+        target_ulong existing = rr_addr_mapping_get(recorded_addr);
+        if (existing != recorded_addr && existing != actual_addr) {
+            RR_WARN("⚠️  Overwriting existing mmap mapping: 0x%lx -> 0x%lx (old) with 0x%lx -> 0x%lx (new), size=%lu",
+                    (unsigned long)recorded_addr, (unsigned long)existing,
+                    (unsigned long)recorded_addr, (unsigned long)actual_addr,
+                    (unsigned long)g_pending_mmap_length);
+        }
+        
+        rr_addr_mapping_add(recorded_addr, actual_addr, g_pending_mmap_length);
+        RR_INFO("mmap address remapped: 0x%lx -> 0x%lx, size=%lu", 
+                (unsigned long)recorded_addr, (unsigned long)actual_addr,
+                (unsigned long)g_pending_mmap_length);
     }
 }
 
@@ -504,28 +600,159 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
         /* 检查：如果这个系统调用已经在 rr_replay_syscall 中被消费（读取记录并递增索引），
          * 就不要再做记录处理，避免重复 */
         if (g_syscall_already_consumed) {
-            RR_VERBOSE("POST_HOOK: Syscall %d already consumed in replay, skipping record handling", num);
-            g_syscall_already_consumed = false; /* 重置标记 */
+            syscall_record_t *record = g_pending_post_record;
+            g_syscall_already_consumed = false;
+            g_pending_post_record = NULL;
+
+            if (record) {
+                /* 🔥 P0: 偏离检测 - 验证返回值是否与 trace 一致 */
+                if (record->retval != ret) {
+                    if (is_expected_deviation(num, record->retval, ret)) {
+                        /* 预期的偏离 (如 ASLR),只在 VERBOSE 级别输出 */
+                        RR_VERBOSE("Expected deviation: syscall=%d (%s), recorded=0x%lx, actual=0x%lx",
+                                   num, get_syscall_name(num), 
+                                   (unsigned long)record->retval, (unsigned long)ret);
+                    } else {
+                        /* 非预期的偏离,需要警告 */
+                        RR_WARN("⚠️  UNEXPECTED DEVIATION: syscall=%d (%s), recorded_ret=%ld, actual_ret=%ld (diff=%ld)",
+                                num, get_syscall_name(num), record->retval, ret, ret - record->retval);
+                        g_rr_framework->deviation_count++;
+                    }
+                }
+
+                switch (num) {
+#ifdef TARGET_NR_open
+                case TARGET_NR_open:
+#endif
+                case TARGET_NR_openat:
+#ifdef TARGET_NR_creat
+                case TARGET_NR_creat:
+#endif
+                case TARGET_NR_dup:
+#ifdef TARGET_NR_dup2
+                case TARGET_NR_dup2:
+#endif
+#ifdef TARGET_NR_dup3
+                case TARGET_NR_dup3:
+#endif
+#ifdef TARGET_NR_socket
+                case TARGET_NR_socket:
+#endif
+#ifdef TARGET_NR_accept
+                case TARGET_NR_accept:
+#endif
+#ifdef TARGET_NR_accept4
+                case TARGET_NR_accept4:
+#endif
+                    if (ret >= 0) {
+                        RR_INFO("🔗 FD_MAPPING: Adding mapping recorded_fd=%d -> actual_fd=%d",
+                                (int)record->retval, (int)ret);
+                        rr_fd_mapping_add(record->retval, (int)ret);
+                    }
+                    break;
+
+                case TARGET_NR_close:
+                    if (ret == 0) {
+                        rr_fd_mapping_remove((int)record->args[0]);
+                    }
+                    break;
+
+#ifdef TARGET_NR_pipe
+                case TARGET_NR_pipe:
+#endif
+#ifdef TARGET_NR_pipe2
+                case TARGET_NR_pipe2:
+#endif
+                    if (ret == 0 && record->arg_data[0]) {
+                        int recorded_fds[2];
+                        memcpy(recorded_fds, record->arg_data[0], sizeof(recorded_fds));
+                        int actual_fds[2];
+                        target_ulong guest_ptr = (target_ulong)record->args[0];
+                        if (cpu_memory_rw_debug(env_cpu(env), guest_ptr, (uint8_t *)actual_fds,
+                                                sizeof(actual_fds), 0) == 0) {
+                            rr_fd_mapping_add(recorded_fds[0], actual_fds[0]);
+                            rr_fd_mapping_add(recorded_fds[1], actual_fds[1]);
+                        }
+                    }
+                    break;
+
+#ifdef TARGET_NR_mmap
+                case TARGET_NR_mmap:
+#endif
+#ifdef TARGET_NR_mmap2
+                case TARGET_NR_mmap2:
+#endif
+                    if (g_pending_mmap_recorded_addr != 0) {
+                        if (ret > 0) {
+                            rr_handle_mmap_post(g_pending_mmap_recorded_addr, (target_ulong)ret);
+                        } else {
+                            RR_ERROR("POST_HOOK: mmap failed, recorded=0x%lx, ret=%ld",
+                                     (unsigned long)g_pending_mmap_recorded_addr, (long)ret);
+                        }
+                        g_pending_mmap_recorded_addr = 0;
+                        g_pending_mmap_length = 0;
+                    }
+                    break;
+
+                case TARGET_NR_munmap:
+                    if (ret == 0) {
+                        rr_addr_mapping_remove((target_ulong)record->args[0]);
+                    }
+                    break;
+
+                case TARGET_NR_mremap:
+#ifdef TARGET_NR_mremap
+                    if (ret != (abi_long)-1) {
+                        rr_addr_mapping_remove((target_ulong)record->args[0]);
+                        rr_handle_mmap_post((target_ulong)record->args[0], (target_ulong)ret);
+                    }
+                    break;
+#endif
+
+                case TARGET_NR_brk:
+                    if (ret != (abi_long)-1 && record->has_aux_data) {
+                        rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0);
+                        if (aux && aux->size == sizeof(abi_long)) {
+                            abi_long recorded_brk;
+                            memcpy(&recorded_brk, aux->data, sizeof(recorded_brk));
+                            rr_addr_mapping_add((target_ulong)recorded_brk, (target_ulong)ret, 0);
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+
+                /* 动态跟踪：系统调用退出（Hybrid 路径） */
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+                rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)&arg1, ret,
+                                                g_rr_framework->replay_index - 1, 0);
+#endif
+
+                rr_record_dispose(record);
+            }
             return;
         }
-        
-        // 原有的mmap地址映射处理（保留）
-        if (num == 9 && g_pending_mmap_recorded_addr != 0) { /* mmap调用且有记录地址 */
-            if (ret > 0) {
-                /* mmap成功，建立地址映射 */
-                RR_VERBOSE("POST_HOOK: mmap success - recorded=0x%lx, actual=0x%lx", 
-                          (unsigned long)g_pending_mmap_recorded_addr, (unsigned long)ret);
+
+        if (
+#ifdef TARGET_NR_mmap
+            num == TARGET_NR_mmap
+#ifdef TARGET_NR_mmap2
+            ||
+#endif
+#endif
+#ifdef TARGET_NR_mmap2
+            num == TARGET_NR_mmap2
+#endif
+        ) {
+            if (g_pending_mmap_recorded_addr != 0 && ret > 0) {
                 rr_handle_mmap_post(g_pending_mmap_recorded_addr, (target_ulong)ret);
-            } else {
-                /* mmap仍然失败，这是一个严重问题 */
-                RR_ERROR("POST_HOOK: mmap still failed after conversion - recorded=0x%lx, ret=%d", 
-                        (unsigned long)g_pending_mmap_recorded_addr, (int)ret);
             }
-            
-            /* 清理临时存储 */
             g_pending_mmap_recorded_addr = 0;
+            g_pending_mmap_length = 0;
         }
-        
+
         RR_VERBOSE("POST_HOOK: Replay mode, syscall=%d, ret=%d", num, (int)ret);
         return;
     }

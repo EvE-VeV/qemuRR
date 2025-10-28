@@ -57,20 +57,12 @@ typedef struct {
 
 /* ==================== 公共接口 ==================== */
 
-/* 初始化和清理 */
-int rr_mapping_manager_init(size_t fd_buckets, size_t addr_buckets);
-void rr_mapping_manager_cleanup(void);
+/* 注意: 核心接口已在 rr_framework.h 中声明，此处仅声明扩展功能 */
 
-/* FD映射操作 */
-int rr_fd_mapping_add(int recorded_fd, int actual_fd);
-int rr_fd_mapping_get(int recorded_fd);
-int rr_fd_mapping_remove(int recorded_fd);
+/* 扩展FD映射操作 */
 bool rr_fd_mapping_exists(int recorded_fd);
 
-/* 地址映射操作 */
-int rr_addr_mapping_add(target_ulong recorded_addr, target_ulong actual_addr, size_t size);
-target_ulong rr_addr_mapping_get(target_ulong recorded_addr);
-int rr_addr_mapping_remove(target_ulong recorded_addr);
+/* 扩展地址映射操作 */
 bool rr_addr_mapping_exists(target_ulong recorded_addr);
 
 /* 批量操作 */

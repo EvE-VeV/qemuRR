@@ -1,5 +1,5 @@
 /**
- * RR-Fuzz 混合重放模块
+ * RR-Fuzz 混合重放模块 (当前聚焦映射闭环，P0阶段)
  * Hybrid Replay Mode - 传统二进制 trace 重放
  * 
  * 负责：
@@ -13,6 +13,7 @@
 #include "rr_framework.h"
 #include "rr_aux_data.h"
 #include "rr_replay_pure.h"
+#include "rr_dynamic_trace.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -23,6 +24,7 @@ static syscall_record_t *g_current_record = NULL;
 
 /* 标记：当前系统调用是否已从 trace 读取并递增索引 */
 __thread bool g_syscall_already_consumed = false;
+__thread syscall_record_t *g_pending_post_record = NULL;
 
 /**
  * 开始重放
@@ -233,11 +235,8 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
 #endif
             /* 第一个参数是FD */
             if (args[0] >= 0) {
-                gpointer mapped_fd = g_hash_table_lookup(g_rr_framework->fd_map,
-                                                        GINT_TO_POINTER((int)args[0]));
-                if (mapped_fd) {
-                    args[0] = GPOINTER_TO_INT(mapped_fd);
-                }
+                int mapped_fd = rr_fd_mapping_get((int)args[0]);
+                args[0] = mapped_fd;
             }
             break;
 
@@ -247,11 +246,8 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
             /* 两个参数都是FD */
             for (int i = 0; i < 2; i++) {
                 if (args[i] >= 0) {
-                    gpointer mapped_fd = g_hash_table_lookup(g_rr_framework->fd_map,
-                                                            GINT_TO_POINTER((int)args[i]));
-                    if (mapped_fd) {
-                        args[i] = GPOINTER_TO_INT(mapped_fd);
-                    }
+                    int mapped_fd = rr_fd_mapping_get((int)args[i]);
+                    args[i] = mapped_fd;
                 }
             }
             break;
@@ -264,14 +260,11 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
 #endif
             /* mmap的第5个参数（args[4]）是文件描述符 */
             if (args[4] >= 0) {  /* 不是匿名映射 */
-                gpointer mapped_fd = g_hash_table_lookup(g_rr_framework->fd_map,
-                                                        GINT_TO_POINTER((int)args[4]));
-                if (mapped_fd) {
-                    RR_VERBOSE("FD_MAPPING: mmap fd %d -> %d", (int)args[4], GPOINTER_TO_INT(mapped_fd));
-                    args[4] = GPOINTER_TO_INT(mapped_fd);
-                } else {
-                    RR_WARN("FD_MAPPING: mmap fd %d not found in mapping table", (int)args[4]);
+                int mapped_fd = rr_fd_mapping_get((int)args[4]);
+                if (mapped_fd != (int)args[4]) {
+                    RR_VERBOSE("FD_MAPPING: mmap fd %d -> %d", (int)args[4], mapped_fd);
                 }
+                args[4] = mapped_fd;
             }
             break;
 
@@ -353,13 +346,20 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         RR_VERBOSE("REPLAY_SYSCALL: Skipping unmatched syscall (recorded=%d, actual=%d)",
                    g_current_record->syscall_nr, num);
 
-        /* 清理当前记录 */
-        for (int i = 0; i < 8; i++) {
-            if (g_current_record->arg_data[i]) {
-                g_free(g_current_record->arg_data[i]);
-            }
-        }
-        g_free(g_current_record);
+        /* 动态跟踪：记录被跳过的 syscall（用于 tree 完整性） */
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+        uint64_t dummy_args[8] = {0};
+        rr_dynamic_trace_syscall_enter(env, g_current_record->syscall_nr, dummy_args, 
+                                         g_rr_framework->replay_index, 0);
+        rr_dynamic_trace_syscall_exit(env, g_current_record->syscall_nr, dummy_args,
+                                        g_current_record->retval, g_rr_framework->replay_index, 0);
+#endif
+
+        /* 清理当前记录 (使用统一的 dispose 函数) */
+        rr_record_dispose(g_current_record);
+        
+        /* 🔥 关键修复: 跳过record时也要递增 replay_index */
+        g_rr_framework->replay_index++;
 
         /* 读取下一条记录 */
         g_current_record = read_next_record();
@@ -381,6 +381,12 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
             num, g_current_record->index);
     RR_VERBOSE("REPLAY_SYSCALL: Found matching syscall %d at record index %u",
                num, g_current_record->index);
+
+    /* 动态跟踪：系统调用进入（二进制重放路径） */
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+    rr_dynamic_trace_syscall_enter(env, num, (uint64_t*)args, 
+                                     g_rr_framework->replay_index, 0);
+#endif
 
     abi_long ret = g_current_record->retval;
 
@@ -419,87 +425,70 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 #ifdef TARGET_NR_mmap2
     if (num == TARGET_NR_mmap2) is_mmap = true;
 #endif
-    
-    if (is_mmap && ret != (abi_long)-1) {
-        /* mmap 成功的情况，需要真实分配内存 */
-        RR_VERBOSE("REPLAY_SYSCALL: mmap detected, need real allocation at 0x%lx", (unsigned long)ret);
-        
-        /* 设置全局变量，让 syscall.c 使用 MAP_FIXED */
-        extern target_ulong g_pending_mmap_recorded_addr;
-        extern target_ulong g_pending_mmap_length;
-        g_pending_mmap_recorded_addr = (target_ulong)ret;
-        g_pending_mmap_length = args[1];  /* length */
-        
-        /* 清理当前记录 */
-        for (int i = 0; i < 8; i++) {
-            if (g_current_record->arg_data[i]) {
-                g_free(g_current_record->arg_data[i]);
-            }
+    if (is_mmap && g_current_record && g_current_record->has_aux_data) {
+        rr_aux_data_t *aux = rr_aux_find(g_current_record->aux_data, 0);
+        if (aux && aux->data && aux->size == sizeof(rr_aux_mmap_info_t)) {
+            rr_aux_mmap_info_t info;
+            memcpy(&info, aux->data, sizeof(info));
+
+            RR_VERBOSE("REPLAY_SYSCALL: Hybrid mmap referencing recorded addr=0x%lx len=%lu",
+                       (unsigned long)info.addr, (unsigned long)info.length);
+
+            /* 记录原始地址和长度，交由 post_hook 建立映射 */
+            g_pending_mmap_recorded_addr = (target_ulong)info.addr;
+            g_pending_mmap_length = (target_ulong)info.length;
+
+            /* 参数使用当前值（不强制 MAP_FIXED） */
+            args[2] = (abi_long)info.prot;
+            args[3] = (abi_long)info.flags;
+            args[4] = (abi_long)info.fd;
+            args[5] = (abi_long)info.offset;
         }
-        if (g_current_record->aux_data) {
-            rr_aux_free(g_current_record->aux_data);
-        }
-        g_free(g_current_record);
-        g_current_record = NULL;
-        
-        /* 推进索引 */
-        g_rr_framework->replay_index++;
-        
-        /* 设置标志，防止 post_hook 重复处理 */
-        g_syscall_already_consumed = true;
-        
-        RR_VERBOSE("REPLAY_SYSCALL: Returning -1 to trigger real mmap with MAP_FIXED");
-        return -1; /* 让 QEMU 执行真实 mmap，但使用 MAP_FIXED */
     }
 
     /* ========== 路径分叉：Pure vs Hybrid ========== */
     
-    if (g_current_record->has_aux_data) {
+    if (g_current_record->has_aux_data &&
+        !(num == TARGET_NR_brk
+#if defined(TARGET_NR_mmap)
+          || num == TARGET_NR_mmap
+#endif
+#if defined(TARGET_NR_mmap2)
+          || num == TARGET_NR_mmap2
+#endif
+        )) {
         /* 
-         * 路径1：Pure Replay 或 Pure Fuzzing
-         * 
-         * ✅ 修复: 在 Fuzzing 模式下，跳过 Pure Replay，直接变异和应用
-         *    避免数据被写入两次，提升性能 30-50%
+         * 路径1：Pure Replay
+         * 当有aux_data时，尝试纯重放（不执行真实syscall）
+         * TODO(P1): Fuzzing变异将在映射闭环完成后添加
          */
+        RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
         
-        if (g_rr_framework->mode == RR_MODE_FUZZING) {
-            /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-             * Fuzzing 模式：直接变异和应用（跳过 Pure Replay）
-             * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-            RR_VERBOSE("FUZZING: Direct mutation path (skip Pure Replay)");
-            
-            /* 1️⃣ 变异 aux_data 结构体 */
-            rr_fuzz_mutate_aux_data(env, g_current_record, args, num);
-            
-            /* 2️⃣ 应用变异后的 aux_data 到 guest 内存（只写一次）*/
-            ret = rr_replay_syscall_pure_reapply(env, num, args, g_current_record);
-            
-            if (ret != -1) {
-                RR_INFO("🎯 FUZZING: Mutations applied directly, ret=%d", (int)ret);
-                goto replay_success;
-            } else {
-                /* Reapply 失败：回退到 Hybrid */
-                RR_WARN("FUZZING: Failed to apply mutations, fallback to hybrid");
-                /* 继续执行下面的 Hybrid 路径 */
-            }
-            
-        } else {
-            /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-             * 非 Fuzzing 模式：正常 Pure Replay
-             * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-            RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
-            
-            ret = rr_replay_syscall_pure(env, num, args, g_current_record);
-            
-            if (ret != -1) {
-                /* Pure Replay 成功：直接返回 */
-                RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
-                goto replay_success;
-            }
-            
-            /* Pure 失败：回退到 Hybrid */
-            RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
-            /* 继续执行下面的 Hybrid 路径 */
+        ret = rr_replay_syscall_pure(env, num, args, g_current_record);
+        
+        if (ret != -1) {
+            /* Pure Replay 成功：直接返回 */
+            RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
+            goto replay_success;
+        }
+        
+        /* Pure 失败：回退到 Hybrid */
+        RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
+    }
+
+    if ((num == TARGET_NR_clone
+#ifdef TARGET_NR_fork
+        || num == TARGET_NR_fork
+#endif
+#ifdef TARGET_NR_vfork
+        || num == TARGET_NR_vfork
+#endif
+        ) && g_current_record && g_current_record->has_aux_data) {
+        rr_aux_data_t *aux = rr_aux_find(g_current_record->aux_data, 0);
+        if (aux && aux->data && aux->size == sizeof(int64_t)) {
+            pid_t recorded_pid = (pid_t)(*(int64_t *)aux->data);
+            RR_VERBOSE("REPLAY_SYSCALL: Recorded child PID=%d", recorded_pid);
+            /* TODO: establish recorded→replay PID mapping */
         }
     }
 
@@ -521,106 +510,16 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     /* 应用FD映射 */
     apply_fd_mapping(args, num);
 
-    /* 应用Fuzzing变异（如果在Fuzzing模式） */
-    rr_fuzz_mutate_syscall(env, g_rr_framework->replay_index, args, num);
+    /* TODO(P1): Fuzzing变异逻辑将在映射闭环完成后添加 */
 
     /* 自动快照管理 */
     rr_snapshot_auto_manage(num, g_rr_framework->replay_index);
 
-    /* 🔥 修复: Hybrid 模式只处理 mmap 特殊情况，其他 syscall 让真实执行自然填充数据 */
-    /* 数据恢复应该在 Pure Replay (rr_replay_pure.c) 中进行 */
-
-    switch (num) {
-#ifdef TARGET_NR_mmap
-        case TARGET_NR_mmap:
-#endif
-#ifdef TARGET_NR_mmap2
-        case TARGET_NR_mmap2:
-#endif
-            /* 
-             * ✅ 简化的 mmap 处理策略：
-             * 1. 如果记录失败 → replay也失败（返回-1）
-             * 2. 如果记录成功：
-             *    - 匿名映射 → 让系统分配
-             *    - 文件映射 → 转换为匿名映射
-             * 3. 记录地址映射供后续使用
-             * 
-             * 优化：移除了未测试的fallback逻辑，简化为单一路径
-             */
-            RR_VERBOSE("MMAP_REPLAY: Recorded ret=0x%lx", (unsigned long)ret);
-
-            if (ret == (abi_long)-1) {
-                /* 记录失败 → replay也失败 */
-                RR_VERBOSE("MMAP_REPLAY: Recorded failure, keeping ret=-1");
-            } else {
-                /* 记录成功 → 确保replay也成功 */
-                g_pending_mmap_recorded_addr = (target_ulong)ret;
-                
-                /* 检查是否为文件映射 */
-                bool is_file_mapping = (args[4] != -1 && args[4] != (abi_long)4294967295UL);
-                
-                if (is_file_mapping) {
-                    /* 文件映射 → 转换为匿名映射（简化策略） */
-                    RR_VERBOSE("MMAP_REPLAY: File mapping (fd=%d) → converting to anonymous", (int)args[4]);
-                    
-                    abi_long original_flags = args[3];
-                    args[3] = MAP_PRIVATE | MAP_ANONYMOUS;
-                    
-                    /* 保留部分标志（去除MAP_FIXED让系统选择地址） */
-                    if (original_flags & MAP_GROWSDOWN) {
-                        args[3] |= MAP_GROWSDOWN;
-                    }
-                    
-                    args[4] = -1;   /* fd = -1 */
-                    args[5] = 0;    /* offset = 0 */
-                    args[0] = 0;    /* 让系统选择地址 */
-                } else {
-                    /* 匿名映射 → 让系统正常分配 */
-                    RR_VERBOSE("MMAP_REPLAY: Anonymous mapping, allowing normal allocation");
-                }
-                
-                /* 清理记录并推进索引 */
-                for (int i = 0; i < 8; i++) {
-                    if (g_current_record->arg_data[i]) {
-                        g_free(g_current_record->arg_data[i]);
-                    }
-                }
-                if (g_current_record->aux_data) {
-                    rr_aux_free(g_current_record->aux_data);
-                }
-                g_free(g_current_record);
-                g_current_record = NULL;
-                g_rr_framework->replay_index++;
-                g_syscall_already_consumed = true;
-                
-                /* 返回-1让系统执行mmap */
-                return -1;
-            }
-            break;
-
-        /* 🔥 Hybrid 路径不需要任何数据恢复逻辑 - 所有数据由真实 syscall 填充 */
-
-        default:
-            /* 大部分系统调用只需要返回记录的返回值 */
-            break;
-    }
+    /* 🔥 Hybrid 模式: 所有syscall都执行真实调用,由post_hook处理映射 */
+    /* mmap等特殊syscall的地址映射在post_hook中完成 */
 
     /* 🔥 关键修复: Hybrid 模式在返回前必须清理记录并推进索引 */
-    /* 清理当前记录的参数数据 */
-    for (int i = 0; i < 8; i++) {
-        if (g_current_record->arg_data[i]) {
-            g_free(g_current_record->arg_data[i]);
-        }
-    }
-    
-    /* 清理 aux_data */
-    if (g_current_record->aux_data) {
-        rr_aux_free(g_current_record->aux_data);
-        g_current_record->aux_data = NULL;
-    }
-    
-    /* 释放记录并推进索引 */
-    g_free(g_current_record);
+    g_pending_post_record = g_current_record;
     g_current_record = NULL;
     g_rr_framework->replay_index++;
     
@@ -633,26 +532,19 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 
 replay_success:
     /* Pure Replay 成功路径：已经返回确定性结果，清理记录 */
-    /* 清理当前记录的参数数据 */
-    for (int i = 0; i < 8; i++) {
-        if (g_current_record->arg_data[i]) {
-            g_free(g_current_record->arg_data[i]);
-        }
-    }
-    
-    /* 清理 aux_data */
-    if (g_current_record->aux_data) {
-        rr_aux_free(g_current_record->aux_data);
-        g_current_record->aux_data = NULL;
-    }
-    
-    g_free(g_current_record);
+    g_pending_post_record = g_current_record;
     g_current_record = NULL;
 
     g_rr_framework->replay_index++;
     
     /* 设置标记，告诉 post_hook 不要重复处理 */
     g_syscall_already_consumed = true;
+
+    /* 动态跟踪：系统调用退出（二进制重放路径） */
+#ifdef RR_ENABLE_DYNAMIC_TRACE
+    rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
+                                    g_rr_framework->replay_index - 1, 0);
+#endif
 
     RR_VERBOSE("REPLAY_SYSCALL: Successfully replayed syscall %u: %d -> %d",
                g_rr_framework->replay_index - 1, num, (int)ret);

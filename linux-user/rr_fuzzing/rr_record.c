@@ -15,6 +15,39 @@
 
 static FILE *g_trace_file = NULL;
 
+static rr_aux_data_t *record_aux_scalar(uint8_t mask, const abi_long *value)
+{
+    abi_long val = value ? *value : 0;
+    return rr_aux_create(AUX_SCALAR, mask, &val, sizeof(val));
+}
+
+/**
+ * 释放syscall_record_t及其关联数据
+ */
+void rr_record_dispose(syscall_record_t *record)
+{
+    if (!record) {
+        return;
+    }
+
+    /* 释放所有arg_data */
+    for (int i = 0; i < 8; i++) {
+        if (record->arg_data[i]) {
+            g_free(record->arg_data[i]);
+            record->arg_data[i] = NULL;
+        }
+    }
+
+    /* 释放aux_data链表 */
+    if (record->aux_data) {
+        rr_aux_free(record->aux_data);
+        record->aux_data = NULL;
+    }
+
+    /* 释放记录本身 */
+    g_free(record);
+}
+
 /**
  * 开始记录到文件
  */
@@ -191,6 +224,80 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
     /* 自动捕获关键数据，使用智能阈值控制 */
 
     switch (syscall_nr) {
+        case TARGET_NR_brk: {
+            /* 记录 brk 返回的新堆顶地址 */
+            if (ret > 0) {
+                rr_aux_data_t *aux = record_aux_scalar(0, &ret);
+                if (aux) {
+                    rr_aux_append(&record->aux_data, aux);
+                    record->has_aux_data = true;
+                }
+            }
+            break;
+        }
+
+#if defined(TARGET_NR_mmap)
+        case TARGET_NR_mmap:
+#endif
+#if defined(TARGET_NR_mmap2)
+        case TARGET_NR_mmap2:
+#endif
+        {
+            if (ret != (abi_long)-1) {
+                rr_aux_mmap_info_t info = {
+                    .addr = (uint64_t)ret,
+                    .length = (uint64_t)args[1],
+                    .prot = (int64_t)args[2],
+                    .flags = (int64_t)args[3],
+                    .fd = (int64_t)args[4],
+                    .offset = (uint64_t)args[5],
+                };
+                rr_aux_data_t *aux = rr_aux_create(AUX_STRUCT, 0, &info, sizeof(info));
+                if (aux) {
+                    rr_aux_append(&record->aux_data, aux);
+                    record->has_aux_data = true;
+                }
+            }
+            break;
+        }
+
+        case TARGET_NR_munmap:
+        case TARGET_NR_mprotect:
+        case TARGET_NR_mremap:
+        case TARGET_NR_madvise: {
+            /* 记录这些内存管理调用的参数，用于重放阶段的校验 */
+            rr_aux_mm_params_t mm_aux = {
+                .addr = (uint64_t)args[0],
+                .len = (uint64_t)args[1],
+                .extra1 = (int64_t)args[2],
+                .extra2 = (int64_t)args[3],
+            };
+            rr_aux_data_t *aux = rr_aux_create(AUX_STRUCT, 0, &mm_aux, sizeof(mm_aux));
+            if (aux) {
+                rr_aux_append(&record->aux_data, aux);
+                record->has_aux_data = true;
+            }
+            break;
+        }
+
+        case TARGET_NR_clone:
+#ifdef TARGET_NR_fork
+        case TARGET_NR_fork:
+#endif
+#ifdef TARGET_NR_vfork
+        case TARGET_NR_vfork:
+#endif
+        {
+            if (ret > 0) {
+                rr_aux_data_t *aux = record_aux_scalar(0, &ret);
+                if (aux) {
+                    rr_aux_append(&record->aux_data, aux);
+                    record->has_aux_data = true;
+                }
+            }
+            break;
+        }
+
         case TARGET_NR_read:
             /* read 的数据在返回后才有效 */
             if (ret > 0 && args[1] != 0) {
@@ -570,8 +677,32 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         // ioctl - 复杂的设备控制调用
         case TARGET_NR_ioctl:
             /* ioctl的参数非常复杂，依赖于具体的command */
-            // 记录command类型，但数据部分需要按command分类处理
-            // 暂时不捕获数据，因为参数格式完全依赖于设备和命令
+            if (ret == 0 && args[2]) {
+                /* 对于成功的 ioctl,尝试捕获输出缓冲区 */
+                unsigned long cmd = args[1];
+                
+                /* 提取 ioctl 方向和大小信息 */
+                /* Linux ioctl 编码: _IOC(dir,type,nr,size) */
+                /* dir: _IOC_NONE=0, _IOC_WRITE=1, _IOC_READ=2, _IOC_READ|_IOC_WRITE=3 */
+                int ioc_dir = (cmd >> 30) & 0x03;
+                int ioc_size = (cmd >> 16) & 0x3FFF;
+                
+                /* 如果有输出 (_IOC_READ) 且有合理大小 */
+                if ((ioc_dir & 2) && ioc_size > 0 && ioc_size < 4096) {
+                    uint8_t *buf = g_malloc0(ioc_size);
+                    if (cpu_memory_rw_debug(env_cpu(env), args[2], buf, ioc_size, 0) == 0) {
+                        /* 使用 AUX_IOCTL_OUTPUT 类型记录输出缓冲区 */
+                        record->aux_data = rr_aux_create(AUX_IOCTL_OUTPUT, 2, buf, ioc_size);
+                        record->has_aux_data = true;
+                        RR_VERBOSE("ioctl: Captured %d bytes output buffer for cmd=0x%lx", 
+                                   ioc_size, cmd);
+                    }
+                    g_free(buf);
+                } else {
+                    RR_VERBOSE("ioctl: cmd=0x%lx, dir=%d, size=%d (not capturing)", 
+                               cmd, ioc_dir, ioc_size);
+                }
+            }
             break;
 
         // 内存管理相关
@@ -734,6 +865,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     if (record->creates_fd) {
         record->created_fd = (int32_t)ret;
         RR_FD_TRACE("Syscall %d creates FD: %d", num, record->created_fd);
+        /* 注意: FD映射在 rr_syscall_post_hook 中统一处理，不在record阶段添加 */
     }
 
     /* 智能捕获参数数据 */

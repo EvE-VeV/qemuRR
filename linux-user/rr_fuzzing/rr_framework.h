@@ -74,12 +74,15 @@ typedef struct {
 
 /**
  * 共享内存协议结构
+ * 添加序列号防止并发读写冲突
  */
 typedef struct {
     uint32_t magic;                     // 魔数：0x46555A5A ("FUZZ")
+    uint32_t sequence;                  // 序列号（每次写入递增，用于检测更新）
     uint32_t instruction_count;         // 指令数量
+    uint32_t checksum;                  // 简单校验和（magic ^ sequence ^ instruction_count）
     uint32_t flags;                     // 控制标志（预留）
-    uint32_t reserved;                  // 保留字段
+    uint32_t reserved[3];               // 保留字段
     FuzzInstruction instructions[32];   // 指令数组（最多32条）
 } FuzzSharedMemory;
 
@@ -159,10 +162,6 @@ typedef struct {
     uint32_t trace_length;              // 轨迹长度
     uint32_t replay_index;              // 重放索引
 
-    /* FD映射表 */
-    GHashTable *fd_map;                 // record_fd -> replay_fd映射
-    GHashTable *addr_map;               // 地址映射(recorded_addr -> actual_addr)
-
     /* IPC通信 */
     int cmd_pipe_fd;                    // 命令管道
     int status_pipe_fd;                 // 状态管道
@@ -174,6 +173,7 @@ typedef struct {
 
     /* 统计信息 */
     uint64_t total_syscalls;            // 总系统调用数
+    uint64_t deviation_count;           // 偏离计数 (P0: 偏离检测)
 } rr_framework_t;
 
 /* ================= 全局变量 ================= */
@@ -188,13 +188,20 @@ void rr_config_cleanup(void);
 void rr_config_print(void);
 const char *rr_config_get_mode_name(rr_mode_t mode);
 
-/* 地址映射管理函数 */
-void rr_add_addr_mapping(target_ulong recorded_addr, target_ulong actual_addr);
-target_ulong rr_get_mapped_addr(target_ulong recorded_addr);
-void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr);
+/* 映射管理器接口 */
+int rr_mapping_manager_init(size_t fd_buckets, size_t addr_buckets);
+void rr_mapping_manager_cleanup(void);
+int rr_fd_mapping_add(int recorded_fd, int actual_fd);
+int rr_fd_mapping_get(int recorded_fd);
+int rr_fd_mapping_remove(int recorded_fd);
+int rr_addr_mapping_add(target_ulong recorded_addr, target_ulong actual_addr, size_t size);
+target_ulong rr_addr_mapping_get(target_ulong recorded_addr);
+int rr_addr_mapping_remove(target_ulong recorded_addr);
 
 /* 全局变量 */
 extern target_ulong g_pending_mmap_recorded_addr;
+extern target_ulong g_pending_mmap_length;
+void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr);
 
 /**
  * 初始化RR框架
@@ -229,6 +236,9 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                           abi_long arg1, abi_long arg2, abi_long arg3, abi_long arg4,
                           abi_long arg5, abi_long arg6, abi_long arg7, abi_long arg8);
 
+/* 记录释放工具 */
+void rr_record_dispose(syscall_record_t *record);
+
 /* ================= 模块函数声明 ================= */
 
 /* Record模块 */
@@ -243,6 +253,7 @@ void rr_stop_replay(void);
 
 /* Replay状态标记 - 用于协调 replay 和 post_hook */
 extern __thread bool g_syscall_already_consumed;
+extern __thread syscall_record_t *g_pending_post_record;
 
 /* Replay模块 - Pure 模式（EnvFuzz 风格） */
 /* 声明已移至 rr_replay_pure.h */
@@ -251,6 +262,7 @@ extern __thread bool g_syscall_already_consumed;
 int rr_start_fork_server(const char *syscall_name, const char *pattern);
 void rr_stop_fork_server(void);
 bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_name, const abi_long *args);
+bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long ret);
 int rr_fork_server_loop(void);
 void rr_reset_fork_point(void);
 
@@ -398,43 +410,8 @@ const char *rr_debug_level_name(rr_debug_level_t level);
  */
 static inline bool rr_should_skip_syscall(int syscall_nr)
 {
-    switch (syscall_nr) {
-        /* 内存管理系统调用 - 应该实时执行 */
-        case TARGET_NR_brk:
-#ifdef TARGET_NR_mmap
-        case TARGET_NR_mmap:
-#endif
-#ifdef TARGET_NR_mmap2
-        case TARGET_NR_mmap2:
-#endif
-        case TARGET_NR_munmap:
-        case TARGET_NR_mremap:
-        case TARGET_NR_mprotect:
-        case TARGET_NR_madvise:
-            
-        /* 架构特定的系统调用 */
-#ifdef TARGET_NR_arch_prctl
-        case TARGET_NR_arch_prctl:
-#endif
-            
-        /* 线程/进程管理 - 实时执行（但不跳过record/replay getpid等） */
-        case TARGET_NR_set_robust_list:
-        case TARGET_NR_rseq:
-        case TARGET_NR_clone:
-#ifdef TARGET_NR_fork
-        case TARGET_NR_fork:
-#endif
-#ifdef TARGET_NR_vfork
-        case TARGET_NR_vfork:
-#endif
-#ifdef TARGET_NR_tgkill
-        case TARGET_NR_tgkill:
-#endif
-            return true;
-            
-        default:
-            return false;
-    }
+    (void)syscall_nr;
+    return false;
 }
 
 /**

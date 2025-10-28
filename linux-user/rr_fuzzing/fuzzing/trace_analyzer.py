@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RR-Fuzz Trace Analyzer
+
+功能:
+1. 解析 binary trace 文件
+2. 识别每个系统调用的类型 (Pure/Hybrid)
+3. 提取系统调用序列和参数信息
+4. 为 Conductor 提供元信息
+
+作者: RR-Fuzz Team
+日期: 2025-10-26
+"""
+
+import struct
+import os
+from enum import IntEnum
+from typing import List, Dict, Tuple, Optional
+
+
+class AuxDataType(IntEnum):
+    """aux_data 类型枚举 (与 rr_aux_data.h 保持一致)"""
+    AUX_TYPE_BUFFER = 1
+    AUX_TYPE_STRING = 2
+    AUX_TYPE_RANDOM = 3
+    AUX_TYPE_STRUCT = 4
+
+
+class SyscallRecord:
+    """系统调用记录"""
+    def __init__(self, index: int, syscall_nr: int, retval: int, 
+                 has_aux_data: bool, aux_data_size: int = 0):
+        self.index = index
+        self.syscall_nr = syscall_nr
+        self.retval = retval
+        self.has_aux_data = has_aux_data
+        self.aux_data_size = aux_data_size
+        self.name = self._nr_to_name(syscall_nr)
+        self.category = self._categorize()
+    
+    def _nr_to_name(self, nr: int) -> str:
+        """将系统调用号转换为名称 (x86_64)"""
+        # 常见系统调用映射 (x86_64)
+        syscall_map = {
+            0: 'read',
+            1: 'write',
+            2: 'open',
+            3: 'close',
+            4: 'stat',
+            5: 'fstat',
+            8: 'lseek',
+            9: 'mmap',
+            10: 'mprotect',
+            11: 'munmap',
+            12: 'brk',
+            21: 'access',
+            41: 'socket',
+            42: 'connect',
+            43: 'accept',
+            44: 'sendto',
+            45: 'recvfrom',
+            56: 'clone',
+            57: 'fork',
+            59: 'execve',
+            60: 'exit',
+            72: 'fcntl',
+            79: 'getcwd',
+            80: 'chdir',
+            96: 'gettimeofday',
+            102: 'getuid',
+            104: 'getgid',
+            158: 'arch_prctl',
+            186: 'gettid',
+            202: 'futex',
+            218: 'set_tid_address',
+            228: 'clock_gettime',
+            231: 'exit_group',
+            257: 'openat',
+            262: 'newfstatat',
+            318: 'getrandom',
+        }
+        return syscall_map.get(nr, f'syscall_{nr}')
+    
+    def _categorize(self) -> str:
+        """分类系统调用"""
+        if self.has_aux_data:
+            return 'pure_replay'
+        
+        # 根据系统调用名称分类
+        if self.name in ['read', 'pread64', 'readv', 'preadv',
+                         'recv', 'recvfrom', 'recvmsg',
+                         'getrandom']:
+            return 'input_io'
+        elif self.name in ['write', 'pwrite64', 'writev', 'pwritev',
+                           'send', 'sendto', 'sendmsg']:
+            return 'output_io'
+        elif self.name in ['open', 'openat', 'creat',
+                           'stat', 'fstat', 'lstat', 'newfstatat',
+                           'access', 'faccessat']:
+            return 'file_ops'
+        elif self.name in ['mmap', 'mmap2', 'munmap', 'mprotect', 'brk']:
+            return 'memory_mgmt'
+        elif self.name in ['socket', 'connect', 'bind', 'listen', 'accept']:
+            return 'network'
+        elif self.name in ['gettimeofday', 'clock_gettime', 'time']:
+            return 'time'
+        elif self.name in ['fork', 'clone', 'vfork', 'execve']:
+            return 'process'
+        else:
+            return 'hybrid_replay'
+    
+    def __repr__(self):
+        return (f"SyscallRecord(index={self.index}, name={self.name}, "
+                f"nr={self.syscall_nr}, retval={self.retval}, "
+                f"aux_data={self.has_aux_data}, category={self.category})")
+
+
+class TraceAnalyzer:
+    """Binary Trace 分析器"""
+    
+    TRACE_MAGIC = 0x52525254  # "RRTR"
+    TRACE_VERSION = 1
+    
+    def __init__(self, trace_file: str):
+        self.trace_file = trace_file
+        self.syscalls: List[SyscallRecord] = []
+        self.pure_syscalls: List[SyscallRecord] = []
+        self.hybrid_syscalls: List[SyscallRecord] = []
+        self.stats = {
+            'total': 0,
+            'pure_replay': 0,
+            'hybrid_replay': 0,
+            'input_io': 0,
+            'output_io': 0,
+            'file_ops': 0,
+            'memory_mgmt': 0,
+            'network': 0,
+            'time': 0,
+            'process': 0
+        }
+    
+    def analyze(self) -> bool:
+        """分析 trace 文件"""
+        if not os.path.exists(self.trace_file):
+            print(f"[TraceAnalyzer] ❌ Trace file not found: {self.trace_file}")
+            return False
+        
+        try:
+            with open(self.trace_file, 'rb') as f:
+                # 读取 header
+                if not self._read_header(f):
+                    return False
+                
+                # 读取所有 syscall records
+                self._read_syscall_records(f)
+                
+                # 分类和统计
+                self._classify_and_stats()
+                
+                print(f"[TraceAnalyzer] ✅ Analysis completed:")
+                print(f"  Total syscalls: {self.stats['total']}")
+                print(f"  Pure Replay:    {self.stats['pure_replay']} "
+                      f"({self.stats['pure_replay'] * 100 // max(self.stats['total'], 1)}%)")
+                print(f"  Hybrid Replay:  {self.stats['hybrid_replay']} "
+                      f"({self.stats['hybrid_replay'] * 100 // max(self.stats['total'], 1)}%)")
+                
+                return True
+                
+        except Exception as e:
+            print(f"[TraceAnalyzer] ❌ Failed to analyze trace: {e}")
+            return False
+    
+    def _read_header(self, f) -> bool:
+        """读取 trace header"""
+        # 魔数 (4 bytes)
+        magic = struct.unpack('I', f.read(4))[0]
+        if magic != self.TRACE_MAGIC:
+            print(f"[TraceAnalyzer] ❌ Invalid trace magic: 0x{magic:08X}")
+            return False
+        
+        # 版本 (4 bytes)
+        version = struct.unpack('I', f.read(4))[0]
+        if version != self.TRACE_VERSION:
+            print(f"[TraceAnalyzer] ⚠️  Trace version mismatch: {version} (expected {self.TRACE_VERSION})")
+        
+        # 记录数量 (4 bytes)
+        count = struct.unpack('I', f.read(4))[0]
+        self.stats['total'] = count
+        
+        print(f"[TraceAnalyzer] Trace header:")
+        print(f"  Magic:   0x{magic:08X}")
+        print(f"  Version: {version}")
+        print(f"  Count:   {count}")
+        
+        return True
+    
+    def _read_syscall_records(self, f):
+        """读取所有系统调用记录"""
+        index = 0
+        
+        while True:
+            # 尝试读取一个 record
+            record_data = f.read(12)  # syscall_nr(4) + retval(8)
+            if len(record_data) < 12:
+                break  # EOF
+            
+            syscall_nr = struct.unpack('i', record_data[0:4])[0]
+            retval = struct.unpack('q', record_data[4:12])[0]
+            
+            # 读取 has_aux_data 标志 (1 byte)
+            has_aux_data_bytes = f.read(1)
+            if len(has_aux_data_bytes) < 1:
+                break
+            
+            has_aux_data = (has_aux_data_bytes[0] != 0)
+            
+            # 如果有 aux_data，跳过 aux_data 数据
+            aux_data_size = 0
+            if has_aux_data:
+                aux_data_size = self._skip_aux_data(f)
+            
+            # 创建记录
+            record = SyscallRecord(
+                index=index,
+                syscall_nr=syscall_nr,
+                retval=retval,
+                has_aux_data=has_aux_data,
+                aux_data_size=aux_data_size
+            )
+            
+            self.syscalls.append(record)
+            index += 1
+        
+        print(f"[TraceAnalyzer] Read {len(self.syscalls)} syscall records")
+    
+    def _skip_aux_data(self, f) -> int:
+        """跳过 aux_data 数据，返回总大小"""
+        total_size = 0
+        
+        # 读取 aux_data 链表
+        while True:
+            # 读取 aux_data header: type(4) + size(4) + arg_mask(1)
+            aux_header = f.read(9)
+            if len(aux_header) < 9:
+                break
+            
+            aux_type = struct.unpack('I', aux_header[0:4])[0]
+            aux_size = struct.unpack('I', aux_header[4:8])[0]
+            
+            # 跳过数据
+            f.read(aux_size)
+            
+            total_size += 9 + aux_size
+            
+            # 检查是否有下一个 aux_data (简化处理，假设只有一个)
+            break
+        
+        return total_size
+    
+    def _classify_and_stats(self):
+        """分类和统计"""
+        for record in self.syscalls:
+            # 分类 Pure/Hybrid
+            if record.has_aux_data:
+                self.pure_syscalls.append(record)
+                self.stats['pure_replay'] += 1
+            else:
+                self.hybrid_syscalls.append(record)
+                self.stats['hybrid_replay'] += 1
+            
+            # 按类别统计
+            if record.category in self.stats:
+                self.stats[record.category] += 1
+    
+    def classify_syscalls(self, syscalls):
+        """分类系统调用"""
+        pure = [s for s in syscalls if s['has_aux_data']]
+        hybrid = [s for s in syscalls if not s['has_aux_data']]
+        return pure, hybrid
+
+    def get_pure_candidates(self):
+        if not self.syscalls:
+            self.analyze()
+            self.classify_syscalls(self.syscalls)
+        return self.pure_syscalls
+
+    def get_hybrid_candidates(self):
+        if not self.syscalls:
+            self.analyze()
+            self.classify_syscalls(self.syscalls)
+        return self.hybrid_syscalls
+    
+    def get_pure_syscalls(self) -> List[SyscallRecord]:
+        """获取 Pure Replay 系统调用"""
+        return self.pure_syscalls
+    
+    def get_hybrid_syscalls(self) -> List[SyscallRecord]:
+        """获取 Hybrid Replay 系统调用"""
+        return self.hybrid_syscalls
+    
+    def get_syscalls_by_category(self, category: str) -> List[SyscallRecord]:
+        """按类别获取系统调用"""
+        return [sc for sc in self.syscalls if sc.category == category]
+    
+    def print_summary(self):
+        """打印分析摘要"""
+        print("\n" + "━" * 60)
+        print("📊 Trace Analysis Summary")
+        print("━" * 60)
+        
+        print(f"\n📈 Overall Statistics:")
+        print(f"  Total syscalls:  {self.stats['total']}")
+        print(f"  Pure Replay:     {self.stats['pure_replay']} "
+              f"({self.stats['pure_replay'] * 100 // max(self.stats['total'], 1)}%)")
+        print(f"  Hybrid Replay:   {self.stats['hybrid_replay']} "
+              f"({self.stats['hybrid_replay'] * 100 // max(self.stats['total'], 1)}%)")
+        
+        print(f"\n🔍 Category Breakdown:")
+        categories = ['input_io', 'output_io', 'file_ops', 'memory_mgmt', 
+                      'network', 'time', 'process']
+        for cat in categories:
+            count = self.stats.get(cat, 0)
+            if count > 0:
+                pct = count * 100 // max(self.stats['total'], 1)
+                print(f"  {cat:15s}: {count:4d} ({pct:2d}%)")
+        
+        print(f"\n📝 Top 10 Syscalls:")
+        syscall_counts = {}
+        for sc in self.syscalls:
+            syscall_counts[sc.name] = syscall_counts.get(sc.name, 0) + 1
+        
+        sorted_syscalls = sorted(syscall_counts.items(), key=lambda x: x[1], reverse=True)
+        for name, count in sorted_syscalls[:10]:
+            pct = count * 100 // max(self.stats['total'], 1)
+            print(f"  {name:20s}: {count:4d} ({pct:2d}%)")
+        
+        print("━" * 60 + "\n")
+    
+    def export_to_json(self, output_file: str):
+        """导出分析结果为 JSON"""
+        import json
+        
+        data = {
+            'trace_file': self.trace_file,
+            'stats': self.stats,
+            'syscalls': [
+                {
+                    'index': sc.index,
+                    'name': sc.name,
+                    'nr': sc.syscall_nr,
+                    'retval': sc.retval,
+                    'has_aux_data': sc.has_aux_data,
+                    'category': sc.category
+                }
+                for sc in self.syscalls
+            ]
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"[TraceAnalyzer] ✅ Exported to {output_file}")
+
+
+def main():
+    """测试入口"""
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: trace_analyzer.py <trace_file>")
+        sys.exit(1)
+    
+    trace_file = sys.argv[1]
+    
+    analyzer = TraceAnalyzer(trace_file)
+    if analyzer.analyze():
+        analyzer.print_summary()
+        
+        # 可选: 导出 JSON
+        if len(sys.argv) >= 3:
+            analyzer.export_to_json(sys.argv[2])
+
+
+if __name__ == '__main__':
+    main()
+

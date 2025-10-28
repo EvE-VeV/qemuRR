@@ -27,6 +27,22 @@ void rr_dynamic_trace_init(int write_fd) {
     g_dynamic_trace_pipe_fd = write_fd;
     g_dynamic_trace_enabled = (write_fd >= 0);
     
+    // 🔧 P0 修复：增加管道缓冲区到 1MB（从默认的 ~64KB）
+    if (g_dynamic_trace_enabled) {
+        int pipe_size = 1024 * 1024;  // 1MB
+        if (fcntl(write_fd, F_SETPIPE_SZ, pipe_size) < 0) {
+            RR_WARN("  Failed to increase pipe buffer: %s (errno=%d)", strerror(errno), errno);
+            RR_WARN("  Will use default pipe size (~64KB)");
+        } else {
+            int actual_size = fcntl(write_fd, F_GETPIPE_SZ);
+            RR_INFO("  Pipe buffer size: %d bytes (requested %d)", actual_size, pipe_size);
+        }
+        
+        // 🔧 P0 修复：忽略 SIGPIPE（防止 Visualizer 断开时进程被杀）
+        signal(SIGPIPE, SIG_IGN);
+        RR_INFO("  SIGPIPE handler set to SIG_IGN");
+    }
+    
     RR_INFO("  g_dynamic_trace_enabled = %d", g_dynamic_trace_enabled);
     
     if (g_dynamic_trace_enabled) {
@@ -86,11 +102,27 @@ static inline void send_trace_msg(rr_dynamic_trace_msg_t *msg) {
     errno = 0;
     ssize_t written = write(g_dynamic_trace_pipe_fd, msg, sizeof(rr_dynamic_trace_msg_t));
     if (written != sizeof(rr_dynamic_trace_msg_t)) {
-        /* 写入失败时禁用跟踪 */
-        RR_WARN("Dynamic trace pipe write failed: written=%zd, expected=%zu, errno=%d (%s)", 
-                written, sizeof(rr_dynamic_trace_msg_t), errno, strerror(errno));
-        g_dynamic_trace_enabled = false;
-        RR_WARN("Dynamic trace DISABLED due to write failure");
+        // 🔧 P0 修复：不要永久禁用，根据错误类型处理
+        if (written < 0) {
+            // write() 返回 -1，检查 errno
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // 管道满，丢弃这条消息（不禁用，继续尝试）
+                RR_VERBOSE("Dynamic trace pipe full (EAGAIN), message dropped (type=%u)", msg->type);
+            } else if (errno == EPIPE) {
+                // Visualizer 断开，禁用 trace
+                RR_WARN("Dynamic trace pipe broken (EPIPE), disabling trace");
+                g_dynamic_trace_enabled = false;
+            } else {
+                // 其他错误，记录但继续
+                RR_WARN("Dynamic trace write failed: errno=%d (%s), continuing anyway", 
+                        errno, strerror(errno));
+            }
+        } else {
+            // 部分写入（written > 0 但 < sizeof），这很罕见
+            RR_WARN("Dynamic trace partial write: %zd/%zu bytes, message may be corrupted", 
+                    written, sizeof(rr_dynamic_trace_msg_t));
+            // 不禁用，继续尝试
+        }
     } else {
         RR_VERBOSE("send_trace_msg: wrote %zd bytes (type=%u)", written, msg->type);
     }
@@ -126,8 +158,40 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
         }
     }
     
-    /* 获取系统调用名 */
+    /* 获取系统调用名 - 先尝试从 dispatch，失败则用内置表 */
     const char *name = rr_get_syscall_name_fast(num);
+    if (!name) {
+        /* 内置常用 syscall 名称表（与 rr_main.c 保持一致） */
+        switch(num) {
+            case 0: name = "read"; break;
+            case 1: name = "write"; break;
+            case 2: name = "open"; break;
+            case 3: name = "close"; break;
+            case 4: name = "stat"; break;
+            case 5: name = "fstat"; break;
+            case 9: name = "mmap"; break;
+            case 10: name = "mprotect"; break;
+            case 11: name = "munmap"; break;
+            case 12: name = "brk"; break;
+            case 16: name = "ioctl"; break;
+            case 17: name = "pread64"; break;
+            case 21: name = "access"; break;
+            case 39: name = "getpid"; break;
+            case 63: name = "uname"; break;
+            case 158: name = "arch_prctl"; break;
+            case 217: name = "getdents64"; break;
+            case 218: name = "set_tid_address"; break;
+            case 231: name = "exit_group"; break;
+            case 257: name = "openat"; break;
+            case 262: name = "newfstatat"; break;
+            case 273: name = "set_robust_list"; break;
+            case 302: name = "prlimit64"; break;
+            case 318: name = "getrandom"; break;
+            case 334: name = "rseq"; break;
+            default: name = NULL; break;
+        }
+    }
+    
     if (name) {
         strncpy(msg.syscall_info.name, name, sizeof(msg.syscall_info.name) - 1);
         msg.syscall_info.name[sizeof(msg.syscall_info.name) - 1] = '\0';
@@ -168,8 +232,40 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
         }
     }
     
-    /* 获取系统调用名 */
+    /* 获取系统调用名 - 先尝试从 dispatch，失败则用内置表 */
     const char *name = rr_get_syscall_name_fast(num);
+    if (!name) {
+        /* 内置常用 syscall 名称表（与 syscall_enter 保持一致） */
+        switch(num) {
+            case 0: name = "read"; break;
+            case 1: name = "write"; break;
+            case 2: name = "open"; break;
+            case 3: name = "close"; break;
+            case 4: name = "stat"; break;
+            case 5: name = "fstat"; break;
+            case 9: name = "mmap"; break;
+            case 10: name = "mprotect"; break;
+            case 11: name = "munmap"; break;
+            case 12: name = "brk"; break;
+            case 16: name = "ioctl"; break;
+            case 17: name = "pread64"; break;
+            case 21: name = "access"; break;
+            case 39: name = "getpid"; break;
+            case 63: name = "uname"; break;
+            case 158: name = "arch_prctl"; break;
+            case 217: name = "getdents64"; break;
+            case 218: name = "set_tid_address"; break;
+            case 231: name = "exit_group"; break;
+            case 257: name = "openat"; break;
+            case 262: name = "newfstatat"; break;
+            case 273: name = "set_robust_list"; break;
+            case 302: name = "prlimit64"; break;
+            case 318: name = "getrandom"; break;
+            case 334: name = "rseq"; break;
+            default: name = NULL; break;
+        }
+    }
+    
     if (name) {
         strncpy(msg.syscall_info.name, name, sizeof(msg.syscall_info.name) - 1);
         msg.syscall_info.name[sizeof(msg.syscall_info.name) - 1] = '\0';

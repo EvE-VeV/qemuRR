@@ -18,6 +18,7 @@ import select
 import threading
 import signal
 from pathlib import Path
+from trace_analyzer import TraceAnalyzer
 
 # ===== Fuzz指令类型定义（与C端保持一致）=====
 FUZZ_CMD_NONE = 0
@@ -82,6 +83,7 @@ class FuzzSharedMemory:
         self.size = size
         self.shm_fd = None
         self.mem = None
+        self.sequence = 0  # 序列号计数器
     
     def create(self):
         """创建共享内存"""
@@ -99,15 +101,25 @@ class FuzzSharedMemory:
         return self
     
     def write_instructions(self, instructions):
-        """写入Fuzz指令到共享内存"""
+        """写入Fuzz指令到共享内存，带序列号和校验"""
         if not self.mem:
             raise RuntimeError("Shared memory not created")
         
         if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
             raise ValueError(f"Too many instructions: {len(instructions)} (max {FUZZ_MAX_INSTRUCTIONS})")
         
-        # 写入头部：magic + count + flags + reserved
-        header = struct.pack('IIII', FUZZ_MAGIC, len(instructions), 0, 0)
+        # 递增序列号
+        self.sequence += 1
+        count = len(instructions)
+        
+        # 计算校验和：magic ^ sequence ^ count
+        checksum = FUZZ_MAGIC ^ self.sequence ^ count
+        
+        # 写入头部：magic + sequence + count + checksum + flags + reserved[3]
+        header = struct.pack('IIIIII', FUZZ_MAGIC, self.sequence, count, checksum, 0, 0)
+        # reserved[3] 需要两个额外的 I (total 8 uint32_t)
+        header += struct.pack('II', 0, 0)
+        
         self.mem.seek(0)
         self.mem.write(header)
         
@@ -115,7 +127,10 @@ class FuzzSharedMemory:
         for instr in instructions:
             self.mem.write(instr.pack())
         
-        print(f"[Conductor] Wrote {len(instructions)} instructions to shared memory")
+        # 强制刷新到磁盘
+        self.mem.flush()
+        
+        print(f"[Conductor] Wrote {count} instructions to shared memory (seq={self.sequence}, checksum=0x{checksum:x})")
     
     def close(self):
         """关闭共享内存"""
@@ -142,6 +157,22 @@ class FuzzSharedMemory:
             pass
 
 
+class SmartMutator:
+    def __init__(self, trace_file):
+        self.analyzer = TraceAnalyzer(trace_file)
+        self.syscalls = self.analyzer.analyze()
+        self.pure_candidates = self.analyzer.get_pure_candidates()
+        self.hybrid_candidates = self.analyzer.get_hybrid_candidates()
+
+    def build_instructions(self, iteration):
+        instrs = []
+        for sc in self.pure_candidates:
+            instrs.append(FuzzInstruction(sc.index, FUZZ_CMD_REPLACE_BUFFER, 1, b'A' * 16))
+        for sc in self.hybrid_candidates:
+            instrs.append(FuzzInstruction(sc.index, FUZZ_CMD_MUTATE_FLAGS, 0, struct.pack('q', 0xFFFFFFFF)))
+        return instrs
+
+
 class FuzzConductor:
     """Fuzz控制器 - 与QEMU进行IPC通信"""
     
@@ -157,6 +188,8 @@ class FuzzConductor:
         # 共享内存
         self.shm = FuzzSharedMemory(f"rr_fuzz_{os.getpid()}")
         self.shm.create()
+        
+        self.smart_mutator = SmartMutator(trace_file)
         
         self.qemu_process = None
         self.total_executions = 0
@@ -182,10 +215,11 @@ class FuzzConductor:
         """启动QEMU进程（Fuzzing模式）"""
         env = os.environ.copy()
         env.update({
-            'RR_DEBUG_LEVEL':'4',
+            'RR_DEBUG_LEVEL': '4',
             'RR_FUZZING_ENABLED': 'True',
+            'RR_TRACE_PIPE': '/tmp/rr_dynamic_trace',  # 启用 dynamic trace
             'RR_MODE': 'fuzzing',  # 关键：设置为fuzzing模式
-            'RR_STRACE_MODE': 'True',  # 使用strace重放
+            # 'RR_STRACE_MODE': 'True',  # ❌ 移除！binary trace 不需要 strace 模式
             'RR_TRACE_FILE': self.trace_file,
             'RR_CMD_PIPE': str(self.cmd_pipe_read),
             'RR_STATUS_PIPE': str(self.status_pipe_write),
@@ -286,99 +320,26 @@ class FuzzConductor:
         
         return status
     
-    def run_fuzzing_campaign(self, num_iterations=100):
-        """运行Fuzzing测试"""
-        global _shutdown_requested
-        print(f"\n[Conductor] Starting fuzzing campaign ({num_iterations} iterations)")
-        
-        consecutive_failures = 0
-        max_consecutive_failures = 3  # 允许连续3次失败
-        
-        for i in range(num_iterations):
-            # 检查是否请求停止
+    def run(self, rounds):
+        """运行Fuzz主循环"""
+        print(f"[Conductor] Starting fuzzing loop for {rounds} rounds")
+        for i in range(rounds):
             if _shutdown_requested:
-                print(f"[Conductor] Shutdown requested, stopping at iteration {i}")
                 break
-            
-            # 生成变异指令（示例：对第15个系统调用的第2个参数进行变异）
-            instructions = self._generate_mutations(i)
-            
-            # 发送并执行
+            print(f"\n[Conductor] ===== Round {i+1}/{rounds} =====")
+            # self._drain_qemu_stdout()  # 方法不存在，暂时注释
+            instructions = self.smart_mutator.build_instructions(i)
+            if not instructions:
+                print("[Conductor] No instructions generated, skipping round")
+                continue
             status = self.send_fuzz_command(instructions)
-            
             if status is None:
-                consecutive_failures += 1
-                print(f"[Conductor] ⚠️  QEMU process issue (failure {consecutive_failures}/{max_consecutive_failures})")
-                
-                if consecutive_failures >= max_consecutive_failures:
-                    print(f"[Conductor] ❌ Too many consecutive failures, stopping campaign")
-                    break
-                else:
-                    print(f"[Conductor] 🔄 Continuing fuzzing campaign...")
-                    continue
-            else:
-                consecutive_failures = 0  # 重置失败计数
-            
-            # 处理不同的执行结果
-            if status == 4:
-                print(f"[Conductor] 💥 CRASH FOUND in iteration #{i}! Saving testcase...")
-                # 保存触发崩溃的指令
-                crash_file = f"crash_{self.total_executions}_{i}.txt"
-                try:
-                    with open(crash_file, 'w') as f:
-                        f.write(f"=== CRASH TESTCASE ===\n")
-                        f.write(f"Iteration: {i}\n")
-                        f.write(f"Execution: {self.total_executions}\n")
-                        f.write(f"Timestamp: {__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        f.write(f"\n=== FUZZ INSTRUCTIONS ===\n")
-                        for idx, instr in enumerate(instructions):
-                            f.write(f"Instruction {idx}:\n")
-                            f.write(f"  Command: {instr.cmd}\n")
-                            f.write(f"  Syscall Index: {instr.syscall_index}\n")
-                            f.write(f"  Arg Index: {instr.arg_index}\n")
-                            f.write(f"  Value: {instr.value}\n")
-                            f.write(f"  Size: {instr.size}\n")
-                            f.write(f"\n")
-                    print(f"[Conductor] 💾 Crash testcase saved: {crash_file}")
-                except Exception as e:
-                    print(f"[Conductor] ⚠️  Failed to save crash: {e}")
-            elif status == 3:
-                # Normal exit - 静默处理，避免日志噪音
-                pass
-            elif status == 5:
-                print(f"[Conductor] ⚠️  Child terminated by signal (iteration #{i})")
-            elif status == -1:
-                print(f"[Conductor] ❌ Error status received (iteration #{i})")
-        
-        print(f"\n[Conductor] Fuzzing campaign completed")
-        print(f"[Conductor] Total executions: {self.total_executions}")
-        print(f"[Conductor] Crashes found: {len(self.crashes)}")
-    
-    def _generate_mutations(self, iteration):
-        """生成变异指令（示例策略）"""
-        # 简单策略：每次变异不同的系统调用
-        syscall_index = 15 + (iteration % 10)  # 轮流变异第15-24个系统调用
-        
-        mutations = []
-        
-        # 变异1：参数边界值测试
-        mutations.append(FuzzInstruction(
-            syscall_index=syscall_index,
-            cmd=FUZZ_CMD_BOUNDARY_VALUE,
-            arg_index=2,
-            data=-1  # 测试-1（常见的错误值）
-        ))
-        
-        # 变异2：标志位翻转
-        if iteration % 3 == 0:
-            mutations.append(FuzzInstruction(
-                syscall_index=syscall_index,
-                cmd=FUZZ_CMD_MUTATE_FLAGS,
-                arg_index=3,
-                data=0xFFFF  # XOR掩码
-            ))
-        
-        return mutations
+                print("[Conductor] QEMU terminated unexpectedly")
+                break
+            if status == "Crash Found":
+                print("[Conductor] Crash detected! Stopping fuzzing loop")
+                break
+        print("[Conductor] Fuzzing loop completed")
     
     def cleanup(self):
         """清理资源"""
@@ -446,7 +407,7 @@ def main():
     
     try:
         conductor.start_qemu()
-        conductor.run_fuzzing_campaign(args.iterations)
+        conductor.run(args.iterations)
     except KeyboardInterrupt:
         print("\n[Conductor] Interrupted by user")
     finally:

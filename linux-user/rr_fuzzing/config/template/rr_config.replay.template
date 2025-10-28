@@ -4,13 +4,18 @@
 # 用于重放已录制的trace
 #
 # 使用方法:
+#   # 1. 使用二进制trace（推荐）
+#   RR_CONFIG_FILE=./rr_config.replay.template \
+#   qemu-x86_64 /usr/bin/target
+#
+#   # 2. 使用strace文本trace（兼容模式）
 #   RR_CONFIG_FILE=./rr_config.replay.template \
 #   RR_STRACE_MODE=True \
-#   qemu-x86_64 /usr/bin/ls
+#   qemu-x86_64 /usr/bin/target
 #
 # 注意：
 #   1. mode字段会自动识别，无需额外设置RR_MODE环境变量
-#   2. RR_STRACE_MODE=True 必须通过环境变量设置
+#   2. 默认使用二进制trace（.dat），若使用strace文本需设置RR_STRACE_MODE=True
 # =========================================
 
 # === 核心配置 ===
@@ -31,10 +36,10 @@ debug_level=4
 # debug_file=./debug-replay.log
 
 # === 注意事项 ===
-# 1. 必须设置环境变量 RR_STRACE_MODE=True 才能启用strace replay
+# 1. 默认读取二进制trace（.dat）；若使用文本trace需设置RR_STRACE_MODE=True
 # 2. trace_file 必须是已经录制好的trace文件
-# 3. 可以通过 RR_STRACE_LOG_LEVEL 环境变量控制strace日志级别
-#    (0=error, 1=warn, 2=info, 3=verbose, 4=debug)
+# 3. 二进制trace性能更好且更精确，推荐使用
+# 4. 可以通过 debug_level 控制日志输出详细程度
 
 # === 不需要的参数（Replay模式不使用） ===
 # shared_memory_name - Fuzzing模式专用

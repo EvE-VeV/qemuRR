@@ -182,7 +182,9 @@ class RealtimeTreeBuilder:
                     
                 elif msg_type == RR_DYN_MSG_CLEANUP:
                     print(f"[Visualizer] 📡 CLEANUP from PID={pid}", flush=True)
-                    break
+                    # 不要 break！在 Fuzzing 模式下，子进程会多次 fork/cleanup
+                    # 只有在收到所有进程的 cleanup 或手动中断时才应该停止
+                    # break  # ❌ 移除这个 break
                     
                 elif msg_type == RR_DYN_MSG_FORK:
                     # 解析syscall_info部分（从第16字节开始）

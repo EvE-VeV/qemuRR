@@ -29,7 +29,26 @@ typedef enum {
     AUX_POLLFD,         /* pollfd array (APFD) */
     AUX_FDSET,          /* fd_set (ASET) */
     AUX_MMAP_CONTENT,   /* mmap file content */
+    AUX_SCALAR,         /* simple scalar value */
+    AUX_STRUCT,         /* generic structured data */
+    AUX_IOCTL_OUTPUT,   /* ioctl output buffer (task2) */
 } rr_aux_kind_t;
+
+typedef struct {
+    uint64_t addr;
+    uint64_t length;
+    int64_t prot;
+    int64_t flags;
+    int64_t fd;
+    uint64_t offset;
+} rr_aux_mmap_info_t;
+
+typedef struct {
+    uint64_t addr;
+    uint64_t len;
+    int64_t extra1;
+    int64_t extra2;
+} rr_aux_mm_params_t;
 
 /* Single auxiliary data entry */
 typedef struct rr_aux_data {

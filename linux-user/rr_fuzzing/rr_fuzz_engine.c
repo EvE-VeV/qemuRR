@@ -54,6 +54,16 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr)
         return -1;
     }
 
+    // 验证校验和（防止读到部分写入的数据）
+    uint32_t expected_checksum = shm->magic ^ shm->sequence ^ shm->instruction_count;
+    if (shm->checksum != expected_checksum) {
+        RR_WARN("Shared memory checksum mismatch: got 0x%x, expected 0x%x (sequence=%u, count=%u)",
+                shm->checksum, expected_checksum, shm->sequence, shm->instruction_count);
+        RR_WARN("Possible incomplete write, skipping this round");
+        g_instruction_count = 0;
+        return -1;  // 返回错误，让调用方知道数据不完整
+    }
+
     // 检查指令数量
     if (shm->instruction_count == 0) {
         RR_VERBOSE("No fuzz instructions in shared memory");
@@ -72,7 +82,8 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr)
     memcpy(g_fuzz_instructions, shm->instructions, 
            sizeof(FuzzInstruction) * g_instruction_count);
 
-    RR_INFO("Loaded %zu fuzz instructions from shared memory", g_instruction_count);
+    RR_INFO("Loaded %zu fuzz instructions from shared memory (seq=%u, checksum=0x%x)", 
+            g_instruction_count, shm->sequence, shm->checksum);
     
     // 输出调试信息
     for (size_t i = 0; i < g_instruction_count; i++) {
@@ -128,7 +139,6 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
     }
 
     // 获取系统调用的类型和重要性（用于智能变异）
-    syscall_type_t syscall_type = rr_get_syscall_type(syscall_nr);
     const char *syscall_name = rr_get_syscall_name_fast(syscall_nr);
 
     /* 遍历所有指令，寻找匹配的系统调用索引 */
@@ -156,13 +166,12 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
             case FUZZ_CMD_MUTATE_ARG:
                 /* 变异参数值 - 适用于整数参数 */
                 if (instr->data_len >= sizeof(abi_long)) {
-                    abi_long old_value = args[instr->arg_index];
                     abi_long new_value = *(abi_long *)instr->data;
                     args[instr->arg_index] = new_value;
                     
                     RR_INFO("🔧 MUTATE_ARG: %s[%u] %ld → %ld (syscall_idx=%u)",
                            syscall_name ? syscall_name : "unknown",
-                           instr->arg_index, old_value, new_value, syscall_index);
+                           instr->arg_index, args[instr->arg_index], new_value, syscall_index);
                     
                     g_fuzz_stats.arg_mutations++;
                 }
@@ -192,13 +201,12 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
             case FUZZ_CMD_MUTATE_FLAGS:
                 /* 变异标志位 - 对flags参数进行位操作 */
                 if (instr->data_len >= sizeof(abi_long)) {
-                    abi_long old_flags = args[instr->arg_index];
                     abi_long xor_mask = *(abi_long *)instr->data;
-                    args[instr->arg_index] = old_flags ^ xor_mask;
+                    args[instr->arg_index] ^= xor_mask;
                     
                     RR_INFO("🔧 MUTATE_FLAGS: %s[%u] 0x%lx → 0x%lx (XOR 0x%lx)",
                            syscall_name ? syscall_name : "unknown",
-                           instr->arg_index, old_flags, args[instr->arg_index], xor_mask);
+                           instr->arg_index, args[instr->arg_index], args[instr->arg_index], xor_mask);
                     
                     g_fuzz_stats.arg_mutations++;
                 }

@@ -4,18 +4,21 @@
 # 用于基于trace进行fuzzing测试
 #
 # 使用方法:
-#   # 1. 创建IPC管道
-#   mkfifo /tmp/rr_cmd_pipe /tmp/rr_status_pipe
+#   # 1. 配合 fuzz_conductor.py 使用（推荐）
+#   python3 fuzzing/fuzz_conductor.py \
+#     --qemu ./build/qemu-x86_64 \
+#     --trace ./trace.dat \
+#     --target /usr/bin/target \
+#     --iterations 100
 #
-#   # 2. 启动QEMU（mode会自动识别）
+#   # 2. 手动启动（高级用户）
 #   RR_CONFIG_FILE=./rr_config.fuzzing.template \
-#   RR_STRACE_MODE=True \
-#   qemu-x86_64 /usr/bin/ls
+#   qemu-x86_64 /usr/bin/target
 #
 # 注意：
 #   1. mode字段会自动识别，无需额外设置RR_MODE环境变量
-#   2. RR_STRACE_MODE=True 必须通过环境变量设置
-#   3. 需要外部fuzzer配合（如fuzz_conductor.py）
+#   2. 需要外部fuzzer配合（如fuzz_conductor.py）创建IPC管道和共享内存
+#   3. trace_file必须是二进制格式（.dat），不支持strace文本格式
 # =========================================
 
 # === 核心配置 ===

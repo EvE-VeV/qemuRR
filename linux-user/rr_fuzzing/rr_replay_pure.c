@@ -34,6 +34,19 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
     /* 根据系统调用类型从 AUX 数据恢复 */
     switch (num) {
+        case TARGET_NR_brk:
+#if defined(TARGET_NR_mmap)
+        case TARGET_NR_mmap:
+#endif
+#if defined(TARGET_NR_mmap2)
+        case TARGET_NR_mmap2:
+#endif
+        {
+            /* brk/mmap 需要真实执行以维护QEMU内部状态，这里直接回退 */
+            RR_VERBOSE("PURE_REPLAY: Syscall %d requires hybrid path, fallback", num);
+            return -1;
+        }
+
         case TARGET_NR_read: {
             /* 从 aux_data 恢复读取的数据 */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1); /* arg[1] 是缓冲区 */
@@ -91,14 +104,6 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
         }
 #endif
 
-#ifdef TARGET_NR_pwrite64
-        case TARGET_NR_pwrite64: {
-            /* 输出系统调用不支持Pure Replay，必须真实执行 */
-            RR_VERBOSE("PURE_REPLAY: Output syscall pwrite64, falling back to real execution");
-            return -1;
-        }
-#endif
-
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom: {
             /* 恢复接收的网络数据 */
@@ -140,6 +145,25 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
             return -1;
 #endif
 
+        case TARGET_NR_ioctl: {
+            /* ioctl Pure Replay - 从 AUX 数据恢复输出缓冲区 */
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 2); /* arg[2] 是缓冲区 */
+            if (aux && aux->kind == AUX_IOCTL_OUTPUT && aux->data && aux->size > 0) {
+                /* 直接写回输出缓冲区 */
+                if (cpu_memory_rw_debug(env_cpu(env), args[2], aux->data, aux->size, 1) == 0) {
+                    RR_VERBOSE("PURE_REPLAY: Restored %u bytes ioctl output for cmd=0x%lx", 
+                               aux->size, (unsigned long)args[1]);
+                    return record->retval; /* Pure replay 成功,返回记录的返回值 */
+                } else {
+                    RR_ERROR("PURE_REPLAY: Failed to write ioctl output buffer");
+                }
+            } else {
+                /* 没有捕获的输出数据,可能是不支持的 ioctl 命令 */
+                RR_VERBOSE("PURE_REPLAY: No ioctl output data, fallback to hybrid");
+            }
+            break;
+        }
+
         default:
             /* 其他系统调用暂不支持纯重放 */
             RR_VERBOSE("PURE_REPLAY: Syscall %d not supported in pure mode", num);
@@ -157,6 +181,8 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 bool rr_replay_pure_supported(int syscall_nr)
 {
     switch (syscall_nr) {
+        case TARGET_NR_brk:
+            return true;
         case TARGET_NR_read:
         case TARGET_NR_write:
 #ifdef TARGET_NR_getrandom
@@ -180,6 +206,7 @@ bool rr_replay_pure_supported(int syscall_nr)
         case TARGET_NR_send:
         case TARGET_NR_sendto:
 #endif
+        case TARGET_NR_ioctl: /* Task2: ioctl Pure Replay */
             return true;
         default:
             return false;
