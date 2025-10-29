@@ -39,11 +39,17 @@ int rr_start_replay(const char *trace_file)
         RR_INFO("Using default trace file: %s", trace_file);
     }
 
-    RR_INFO("Opening trace file for reading: %s", trace_file);
-    g_trace_file = fopen(trace_file, "rb");
-    if (!g_trace_file) {
-        RR_ERROR("Failed to open trace file: %s", trace_file);
-        return -1;
+    /* 如果文件已打开，重置文件指针而不是重新打开 */
+    if (g_trace_file) {
+        RR_INFO("Trace file already open, rewinding to start");
+        rewind(g_trace_file);
+    } else {
+        RR_INFO("Opening trace file for reading: %s", trace_file);
+        g_trace_file = fopen(trace_file, "rb");
+        if (!g_trace_file) {
+            RR_ERROR("Failed to open trace file: %s", trace_file);
+            return -1;
+        }
     }
 
     /* 读取并验证文件头 */
@@ -77,6 +83,23 @@ int rr_start_replay(const char *trace_file)
     RR_INFO("Trace contains %u syscall records", record_count);
 
     return 0;
+}
+
+/**
+ * 重置 trace 文件指针到开头（用于 fork server）
+ */
+void rr_reset_trace_position(void)
+{
+    if (!g_trace_file) {
+        RR_WARN("Cannot reset trace: file not open");
+        return;
+    }
+    
+    RR_INFO("Resetting trace file position to start");
+    rewind(g_trace_file);
+    
+    /* 跳过 header (12 bytes: magic + version + count) */
+    fseek(g_trace_file, 12, SEEK_SET);
 }
 
 /**
@@ -393,8 +416,16 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 
     /* ========== 特殊处理 1：Output Syscalls ========== */
     /* 输出系统调用必须真实执行以维持I/O状态，但需要先消费 record */
+    /* 🔥 注意：对于output syscalls，我们需要在这里先应用mutation，然后再执行真实syscall */
     if (rr_is_output_syscall(num)) {
         RR_VERBOSE("REPLAY_SYSCALL: Output syscall %d, consuming record and executing directly", num);
+        
+        /* 🔥 关键修复：在执行output syscall之前先应用mutation */
+        if (g_rr_framework->mode == RR_MODE_FUZZING) {
+            uint32_t syscall_index = g_current_record->index;
+            RR_INFO("🎯 FUZZING MODE: Applying mutations for OUTPUT syscall %d at index %u", num, syscall_index);
+            rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+        }
         
         /* 清理当前记录 */
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {

@@ -21,6 +21,9 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../analysis'))
+USE_FIXED_PARSER = False  # 暂时禁用，因为trace_parser_fixed不返回结构化数据
 from trace_analyzer import TraceAnalyzer
 
 # ===== Fuzz指令类型定义（与C端保持一致）=====
@@ -74,25 +77,27 @@ class FuzzInstruction:
     
     def pack(self):
         """打包成二进制格式（对应C结构体）"""
-        # struct FuzzInstruction {
-        #     uint32_t syscall_index;
-        #     uint32_t cmd;           // fuzz_cmd_type_t (enum)
-        #     uint8_t arg_index;
-        #     uint16_t data_len;
-        #     uint8_t data[256];
-        # }
+        # 🔥 修正：C端的结构体定义（rr_framework.h:68-74）：
+        # typedef struct {
+        #     fuzz_cmd_type_t cmd;        // 第1个字段 (uint32)
+        #     uint32_t syscall_index;     // 第2个字段
+        #     uint32_t arg_index;         // 第3个字段
+        #     uint32_t data_len;          // 第4个字段
+        #     uint8_t data[256];          // 第5个字段
+        # } FuzzInstruction;
         data_bytes = self.data if isinstance(self.data, bytes) else struct.pack('q', self.data)
         data_len = len(data_bytes)
         
         # 填充到256字节
         padded_data = data_bytes + b'\x00' * (256 - data_len)
         
-        return struct.pack('IIBH256s', 
-                          self.syscall_index,
-                          self.cmd,
-                          self.arg_index,
-                          data_len,
-                          padded_data)
+        # 按照C端的字段顺序打包
+        return struct.pack('IIII256s', 
+                          self.cmd,                # 第1个：cmd
+                          self.syscall_index,      # 第2个：syscall_index  
+                          self.arg_index,          # 第3个：arg_index
+                          data_len,                # 第4个：data_len
+                          padded_data)             # 第5个：data
 
 
 class FuzzSharedMemory:
@@ -178,13 +183,142 @@ class FuzzSharedMemory:
 
 class SmartMutator:
     def __init__(self, trace_file):
-        self.analyzer = TraceAnalyzer(trace_file)
-        self.syscalls = self.analyzer.analyze()
-        self.pure_candidates = self.analyzer.get_pure_candidates()
-        self.hybrid_candidates = self.analyzer.get_hybrid_candidates()
+        # ✅ 修复：恢复自动解析，使用修复后的TraceAnalyzer
+        print(f"[Mutator] Analyzing trace file: {trace_file}")
+        
+        # 导入并使用修复后的TraceAnalyzer
+        from trace_analyzer import TraceAnalyzer
+        
+        analyzer = TraceAnalyzer(trace_file)
+        if not analyzer.analyze():
+            raise RuntimeError(f"Failed to analyze trace: {trace_file}")
+        
+        # 获取所有pure syscalls（有aux_data的syscalls）
+        pure_syscalls = analyzer.get_pure_syscalls()
+        
+        # 定义Candidate类
+        class Candidate:
+            def __init__(self, index, name, nr):
+                self.index = index
+                self.name = name
+                self.syscall_nr = nr
+        
+        # 转换为Candidate对象
+        self.pure_candidates = [
+            Candidate(sc.index, sc.name, sc.syscall_nr)
+            for sc in pure_syscalls
+        ]
+        
+        # 获取hybrid syscalls（无aux_data的syscalls）
+        hybrid_syscalls = analyzer.get_hybrid_syscalls()
+        self.hybrid_candidates = [
+            Candidate(sc.index, sc.name, sc.syscall_nr)
+            for sc in hybrid_syscalls
+        ]
+        
+        # 保存所有syscalls供后续使用
+        self.syscalls = analyzer.syscalls
+        
+        print(f"[Mutator] ✅ Found {len(self.pure_candidates)} pure replay syscalls:")
+        for cand in self.pure_candidates[:10]:  # 只打印前10个
+            print(f"[Mutator]   index={cand.index}, name={cand.name}, nr={cand.syscall_nr}")
+        if len(self.pure_candidates) > 10:
+            print(f"[Mutator]   ... and {len(self.pure_candidates) - 10} more")
         
         # Phase 1: 过滤不可变异的 syscall
         self.mutable_candidates = self._filter_mutable_candidates()
+    
+    def _parse_trace_for_candidates(self, trace_file):
+        """手动解析trace文件，找到所有有aux_data的syscalls"""
+        candidates = []
+        
+        # 简化的Candidate类
+        class Candidate:
+            def __init__(self, index, name, nr):
+                self.index = index
+                self.name = name
+                self.syscall_nr = nr
+        
+        # 已知的系统调用号映射
+        syscall_names = {
+            0: 'read', 1: 'write', 9: 'mmap', 10: 'mprotect',
+            12: 'brk', 44: 'sendto', 45: 'recvfrom'
+        }
+        
+        try:
+            with open(trace_file, 'rb') as f:
+                # 读取头部
+                header = f.read(12)
+                if len(header) < 12:
+                    print("[Mutator] ❌ Trace file too short")
+                    return candidates
+                
+                magic, version, count = struct.unpack('<III', header)
+                print(f"[Mutator] Trace: magic=0x{magic:x}, version={version}, count={count}")
+                
+                for i in range(count):
+                    try:
+                        # 读取record header
+                        rec_header = f.read(8)
+                        if len(rec_header) < 8:
+                            break
+                        
+                        index, syscall_nr = struct.unpack('<Ii', rec_header)
+                        
+                        # 跳过args (72) + arg_sizes (64) + timestamps (16) + flags (6) = 158 bytes
+                        f.read(158)
+                        
+                        # 读取arg_data (跳过直到-1标记)
+                        while True:
+                            arg_idx_bytes = f.read(4)
+                            if len(arg_idx_bytes) < 4:
+                                break
+                            arg_idx = struct.unpack('<i', arg_idx_bytes)[0]
+                            if arg_idx == -1:
+                                break
+                            # 跳过size(8) + data
+                            size_bytes = f.read(8)
+                            if len(size_bytes) < 8:
+                                break
+                            size = struct.unpack('<Q', size_bytes)[0]
+                            f.read(size)
+                        
+                        # 读取aux marker
+                        marker_bytes = f.read(4)
+                        if len(marker_bytes) < 4:
+                            break
+                        
+                        marker = struct.unpack('<I', marker_bytes)[0]
+                        
+                        if marker == 0x41555844:  # "AUXD"
+                            # 有aux_data!
+                            name = syscall_names.get(syscall_nr, f'syscall_{syscall_nr}')
+                            cand = Candidate(index, name, syscall_nr)
+                            candidates.append(cand)
+                            print(f"[Mutator] ✅ Found candidate: index={index}, name={name}, nr={syscall_nr}")
+                            
+                            # 跳过aux_data
+                            aux_count_bytes = f.read(4)
+                            if len(aux_count_bytes) < 4:
+                                break
+                            aux_count = struct.unpack('<I', aux_count_bytes)[0]
+                            for _ in range(aux_count):
+                                # kind(1) + arg_mask(1) + size(4)
+                                aux_header = f.read(6)
+                                if len(aux_header) < 6:
+                                    break
+                                aux_size = struct.unpack('<I', aux_header[2:6])[0]
+                                f.read(aux_size)  # 跳过data
+                    
+                    except Exception as e:
+                        print(f"[Mutator] Error parsing record {i}: {e}")
+                        break
+        
+        except Exception as e:
+            print(f"[Mutator] Error opening trace file: {e}")
+        
+        print(f"[Mutator] Found {len(candidates)} pure candidates")
+        return candidates
     
     def _should_skip_mutation(self, syscall_info, index):
         """判断是否应跳过该 syscall 的变异
@@ -196,10 +330,18 @@ class SmartMutator:
         Returns:
             bool: True 表示应跳过，False 表示可以变异
         """
+        syscall_name = getattr(syscall_info, 'name', '').lower()
+        
+        # 🔥 关键修复：重要的IO syscalls永远不跳过
+        IMPORTANT_SYSCALLS = {'send', 'sendto', 'recv', 'recvfrom', 'write', 'read'}
+        if syscall_name in IMPORTANT_SYSCALLS:
+            print(f"[Mutator] ✅ Keeping important IO syscall: {syscall_name} (index={index})")
+            return False  # 永不跳过
+        
         # 1. 跳过初始化阶段的关键 syscall
         if index < INIT_PHASE_THRESHOLD:
-            syscall_name = getattr(syscall_info, 'name', '').lower()
             if any(init_sc in syscall_name for init_sc in INIT_SYSCALLS):
+                print(f"[Mutator] ⏭️  Skipping init syscall: {syscall_name} (index={index})")
                 return True
         
         # 2. 跳过没有可变异数据的 syscall（将来可扩展）
@@ -218,9 +360,16 @@ class SmartMutator:
         # 合并 pure 和 hybrid candidates
         all_candidates = list(self.pure_candidates) + list(self.hybrid_candidates)
         
+        print(f"[Mutator] 📋 Filtering {len(all_candidates)} candidates...")
+        
         for candidate in all_candidates:
             if not self._should_skip_mutation(candidate, candidate.index):
                 mutable.append(candidate)
+        
+        print(f"[Mutator] ✅ Filtered result: {len(mutable)} mutable candidates")
+        print(f"[Mutator] 📝 Mutable candidates:")
+        for i, cand in enumerate(mutable):
+            print(f"[Mutator]   [{i}] index={cand.index}, name={cand.name}")
         
         return mutable
     
@@ -249,10 +398,12 @@ class SmartMutator:
             # Pure syscall: 轻量级缓冲区变异（少量数据）
             # 改为翻转几个字节，而不是完全替换
             mutation_data = bytes([0xFF ^ (iteration % 256)] * 4)  # 只变异 4 字节
+            print(f"[Mutator] 🎯 Target: index={target_candidate.index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({FUZZ_CMD_REPLACE_BUFFER})")
             instrs.append(FuzzInstruction(target_candidate.index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data))
         else:
             # Hybrid syscall: 标志位变异
             flag_mutation = struct.pack('q', (1 << (iteration % 32)))  # 单个 bit 翻转
+            print(f"[Mutator] 🎯 Target: index={target_candidate.index}, name={target_candidate.name}, cmd=MUTATE_FLAGS({FUZZ_CMD_MUTATE_FLAGS})")
             instrs.append(FuzzInstruction(target_candidate.index, FUZZ_CMD_MUTATE_FLAGS, 0, flag_mutation))
         
         return instrs

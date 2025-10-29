@@ -321,15 +321,28 @@ int rr_fork_server_loop(void)
                             g_rr_framework->status_pipe_fd = -1;
                         }
                         
+                        /* 🔥 关键修复：重置 trace 文件指针到开头 */
+                        RR_INFO("🔄 Child: Resetting trace position to start");
+                        rr_reset_trace_position();
+                        
+                        /* 🔥 关键修复：子进程重新加载Fuzz指令 */
+                        if (g_rr_framework->shared_memory) {
+                            RR_INFO("🔄 Child: Reloading fuzz instructions from shared memory");
+                            extern size_t g_instruction_count;  // 声明外部变量
+                            int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory);
+                            if (load_result < 0) {
+                                RR_ERROR("Child: Failed to reload fuzz instructions!");
+                            } else {
+                                RR_INFO("🎉 Child: Successfully reloaded %zu fuzz instructions", g_instruction_count);
+                            }
+                        }
+                        
                         /* 继续执行Fuzzing */
                         g_rr_framework->child_pid = 0;
                         g_rr_framework->fork_server_active = false;  // 🔥 子进程不再是fork server
                         
                         RR_INFO("🔄 Child process started for fuzzing execution (PID=%d)", getpid());
-                        RR_INFO("🔄 Child will continue replay from current point");
-                        
-                        // 子进程会继承父进程加载的Fuzz指令
-                        // 这些指令将在 rr_fuzz_mutate_syscall() 中被应用
+                        RR_INFO("🔄 Child will replay from START of trace with mutations");
                         
                         return 1; // 返回1表示子进程应该继续执行
                         

@@ -196,33 +196,114 @@ class TraceAnalyzer:
         return True
     
     def _read_syscall_records(self, f):
-        """读取所有系统调用记录"""
+        """读取所有系统调用记录 - 修复版，正确解析完整的trace格式"""
         index = 0
         
         while True:
-            # 尝试读取一个 record
-            record_data = f.read(12)  # syscall_nr(4) + retval(8)
-            if len(record_data) < 12:
+            # ===== Step 1: 读取固定字段 (150字节) =====
+            # [A] Record header (8 bytes): index + syscall_nr
+            header_data = f.read(8)
+            if len(header_data) < 8:
                 break  # EOF
             
-            syscall_nr = struct.unpack('i', record_data[0:4])[0]
-            retval = struct.unpack('q', record_data[4:12])[0]
+            rec_index, syscall_nr = struct.unpack('<Ii', header_data)
             
-            # 读取 has_aux_data 标志 (1 byte)
-            has_aux_data_bytes = f.read(1)
-            if len(has_aux_data_bytes) < 1:
+            # [B] Args and retval (72 bytes): args[8] (64) + retval (8)
+            args_retval = f.read(72)
+            if len(args_retval) < 72:
+                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} args_retval")
                 break
             
-            has_aux_data = (has_aux_data_bytes[0] != 0)
+            retval = struct.unpack('<q', args_retval[64:72])[0]
             
-            # 如果有 aux_data，跳过 aux_data 数据
+            # [C] Arg sizes (64 bytes): arg_sizes[8]
+            arg_sizes = f.read(64)
+            if len(arg_sizes) < 64:
+                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_sizes")
+                break
+            
+            # [D] Flags (6 bytes): creates_fd + uses_fd + created_fd
+            flags = f.read(6)
+            if len(flags) < 6:
+                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} flags")
+                break
+            
+            creates_fd = struct.unpack('<?', flags[0:1])[0]
+            uses_fd = struct.unpack('<?', flags[1:2])[0]
+            created_fd = struct.unpack('<i', flags[2:6])[0]
+            
+            # ===== Step 2: 读取variable arg_data section =====
+            while True:
+                arg_idx_bytes = f.read(4)
+                if len(arg_idx_bytes) < 4:
+                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_idx")
+                    break
+                
+                arg_idx = struct.unpack('<i', arg_idx_bytes)[0]
+                if arg_idx == -1:  # End marker
+                    break
+                
+                # Read size and data
+                size_bytes = f.read(8)
+                if len(size_bytes) < 8:
+                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_size")
+                    break
+                
+                size = struct.unpack('<Q', size_bytes)[0]
+                if size > 1000000:  # Sanity check
+                    print(f"[TraceAnalyzer] ⚠️  Record {index}: suspicious arg_size={size}")
+                    break
+                
+                data = f.read(size)
+                if len(data) < size:
+                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_data")
+                    break
+            
+            # ===== Step 3: 读取aux_data section =====
+            has_aux_data = False
             aux_data_size = 0
-            if has_aux_data:
-                aux_data_size = self._skip_aux_data(f)
             
-            # 创建记录
+            marker_bytes = f.read(4)
+            if len(marker_bytes) >= 4:
+                marker = struct.unpack('<I', marker_bytes)[0]
+                
+                if marker == 0x41555844:  # "AUXD" (little-endian)
+                    has_aux_data = True
+                    aux_cnt_bytes = f.read(4)
+                    if len(aux_cnt_bytes) < 4:
+                        print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux_count")
+                        break
+                    
+                    aux_count = struct.unpack('<I', aux_cnt_bytes)[0]
+                    
+                    # ✅ 关键修复：遍历所有aux_data（不要break！）
+                    for j in range(aux_count):
+                        kind_bytes = f.read(1)
+                        arg_mask_bytes = f.read(1)
+                        size_bytes = f.read(4)
+                        
+                        if len(kind_bytes) < 1 or len(arg_mask_bytes) < 1 or len(size_bytes) < 4:
+                            print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux[{j}] header")
+                            break
+                        
+                        kind = struct.unpack('<B', kind_bytes)[0]
+                        arg_mask = struct.unpack('<B', arg_mask_bytes)[0]
+                        size = struct.unpack('<I', size_bytes)[0]
+                        
+                        if size > 1000000:  # Sanity check
+                            print(f"[TraceAnalyzer] ⚠️  Record {index}: suspicious aux_size={size}")
+                            break
+                        
+                        data = f.read(size)
+                        if len(data) < size:
+                            print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux[{j}] data")
+                            break
+                        
+                        aux_data_size += size
+            
+            # ===== Step 4: 创建记录 =====
             record = SyscallRecord(
-                index=index,
+                index=rec_index,
                 syscall_nr=syscall_nr,
                 retval=retval,
                 has_aux_data=has_aux_data,
@@ -232,31 +313,7 @@ class TraceAnalyzer:
             self.syscalls.append(record)
             index += 1
         
-        print(f"[TraceAnalyzer] Read {len(self.syscalls)} syscall records")
-    
-    def _skip_aux_data(self, f) -> int:
-        """跳过 aux_data 数据，返回总大小"""
-        total_size = 0
-        
-        # 读取 aux_data 链表
-        while True:
-            # 读取 aux_data header: type(4) + size(4) + arg_mask(1)
-            aux_header = f.read(9)
-            if len(aux_header) < 9:
-                break
-            
-            aux_type = struct.unpack('I', aux_header[0:4])[0]
-            aux_size = struct.unpack('I', aux_header[4:8])[0]
-            
-            # 跳过数据
-            f.read(aux_size)
-            
-            total_size += 9 + aux_size
-            
-            # 检查是否有下一个 aux_data (简化处理，假设只有一个)
-            break
-        
-        return total_size
+        print(f"[TraceAnalyzer] ✅ Read {len(self.syscalls)} syscall records")
     
     def _classify_and_stats(self):
         """分类和统计"""
@@ -265,6 +322,8 @@ class TraceAnalyzer:
             if record.has_aux_data:
                 self.pure_syscalls.append(record)
                 self.stats['pure_replay'] += 1
+                # 🔥 调试：打印pure syscalls
+                print(f"[TraceAnalyzer] Pure syscall: index={record.index}, name={record.name}, nr={record.syscall_nr}")
             else:
                 self.hybrid_syscalls.append(record)
                 self.stats['hybrid_replay'] += 1

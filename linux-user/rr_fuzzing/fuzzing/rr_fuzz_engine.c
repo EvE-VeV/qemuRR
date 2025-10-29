@@ -134,21 +134,40 @@ int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count
  */
 static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
+    fprintf(stderr, "[APPLY] START: syscall_index=%u, nr=%d, g_instruction_count=%zu\n", 
+            syscall_index, syscall_nr, g_instruction_count);
+    fflush(stderr);
+    
     if (g_instruction_count == 0) {
+        fprintf(stderr, "[APPLY] ERROR: g_instruction_count is 0!\n");
+        fflush(stderr);
         return;  // 没有变异指令
     }
 
     // 获取系统调用的类型和重要性（用于智能变异）
     const char *syscall_name = rr_get_syscall_name_fast(syscall_nr);
+    
+    fprintf(stderr, "[APPLY] Searching for mutations: syscall_idx=%u, nr=%d (%s)\n",
+            syscall_index, syscall_nr, syscall_name ? syscall_name : "unknown");
+    fflush(stderr);
 
     /* 遍历所有指令，寻找匹配的系统调用索引 */
     for (size_t i = 0; i < g_instruction_count; i++) {
         FuzzInstruction *instr = &g_fuzz_instructions[i];
+        
+        fprintf(stderr, "[APPLY] Checking instr[%zu]: syscall_idx=%u vs target=%u, cmd=%d\n", 
+                   i, instr->syscall_index, syscall_index, instr->cmd);
+        fflush(stderr);
 
         // 跳过不匹配的系统调用
         if (instr->syscall_index != syscall_index) {
+            fprintf(stderr, "[APPLY]   Skip: mismatch (%u != %u)\n", instr->syscall_index, syscall_index);
+            fflush(stderr);
             continue;
         }
+        
+        fprintf(stderr, "[APPLY]   *** MATCH FOUND! cmd=%d ***\n", instr->cmd);
+        fflush(stderr);
 
         // 检查参数索引有效性
         if (instr->arg_index >= 8) {
@@ -242,11 +261,32 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
  */
 void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
+    // 🔥 直接写stderr，绕过日志系统
+    fprintf(stderr, "[DEBUG] rr_fuzz_mutate_syscall CALLED: syscall_index=%u, nr=%d\n", syscall_index, syscall_nr);
+    fflush(stderr);
+    
+    if (!g_rr_framework) {
+        fprintf(stderr, "[ERROR] g_rr_framework is NULL!\n");
+        fflush(stderr);
+        return;
+    }
+    
+    fprintf(stderr, "[DEBUG] g_rr_framework OK, mode=%d, g_instruction_count=%zu\n", 
+            g_rr_framework->mode, g_instruction_count);
+    fflush(stderr);
+    
     if (g_rr_framework->mode != RR_MODE_FUZZING) {
+        fprintf(stderr, "[WARN] Not in fuzzing mode (mode=%d != %d)\n", 
+                g_rr_framework->mode, RR_MODE_FUZZING);
+        fflush(stderr);
         return;
     }
 
+    fprintf(stderr, "[DEBUG] Calling apply_mutations_for_syscall...\n");
+    fflush(stderr);
     apply_mutations_for_syscall(env, syscall_index, args, syscall_nr);
+    fprintf(stderr, "[DEBUG] apply_mutations_for_syscall DONE\n");
+    fflush(stderr);
 }
 
 /**

@@ -23,6 +23,53 @@ static rr_aux_data_t *record_aux_scalar(uint8_t mask, const abi_long *value)
 }
 
 /**
+ * 辅助函数：将 arg_data 转换为 aux_data（用于 fuzzing）
+ * @param record: syscall record
+ * @param arg_index: 参数索引 (0-7)
+ * @param data: 数据指针（如果为 NULL，使用 record->arg_data[arg_index]）
+ * @param size: 数据大小（如果为 0，使用 record->arg_size[arg_index]）
+ * @return: 成功返回 true，失败返回 false
+ */
+static bool rr_promote_arg_to_aux(syscall_record_t *record, int arg_index, 
+                                   const uint8_t *data, size_t size)
+{
+    if (!record || arg_index < 0 || arg_index >= RR_MAX_SYSCALL_ARGS) {
+        return false;
+    }
+    
+    /* 如果没有提供数据，尝试使用 arg_data */
+    if (!data) {
+        data = record->arg_data[arg_index];
+        if (!data) return false;
+    }
+    
+    /* 如果没有提供大小，尝试使用 arg_size */
+    if (size == 0) {
+        size = record->arg_size[arg_index];
+        if (size == 0) return false;
+    }
+    
+    /* 创建 aux_data */
+    uint8_t *aux_data_copy = g_malloc(size);
+    if (!aux_data_copy) return false;
+    
+    memcpy(aux_data_copy, data, size);
+    
+    rr_aux_data_t *aux = rr_aux_create(AUX_BUFFER, (1 << arg_index), 
+                                       aux_data_copy, size);
+    if (!aux) {
+        g_free(aux_data_copy);
+        return false;
+    }
+    
+    /* 添加到 aux_data 链表 */
+    rr_aux_append(&record->aux_data, aux);
+    record->has_aux_data = true;
+    
+    return true;
+}
+
+/**
  * 释放syscall_record_t及其关联数据
  */
 void rr_record_dispose(syscall_record_t *record)
@@ -392,6 +439,31 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
+#ifdef TARGET_NR_sendto
+        case TARGET_NR_sendto:
+            /* sendto 的数据在调用前就存在（类似 write）*/
+            RR_VERBOSE("AUX_CAPTURE: sendto - args[2]=%ld, args[1]=0x%lx, args[0]=%d", args[2], args[1], (int)args[0]);
+            if (args[2] > 0 && args[1] != 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
+                bool should_record = rr_aux_should_record(args[2], args[0], syscall_nr);
+                RR_VERBOSE("AUX_CAPTURE: rr_aux_should_record returned %d for sendto (size=%ld, fd=%d)", should_record, args[2], (int)args[0]);
+                if (should_record) {
+                    uint8_t *data = rr_capture_buffer(env, args[1], args[2]);
+                    RR_VERBOSE("AUX_CAPTURE: rr_capture_buffer returned %p", data);
+                    if (data) {
+                        rr_aux_data_t *aux = rr_aux_create(AUX_BUFFER, 1, data, args[2]);
+                        RR_VERBOSE("AUX_CAPTURE: rr_aux_create returned %p", aux);
+                        if (aux) {
+                            rr_aux_append(&record->aux_data, aux);
+                            record->has_aux_data = true;
+                            RR_VERBOSE("AUX_CAPTURE: Successfully created aux_data for sendto, size=%ld", args[2]);
+                        }
+                        g_free(data);
+                    }
+                }
+            }
+            break;
+#endif
+
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom:
             /* 捕获接收到的数据 */
@@ -449,6 +521,9 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 if (record->arg_data[1]) {
                     record->arg_size[1] = args[2];
+                    
+                    /* 🔥 添加 aux_data for fuzzing */
+                    rr_promote_arg_to_aux(record, 1, NULL, 0);
                 }
             }
             break;
@@ -569,6 +644,9 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                     /* pwrite64: 需要在调用前捕获要写入的数据 */
                     record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                     record->arg_size[1] = args[2];
+                    
+                    /* 🔥 添加 aux_data for fuzzing */
+                    rr_promote_arg_to_aux(record, 1, NULL, 0);
                 }
 #endif
             }
@@ -601,19 +679,56 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         // I/O向量操作
 #ifdef TARGET_NR_readv
         case TARGET_NR_readv:
-            /* TODO: 处理 iovec 结构体数组 - 复杂数据结构 */
-            // 暂时记录向量个数
-            if (args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
-                // 这里需要遍历iovec数组捕获所有缓冲区
-                // 暂时不实现完整的iovec处理
+            /* 捕获 iovec 结构体数组（简化：只记录 iovec 结构本身） */
+            if (ret > 0 && args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
+                size_t iov_size = sizeof(struct iovec) * args[2];
+                record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
+                record->arg_size[1] = iov_size;
+                /* TODO: 完整实现需要遍历每个 iovec 捕获实际数据缓冲区 */
             }
             break;
 #endif
 
 #ifdef TARGET_NR_writev
         case TARGET_NR_writev:
-            /* TODO: 处理 iovec 结构体数组 */
-            // 类似readv的复杂处理逻辑
+            /* 捕获 iovec 结构体数组（简化处理） */
+            if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
+                size_t iov_size = sizeof(struct iovec) * args[2];
+                record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
+                record->arg_size[1] = iov_size;
+                
+                /* 🔥 添加 aux_data for fuzzing */
+                rr_promote_arg_to_aux(record, 1, NULL, 0);
+                /* TODO: 完整实现需要遍历每个 iovec 捕获实际数据缓冲区 */
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_preadv
+        case TARGET_NR_preadv:
+            /* preadv = readv + offset */
+            if (ret > 0 && args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
+                size_t iov_size = sizeof(struct iovec) * args[2];
+                record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
+                record->arg_size[1] = iov_size;
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_pwritev
+        case TARGET_NR_pwritev:
+            /* pwritev = writev + offset */
+            if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
+                size_t iov_size = sizeof(struct iovec) * args[2];
+                record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
+                record->arg_size[1] = iov_size;
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_flock
+        case TARGET_NR_flock:
+            /* flock 参数简单（fd, operation），不需要捕获额外数据 */
             break;
 #endif
 
@@ -760,10 +875,16 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 record->arg_size[1] = args[2];
+                
+                /* 🔥 关键修复：同时创建 aux_data for fuzzing */
+                rr_promote_arg_to_aux(record, 1, NULL, 0);
             }
             if (args[4] != 0 && args[5] > 0 && args[5] <= RR_MAX_SOCKADDR_SIZE) {
                 record->arg_data[4] = rr_capture_buffer(env, args[4], args[5]);
                 record->arg_size[4] = args[5];
+                
+                /* 目标地址也可以 fuzz（可选） */
+                rr_promote_arg_to_aux(record, 4, NULL, 0);
             }
             break;
 #endif
@@ -774,6 +895,9 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             if (ret > 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], ret);
                 record->arg_size[1] = ret;
+                
+                /* 接收数据也可以用于 fuzzing（用于回放时的比对/变异） */
+                rr_promote_arg_to_aux(record, 1, NULL, 0);
             }
             if (args[4] != 0 && args[5] != 0) {
                 // 捕获源地址和地址长度
@@ -786,6 +910,112 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                         record->arg_size[5] = sizeof(uint32_t);
                     }
                 }
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_bind
+        case TARGET_NR_bind:
+            /* 捕获 sockaddr 结构体 */
+            if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_SOCKADDR_SIZE) {
+                record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
+                record->arg_size[1] = args[2];
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_listen
+        case TARGET_NR_listen:
+            /* listen 参数简单（fd, backlog），不需要捕获额外数据 */
+            break;
+#endif
+
+#ifdef TARGET_NR_getsockname
+        case TARGET_NR_getsockname:
+            /* 捕获本地地址（输出参数） */
+            if (ret == 0 && args[1] != 0 && args[2] != 0) {
+                uint32_t addr_len;
+                if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
+                    if (addr_len > 0 && addr_len <= RR_MAX_SOCKADDR_SIZE) {
+                        record->arg_data[1] = rr_capture_buffer(env, args[1], addr_len);
+                        record->arg_size[1] = addr_len;
+                        record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(uint32_t));
+                        record->arg_size[2] = sizeof(uint32_t);
+                    }
+                }
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_getpeername
+        case TARGET_NR_getpeername:
+            /* 捕获对端地址（输出参数） */
+            if (ret == 0 && args[1] != 0 && args[2] != 0) {
+                uint32_t addr_len;
+                if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
+                    if (addr_len > 0 && addr_len <= RR_MAX_SOCKADDR_SIZE) {
+                        record->arg_data[1] = rr_capture_buffer(env, args[1], addr_len);
+                        record->arg_size[1] = addr_len;
+                        record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(uint32_t));
+                        record->arg_size[2] = sizeof(uint32_t);
+                    }
+                }
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_setsockopt
+        case TARGET_NR_setsockopt:
+            /* 捕获 socket 选项数据（输入参数） */
+            if (args[3] != 0 && args[4] > 0 && args[4] <= RR_MAX_IOCTL_PAYLOAD) {
+                record->arg_data[3] = rr_capture_buffer(env, args[3], args[4]);
+                record->arg_size[3] = args[4];
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_getsockopt
+        case TARGET_NR_getsockopt:
+            /* 捕获 socket 选项数据（输出参数） */
+            if (ret == 0 && args[3] != 0 && args[4] != 0) {
+                uint32_t opt_len;
+                if (cpu_memory_rw_debug(env_cpu(env), args[4], (uint8_t*)&opt_len, sizeof(uint32_t), 0) == 0) {
+                    if (opt_len > 0 && opt_len <= RR_MAX_IOCTL_PAYLOAD) {
+                        record->arg_data[3] = rr_capture_buffer(env, args[3], opt_len);
+                        record->arg_size[3] = opt_len;
+                        record->arg_data[4] = rr_capture_buffer(env, args[4], sizeof(uint32_t));
+                        record->arg_size[4] = sizeof(uint32_t);
+                    }
+                }
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_recvmsg
+        case TARGET_NR_recvmsg:
+            /* recvmsg 使用 msghdr 结构，包含 iovec、控制消息等 */
+            if (ret > 0 && args[1] != 0) {
+                /* 捕获整个 msghdr 结构（简化处理） */
+                record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct msghdr));
+                record->arg_size[1] = sizeof(struct msghdr);
+                
+                /* 🔥 添加 aux_data for fuzzing */
+                rr_promote_arg_to_aux(record, 1, NULL, 0);
+                /* TODO: 完整实现需要递归捕获 iovec 和 control message */
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_sendmsg
+        case TARGET_NR_sendmsg:
+            /* sendmsg 同样使用 msghdr 结构 */
+            if (args[1] != 0) {
+                record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct msghdr));
+                record->arg_size[1] = sizeof(struct msghdr);
+                
+                /* 🔥 添加 aux_data for fuzzing */
+                rr_promote_arg_to_aux(record, 1, NULL, 0);
+                /* TODO: 完整实现需要递归捕获 iovec */
             }
             break;
 #endif
@@ -936,6 +1166,132 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
+#ifdef TARGET_NR_pselect6
+        case TARGET_NR_pselect6:
+            /* pselect6 类似 select，但使用 timespec 而不是 timeval */
+            if (args[1] != 0) {
+                record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(fd_set));
+                record->arg_size[1] = sizeof(fd_set);
+            }
+            if (args[2] != 0) {
+                record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(fd_set));
+                record->arg_size[2] = sizeof(fd_set);
+            }
+            if (args[3] != 0) {
+                record->arg_data[3] = rr_capture_buffer(env, args[3], sizeof(fd_set));
+                record->arg_size[3] = sizeof(fd_set);
+            }
+            if (args[4] != 0) {
+                record->arg_data[4] = rr_capture_buffer(env, args[4], sizeof(struct timespec));
+                record->arg_size[4] = sizeof(struct timespec);
+            }
+            if (args[5] != 0) {
+                /* sigmask */
+                record->arg_data[5] = rr_capture_buffer(env, args[5], 8); // sizeof(sigset_t)
+                record->arg_size[5] = 8;
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_nanosleep
+        case TARGET_NR_nanosleep:
+            /* 捕获 timespec 结构体（输入和输出） */
+            if (args[0] != 0) {
+                record->arg_data[0] = rr_capture_buffer(env, args[0], sizeof(struct timespec));
+                record->arg_size[0] = sizeof(struct timespec);
+            }
+            if (ret == 0 && args[1] != 0) {
+                /* 剩余时间（可选，仅在被中断时） */
+                record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct timespec));
+                record->arg_size[1] = sizeof(struct timespec);
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_clock_nanosleep
+        case TARGET_NR_clock_nanosleep:
+            /* clock_nanosleep 类似 nanosleep 但有时钟 ID */
+            if (args[2] != 0) {
+                record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct timespec));
+                record->arg_size[2] = sizeof(struct timespec);
+            }
+            if (ret == 0 && args[3] != 0) {
+                record->arg_data[3] = rr_capture_buffer(env, args[3], sizeof(struct timespec));
+                record->arg_size[3] = sizeof(struct timespec);
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_timer_create
+        case TARGET_NR_timer_create:
+            /* timer_create 返回 timer_t (timer ID) */
+            if (ret == 0 && args[2] != 0) {
+                record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(int)); // timer_t is int
+                record->arg_size[2] = sizeof(int);
+            }
+            if (args[1] != 0) {
+                /* sigevent structure */
+                record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct sigevent));
+                record->arg_size[1] = sizeof(struct sigevent);
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_timer_settime
+        case TARGET_NR_timer_settime:
+            /* 设置定时器 */
+            if (args[2] != 0) {
+                record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct itimerspec));
+                record->arg_size[2] = sizeof(struct itimerspec);
+            }
+            if (ret == 0 && args[3] != 0) {
+                /* 旧值（可选） */
+                record->arg_data[3] = rr_capture_buffer(env, args[3], sizeof(struct itimerspec));
+                record->arg_size[3] = sizeof(struct itimerspec);
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_timerfd_create
+        case TARGET_NR_timerfd_create:
+            /* timerfd_create 参数简单，返回 fd */
+            break;
+#endif
+
+#ifdef TARGET_NR_timerfd_settime
+        case TARGET_NR_timerfd_settime:
+            /* 设置 timerfd */
+            if (args[2] != 0) {
+                record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct itimerspec));
+                record->arg_size[2] = sizeof(struct itimerspec);
+            }
+            if (ret == 0 && args[3] != 0) {
+                record->arg_data[3] = rr_capture_buffer(env, args[3], sizeof(struct itimerspec));
+                record->arg_size[3] = sizeof(struct itimerspec);
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_signalfd
+        case TARGET_NR_signalfd:
+            /* 捕获信号掩码 */
+            if (args[1] != 0) {
+                record->arg_data[1] = rr_capture_buffer(env, args[1], 8); // sizeof(sigset_t)
+                record->arg_size[1] = 8;
+            }
+            break;
+#endif
+
+#ifdef TARGET_NR_signalfd4
+        case TARGET_NR_signalfd4:
+            /* signalfd4 = signalfd + flags */
+            if (args[1] != 0) {
+                record->arg_data[1] = rr_capture_buffer(env, args[1], 8); // sizeof(sigset_t)
+                record->arg_size[1] = 8;
+            }
+            break;
+#endif
+
         // 可以继续添加更多系统调用的特殊处理
         default:
             // 对于未特殊处理的系统调用，不捕获参数数据
@@ -1069,8 +1425,14 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     if (record->has_aux_data && record->aux_data) {
         /* 写入 aux_data 标记 */
         uint32_t aux_magic = 0x41555844; // "AUXD"
-        RR_VERBOSE("RECORD_SYSCALL: Writing AUXD magic 0x%08x", aux_magic);
-        fwrite(&aux_magic, sizeof(uint32_t), 1, g_trace_file);
+        long pos_before = ftell(g_trace_file);
+        RR_VERBOSE("RECORD_SYSCALL: Writing AUXD magic 0x%08x at pos %ld", aux_magic, pos_before);
+        size_t written = fwrite(&aux_magic, sizeof(uint32_t), 1, g_trace_file);
+        if (written != 1) {
+            RR_ERROR("RECORD_SYSCALL: Failed to write AUXD magic!");
+        }
+        long pos_after = ftell(g_trace_file);
+        RR_VERBOSE("RECORD_SYSCALL: After writing AUXD, pos=%ld (delta=%ld)", pos_after, pos_after - pos_before);
         
         /* 统计 aux_data 数量 */
         uint32_t aux_count = 0;
@@ -1101,12 +1463,12 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         fwrite(&no_aux, sizeof(uint32_t), 1, g_trace_file);
     }
 
-    /* 🔥 优化：减少同步 I/O，仅在批量写入时 flush */
-    if (g_rr_framework->trace_length % 50 == 0) {
-        fflush(g_trace_file);
-        RR_VERBOSE("RECORD_SYSCALL: Flushed at record %u", g_rr_framework->trace_length);
+    /* 🔥 重要：每次写完 record 后立即 flush，确保数据完整性 */
+    fflush(g_trace_file);
+    
+    if (num == 44) {
+        RR_INFO("🎯 RECORDED SENDTO: index=%u, has_aux=%d", record->index, record->has_aux_data);
     }
-
     RR_VERBOSE("RECORD_SYSCALL: Successfully recorded syscall %d (index=%u, args=%d, aux=%s, total_syscalls=%u)",
                num, record->index, arg_count, record->has_aux_data ? "yes" : "no", g_rr_framework->trace_length);
     RR_LOG("Recorded syscall %d: %s -> %ld", record->index,
@@ -1115,10 +1477,13 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     /* 优化：每100个记录更新一次头部，减少 fseek 开销 */
     if (g_rr_framework->trace_length % 100 == 0) {
         long header_pos = ftell(g_trace_file);
+        RR_VERBOSE("RECORD_SYSCALL: Before header update - ftell=%ld", header_pos);
         fseek(g_trace_file, sizeof(uint32_t) * 2, SEEK_SET);  // 跳过magic和version
         uint32_t record_count = g_rr_framework->trace_length;
         fwrite(&record_count, sizeof(record_count), 1, g_trace_file);
         fseek(g_trace_file, header_pos, SEEK_SET);  // 恢复位置
+        long after_seek = ftell(g_trace_file);
+        RR_VERBOSE("RECORD_SYSCALL: After header update - ftell=%ld (should be %ld)", after_seek, header_pos);
         fflush(g_trace_file);
         RR_VERBOSE("RECORD_SYSCALL: Updated header with record_count=%u", record_count);
     }

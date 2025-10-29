@@ -153,6 +153,21 @@ bool rr_aux_should_record(uint32_t size, int fd, int syscall_nr)
                 /* Always record random data for determinism */
                 return true;
             
+#ifdef TARGET_NR_sendto
+            case TARGET_NR_sendto:
+#endif
+#ifdef TARGET_NR_recvfrom
+            case TARGET_NR_recvfrom:
+#endif
+#ifdef TARGET_NR_sendmsg
+            case TARGET_NR_sendmsg:
+#endif
+#ifdef TARGET_NR_recvmsg
+            case TARGET_NR_recvmsg:
+#endif
+                /* Record network I/O operations */
+                return true;
+            
             default:
                 /* For other syscalls, be conservative */
                 return size <= 16 * 1024; /* 16KB threshold */

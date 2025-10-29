@@ -250,6 +250,7 @@ void rr_stop_recording(void);
 /* Replay模块 - Hybrid 模式（传统二进制 trace） */
 abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args);
 int rr_start_replay(const char *trace_file);
+void rr_reset_trace_position(void);  // 重置 trace 文件指针（用于 fork server）
 void rr_stop_replay(void);
 
 /* Replay状态标记 - 用于协调 replay 和 post_hook */
