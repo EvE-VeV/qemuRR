@@ -9,9 +9,9 @@
  * 3. 支持多种变异策略，覆盖不同的测试场景
  */
 
-#include "../core/rr_framework.h"
-#include "../record/rr_aux_data.h"
-#include "../utils/rr_syscall_dispatch.h"
+#include "../../core/rr_framework.h"
+#include "../../record/rr_aux_data.h"
+#include "../../utils/rr_syscall_dispatch.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -19,8 +19,6 @@
 /* ==================== 外部变量 ==================== */
 
 // Fuzz 指令（来自 rr_fuzz_engine.c）
-extern FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
-extern size_t g_instruction_count;
 
 // Fuzz 统计（来自 rr_fuzz_engine.c）
 typedef struct {
@@ -127,7 +125,7 @@ static void truncate_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
         return;
     }
     
-    uint32_t old_size = aux->size;
+    __attribute__((unused)) uint32_t old_size = aux->size;
     
     // 从 instr->data[0] 读取截断比例（如果没有，默认减半）
     if (instr->data_len > 0 && instr->data[0] > 0 && instr->data[0] < 100) {
@@ -157,7 +155,7 @@ static void extend_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
         return;
     }
     
-    uint32_t old_size = aux->size;
+    __attribute__((unused)) uint32_t old_size = aux->size;
     uint32_t new_size;
     
     // 从 instr->data[0] 读取扩展倍数（默认 2 倍）

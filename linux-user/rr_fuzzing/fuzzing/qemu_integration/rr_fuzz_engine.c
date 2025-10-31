@@ -8,8 +8,8 @@
  * 3. 支持多种变异策略（参数变异、缓冲区替换、边界值测试等）
  */
 
-#include "../core/rr_framework.h"
-#include "../utils/rr_syscall_dispatch.h"
+#include "../../core/rr_framework.h"
+#include "../../utils/rr_syscall_dispatch.h"
 
 /* ==================== 全局状态 ==================== */
 
@@ -131,9 +131,12 @@ int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count
  * @param syscall_index 系统调用在trace中的索引
  * @param args 系统调用参数数组（会被修改）
  * @param syscall_nr 系统调用号
+ * @return int >0表示应用了buffer mutation, 0表示无buffer mutation, <0表示错误
  */
-static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
+static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
+    int has_buffer_mutation = 0;  // 标记是否应用了buffer mutation
+    
     fprintf(stderr, "[APPLY] START: syscall_index=%u, nr=%d, g_instruction_count=%zu\n", 
             syscall_index, syscall_nr, g_instruction_count);
     fflush(stderr);
@@ -141,7 +144,7 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
     if (g_instruction_count == 0) {
         fprintf(stderr, "[APPLY] ERROR: g_instruction_count is 0!\n");
         fflush(stderr);
-        return;  // 没有变异指令
+        return 0;  // 没有变异指令
     }
 
     // 获取系统调用的类型和重要性（用于智能变异）
@@ -170,11 +173,20 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
         fflush(stderr);
 
         // 检查参数索引有效性
+        fprintf(stderr, "[APPLY] Checking arg_index: %u (must be < 8)\n", instr->arg_index);
+        fflush(stderr);
+        
         if (instr->arg_index >= 8) {
+            fprintf(stderr, "[APPLY] ERROR: Invalid arg_index %u for syscall %s\n",
+                    instr->arg_index, syscall_name ? syscall_name : "unknown");
+            fflush(stderr);
             RR_WARN("Invalid arg_index %u for syscall %s", 
                     instr->arg_index, syscall_name ? syscall_name : "unknown");
             continue;
         }
+        
+        fprintf(stderr, "[APPLY] arg_index check passed, entering switch(cmd=%d)\n", instr->cmd);
+        fflush(stderr);
 
         RR_VERBOSE("Applying mutation [%zu/%zu] to %s arg[%u]: cmd=%d",
                    i + 1, g_instruction_count, 
@@ -185,12 +197,13 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
             case FUZZ_CMD_MUTATE_ARG:
                 /* 变异参数值 - 适用于整数参数 */
                 if (instr->data_len >= sizeof(abi_long)) {
+                    __attribute__((unused)) abi_long old_value = args[instr->arg_index];  // 🔥 P0修复：先保存旧值
                     abi_long new_value = *(abi_long *)instr->data;
-                    args[instr->arg_index] = new_value;
+                    args[instr->arg_index] = new_value;  // 然后修改
                     
                     RR_INFO("🔧 MUTATE_ARG: %s[%u] %ld → %ld (syscall_idx=%u)",
                            syscall_name ? syscall_name : "unknown",
-                           instr->arg_index, args[instr->arg_index], new_value, syscall_index);
+                           instr->arg_index, old_value, new_value, syscall_index);
                     
                     g_fuzz_stats.arg_mutations++;
                 }
@@ -208,6 +221,7 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
                         /* 🔥 修复：真正写入 guest 内存 */
                         if (cpu_memory_rw_debug(env_cpu(env), addr, instr->data, instr->data_len, 1) == 0) {
                             g_fuzz_stats.buffer_mutations++;
+                            has_buffer_mutation = 1;  // 🔥 标记为buffer mutation
                             RR_VERBOSE("REPLACE_BUFFER: Successfully wrote %u bytes to guest addr 0x%lx",
                                       instr->data_len, addr);
                         } else {
@@ -220,12 +234,13 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
             case FUZZ_CMD_MUTATE_FLAGS:
                 /* 变异标志位 - 对flags参数进行位操作 */
                 if (instr->data_len >= sizeof(abi_long)) {
+                    __attribute__((unused)) abi_long old_value = args[instr->arg_index];  // 🔥 P0修复：先保存旧值
                     abi_long xor_mask = *(abi_long *)instr->data;
-                    args[instr->arg_index] ^= xor_mask;
+                    args[instr->arg_index] ^= xor_mask;  // 然后修改
                     
                     RR_INFO("🔧 MUTATE_FLAGS: %s[%u] 0x%lx → 0x%lx (XOR 0x%lx)",
                            syscall_name ? syscall_name : "unknown",
-                           instr->arg_index, args[instr->arg_index], args[instr->arg_index], xor_mask);
+                           instr->arg_index, old_value, args[instr->arg_index], xor_mask);
                     
                     g_fuzz_stats.arg_mutations++;
                 }
@@ -234,7 +249,7 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
             case FUZZ_CMD_BOUNDARY_VALUE:
                 /* 边界值测试 - 使用特殊值（0, -1, MAX等） */
                 if (instr->data_len >= sizeof(abi_long)) {
-                    abi_long old_value = args[instr->arg_index];
+                    __attribute__((unused)) abi_long old_value = args[instr->arg_index];
                     abi_long boundary = *(abi_long *)instr->data;
                     args[instr->arg_index] = boundary;
                     
@@ -246,6 +261,139 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
                 }
                 break;
 
+            case FUZZ_CMD_FLIP_BITS:
+                /* 🔥 P0新增：AFL风格位翻转 - 翻转指定的bits */
+                {
+                    target_ulong addr = args[instr->arg_index];
+                    if (addr != 0 && instr->data_len > 0) {
+                        /* instr->data 包含：[offset(4字节)][bit_mask(剩余)] */
+                        if (instr->data_len >= 4) {
+                            uint32_t offset = *(uint32_t *)instr->data;
+                            uint32_t mask_len = instr->data_len - 4;
+                            uint8_t *bit_mask = instr->data + 4;
+                            
+                            /* 读取guest内存 */
+                            uint8_t *buffer = g_malloc(mask_len);
+                            if (cpu_memory_rw_debug(env_cpu(env), addr + offset, buffer, mask_len, 0) == 0) {
+                                /* 应用位翻转 */
+                                for (uint32_t j = 0; j < mask_len; j++) {
+                                    buffer[j] ^= bit_mask[j];
+                                }
+                                
+                                /* 写回guest内存 */
+                                if (cpu_memory_rw_debug(env_cpu(env), addr + offset, buffer, mask_len, 1) == 0) {
+                                    RR_INFO("🔧 FLIP_BITS: %s[%u] addr=0x%lx+%u, flipped %u bytes",
+                                           syscall_name ? syscall_name : "unknown",
+                                           instr->arg_index, addr, offset, mask_len);
+                                    has_buffer_mutation = 1;  // 标记为buffer mutation
+                                    g_fuzz_stats.buffer_mutations++;
+                                } else {
+                                    RR_WARN("FLIP_BITS: Failed to write back to guest memory");
+                                }
+                            } else {
+                                RR_WARN("FLIP_BITS: Failed to read from guest memory at 0x%lx", addr + offset);
+                            }
+                            g_free(buffer);
+                        }
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_INTERESTING_VALUES:
+                /* 🔥 P0新增：特殊值/魔数注入 */
+                {
+                    target_ulong addr = args[instr->arg_index];
+                    if (addr != 0 && instr->data_len > 0) {
+                        /* instr->data 包含：[offset(4字节)][interesting_value(剩余)] */
+                        if (instr->data_len >= 4) {
+                            uint32_t offset = *(uint32_t *)instr->data;
+                            uint32_t value_len = instr->data_len - 4;
+                            uint8_t *value = instr->data + 4;
+                            
+                            /* 直接写入特殊值到guest内存 */
+                            if (cpu_memory_rw_debug(env_cpu(env), addr + offset, value, value_len, 1) == 0) {
+                                RR_INFO("🔧 INTERESTING_VALUES: %s[%u] addr=0x%lx+%u, injected %u bytes",
+                                       syscall_name ? syscall_name : "unknown",
+                                       instr->arg_index, addr, offset, value_len);
+                                has_buffer_mutation = 1;  // 标记为buffer mutation
+                                g_fuzz_stats.buffer_mutations++;
+                            } else {
+                                RR_WARN("INTERESTING_VALUES: Failed to write to guest memory at 0x%lx", addr + offset);
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_OVERWRITE_AT_OFFSET:
+                /* ━━━━ Phase 2: 精确偏移覆写 ━━━━ */
+                /* 
+                 * 用于实现配方驱动的变异
+                 * 从PathFinder生成的配方中获取精确的offset和size
+                 * 在指定位置覆写数据
+                 */
+                {
+                    fprintf(stderr, "[OVERWRITE] Entered FUZZ_CMD_OVERWRITE_AT_OFFSET branch\n");
+                    fflush(stderr);
+                    
+                    target_ulong addr = args[instr->arg_index];
+                    fprintf(stderr, "[OVERWRITE] addr=0x%lx (from args[%u])\n", addr, instr->arg_index);
+                    fflush(stderr);
+                    
+                    if (addr == 0) {
+                        fprintf(stderr, "[OVERWRITE] ERROR: NULL address for arg[%u]\n", instr->arg_index);
+                        fflush(stderr);
+                        RR_WARN("OVERWRITE_AT_OFFSET: NULL address for arg[%u]", instr->arg_index);
+                        break;
+                    }
+                    
+                    /* 验证offset和size的有效性 */
+                    if (instr->size == 0 || instr->size > instr->data_len) {
+                        RR_WARN("OVERWRITE_AT_OFFSET: Invalid size %u (data_len=%u)", 
+                               instr->size, instr->data_len);
+                        break;
+                    }
+                    
+                    /* 计算目标地址 */
+                    target_ulong target_addr = addr + instr->offset;
+                    
+                    /* 安全检查：防止溢出 */
+                    if (target_addr < addr) {
+                        RR_ERROR("OVERWRITE_AT_OFFSET: Address overflow detected (addr=0x%lx, offset=%u)",
+                                addr, instr->offset);
+                        break;
+                    }
+                    
+                    /* 执行精确覆写 */
+                    fprintf(stderr, "[OVERWRITE] Attempting to write %u bytes to 0x%lx\n", instr->size, target_addr);
+                    fprintf(stderr, "[OVERWRITE] Data (first 20 bytes): ");
+                    for (int k = 0; k < (instr->size < 20 ? instr->size : 20); k++) {
+                        fprintf(stderr, "%02x ", instr->data[k]);
+                    }
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "[OVERWRITE] Data (ASCII): %.*s\n", instr->size < 30 ? instr->size : 30, instr->data);
+                    fflush(stderr);
+                    
+                    if (cpu_memory_rw_debug(env_cpu(env), target_addr, 
+                                           instr->data, instr->size, 1) == 0) {
+                        fprintf(stderr, "[OVERWRITE] ✅ Successfully wrote %u bytes\n", instr->size);
+                        fflush(stderr);
+                        
+                        RR_INFO("🎯 OVERWRITE_AT_OFFSET: %s[%u] addr=0x%lx+%u, wrote %u bytes",
+                               syscall_name ? syscall_name : "unknown",
+                               instr->arg_index, addr, instr->offset, instr->size);
+                        
+                        has_buffer_mutation = 1;  // 标记为buffer mutation
+                        g_fuzz_stats.buffer_mutations++;
+                    } else {
+                        fprintf(stderr, "[OVERWRITE] ❌ Failed to write!\n");
+                        fflush(stderr);
+                        RR_ERROR("OVERWRITE_AT_OFFSET: Failed to write %u bytes to guest memory at 0x%lx",
+                                instr->size, target_addr);
+                    }
+                }
+                break;
+
             default:
                 RR_WARN("Unknown fuzz command: %d", instr->cmd);
                 break;
@@ -253,13 +401,16 @@ static void apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_inde
 
         g_fuzz_stats.total_mutations++;
     }
+    
+    return has_buffer_mutation;  // 返回是否应用了buffer mutation
 }
 
 /**
  * 在重放系统调用时应用变异
  * 这个函数被rr_replay_syscall调用
+ * @return int >0表示应用了buffer mutation, 0表示无buffer mutation, <0表示错误
  */
-void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
+int rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr)
 {
     // 🔥 直接写stderr，绕过日志系统
     fprintf(stderr, "[DEBUG] rr_fuzz_mutate_syscall CALLED: syscall_index=%u, nr=%d\n", syscall_index, syscall_nr);
@@ -268,7 +419,7 @@ void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long 
     if (!g_rr_framework) {
         fprintf(stderr, "[ERROR] g_rr_framework is NULL!\n");
         fflush(stderr);
-        return;
+        return 0;
     }
     
     fprintf(stderr, "[DEBUG] g_rr_framework OK, mode=%d, g_instruction_count=%zu\n", 
@@ -279,14 +430,16 @@ void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long 
         fprintf(stderr, "[WARN] Not in fuzzing mode (mode=%d != %d)\n", 
                 g_rr_framework->mode, RR_MODE_FUZZING);
         fflush(stderr);
-        return;
+        return 0;
     }
 
     fprintf(stderr, "[DEBUG] Calling apply_mutations_for_syscall...\n");
     fflush(stderr);
-    apply_mutations_for_syscall(env, syscall_index, args, syscall_nr);
-    fprintf(stderr, "[DEBUG] apply_mutations_for_syscall DONE\n");
+    int result = apply_mutations_for_syscall(env, syscall_index, args, syscall_nr);
+    fprintf(stderr, "[DEBUG] apply_mutations_for_syscall DONE, result=%d\n", result);
     fflush(stderr);
+    
+    return result;  // 返回是否应用了buffer mutation
 }
 
 /**

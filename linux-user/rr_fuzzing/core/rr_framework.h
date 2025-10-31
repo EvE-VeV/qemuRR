@@ -59,16 +59,23 @@ typedef enum {
     FUZZ_CMD_TRUNCATE = 7,          // 截断数据（减少大小）
     FUZZ_CMD_EXTEND = 8,            // 扩展数据（增加大小）
     FUZZ_CMD_INTERESTING_VALUES = 9,// 特殊值注入（边界值、魔数等）
-    FUZZ_CMD_LIGHT_MUTATION = 10    // 轻量级变异（只翻转 1-2 bits，最小破坏性）
+    FUZZ_CMD_LIGHT_MUTATION = 10,   // 轻量级变异（只翻转 1-2 bits，最小破坏性）
+    
+    /* ━━━━ Phase 2: 精确内存覆写命令 ━━━━ */
+    FUZZ_CMD_OVERWRITE_AT_OFFSET = 11 // 在指定偏移处精确覆写数据
 } fuzz_cmd_type_t;
 
 /**
  * Fuzzing指令结构 (固定大小版本，适合共享内存)
+ * 
+ * Phase 2 增强：添加offset和size字段，支持精确的内存覆写
  */
 typedef struct {
     fuzz_cmd_type_t cmd;                // 命令类型
     uint32_t syscall_index;             // 目标系统调用索引
     uint32_t arg_index;                 // 目标参数索引
+    uint32_t offset;                    // 新增：在缓冲区/数据中的偏移
+    uint32_t size;                      // 新增：变异数据的大小（字节）
     uint32_t data_len;                  // 数据长度
     uint8_t data[256];                  // 固定大小数据数组
 } FuzzInstruction;
@@ -82,10 +89,13 @@ typedef struct {
     uint32_t sequence;                  // 序列号（每次写入递增，用于检测更新）
     uint32_t instruction_count;         // 指令数量
     uint32_t checksum;                  // 简单校验和（magic ^ sequence ^ instruction_count）
-    uint32_t flags;                     // 控制标志（预留）
+    uint32_t flags;                     // 控制标志（Phase 3: bit 0 = capture_seed）
     uint32_t reserved[3];               // 保留字段
     FuzzInstruction instructions[32];   // 指令数组（最多32条）
 } FuzzSharedMemory;
+
+/* Phase 3: FuzzSharedMemory flags位定义 */
+#define FUZZ_FLAG_CAPTURE_SEED  (1 << 0)  // 请求捕获新种子
 
 #define FUZZ_MAGIC 0x46555A5A
 #define FUZZ_MAX_INSTRUCTIONS 32
@@ -253,6 +263,9 @@ int rr_start_replay(const char *trace_file);
 void rr_reset_trace_position(void);  // 重置 trace 文件指针（用于 fork server）
 void rr_stop_replay(void);
 
+/* Replay状态变量 - 供fork_server访问 */
+extern syscall_record_t *g_current_record;  // 当前正在replay的record
+
 /* Replay状态标记 - 用于协调 replay 和 post_hook */
 extern __thread bool g_syscall_already_consumed;
 extern __thread syscall_record_t *g_pending_post_record;
@@ -276,14 +289,22 @@ int rr_ipc_receive_command(void);
 
 /* Fuzz Engine模块 */
 int rr_fuzz_apply_instructions(const FuzzInstruction *instructions, size_t count);
-void rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr);
+int rr_fuzz_mutate_syscall(CPUArchState *env, uint32_t syscall_index, abi_long *args, int syscall_nr);
 int rr_fuzz_load_from_shared_memory(void *shm_ptr);
 void rr_fuzz_get_stats(uint64_t *total, uint64_t *arg_mut, uint64_t *buf_mut, uint64_t *boundary);
 void rr_fuzz_print_stats(void);
+
+/* Fuzz Engine内部状态 - 供replay模块查询mutation状态 */
+extern FuzzInstruction g_fuzz_instructions[];
+extern size_t g_instruction_count;
 FuzzInstruction *rr_fuzz_generate_mutations(uint32_t target_syscall, int target_arg,
                                           const uint8_t *seed_data, size_t seed_len,
                                           size_t *out_count);
 void rr_fuzz_cleanup(void);
+
+/* BB Trace模块 (已在rr_bb_trace.h中声明，这里不重复) */
+
+/* Coverage模块 (Phase 3 - 已在rr_coverage.h中声明，这里不重复) */
 
 /* ━━━━ Phase 1: Pure Replay + Fuzzing 集成 ━━━━ */
 /**

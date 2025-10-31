@@ -57,8 +57,9 @@ static char g_stats_filename[256] = {0};
 #define STATS_PRINT_INTERVAL 10
 static size_t g_last_stats_print = 0;
 
-/* 当前正在处理的记录 */
-static rr_strace_record_t *g_current_record = NULL;
+/* 当前正在处理的记录 (strace专用，区别于binary replay的g_current_record) */
+__attribute__((unused)) static rr_strace_record_t *g_current_strace_record = NULL;
+static rr_strace_record_t *g_current_record_strace = NULL;  /* 供 post_hook 使用 */
 
 /* 信号处理器标志 */
 static volatile sig_atomic_t g_signal_received = 0;
@@ -353,7 +354,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
  * 导致插入额外的系统调用（openat /proc/sys/kernel/osrelease等），
  * 从而破坏trace的对齐。应该直接返回成功(0)。
  */
-static abi_long rr_handle_deterministic_uname(CPUArchState *env, abi_long buf_addr) {
+__attribute__((unused)) static abi_long rr_handle_deterministic_uname(CPUArchState *env, abi_long buf_addr) {
     g_strace_state.matched_syscalls++;
     STRACE_INFO("Deterministic uname: directly returning success to avoid fallback syscalls");
     
@@ -628,10 +629,9 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     }
     
     // 保存当前记录供POST-HOOK使用
-    g_current_record = record;
+    g_current_record_strace = record;
     
     /* 🔥 修复：设置标记，告诉 post_hook 这条记录已经被处理 */
-    extern __thread bool g_syscall_already_consumed;
     g_syscall_already_consumed = true;
     
     STRACE_VERBOSE("Hybrid replay+fuzz mode: executing real syscall with modified args");
@@ -639,7 +639,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
 }
 
 void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long ret, abi_long *args) {
-    if (!g_strace_state.enabled || !g_current_record) {
+    if (!g_strace_state.enabled || !g_current_record_strace) {
         return;
     }
     
@@ -648,7 +648,7 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
              syscall_name ? syscall_name : "unknown", ret);
     
     // 使用优化的POST处理
-    rr_syscall_post_hook_optimized(num, g_current_record, ret, args);
+    rr_syscall_post_hook_optimized(num, g_current_record_strace, ret, args);
     
     /* 动态跟踪：系统调用退出 */
     bool was_fuzzed = (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING);

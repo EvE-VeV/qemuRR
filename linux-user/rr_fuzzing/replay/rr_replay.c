@@ -21,7 +21,7 @@
 #include <stdint.h>
 
 static FILE *g_trace_file = NULL;
-static syscall_record_t *g_current_record = NULL;
+syscall_record_t *g_current_record = NULL;  // 非static，供fork_server访问
 
 /* 标记：当前系统调用是否已从 trace 读取并递增索引 */
 __thread bool g_syscall_already_consumed = false;
@@ -406,10 +406,22 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     RR_VERBOSE("REPLAY_SYSCALL: Found matching syscall %d at record index %u",
                num, g_current_record->index);
 
+    /* 检查是否应用了mutation */
+    int has_mutation = 0;
+    if (g_rr_framework->mode == RR_MODE_FUZZING) {
+        /* 预先检查是否有mutation（用于设置is_fuzzed标志） */
+        for (size_t i = 0; i < g_instruction_count; i++) {
+            if (g_fuzz_instructions[i].syscall_index == g_current_record->index) {
+                has_mutation = 1;
+                break;
+            }
+        }
+    }
+
     /* 动态跟踪：系统调用进入（二进制重放路径） */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     rr_dynamic_trace_syscall_enter(env, num, (uint64_t*)args, 
-                                     g_rr_framework->replay_index, 0);
+                                     g_rr_framework->replay_index, has_mutation);
 #endif
 
     abi_long ret = g_current_record->retval;
@@ -492,20 +504,45 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         /* 
          * 路径1：Pure Replay
          * 当有aux_data时，尝试纯重放（不执行真实syscall）
-         * TODO(P1): Fuzzing变异将在映射闭环完成后添加
+         * 🔥 P0修复：在Pure Replay之前先应用Fuzzing变异
          */
         RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
         
+        /* 
+         * 🔥 新策略：对于buffer mutation，先恢复aux_data再应用mutation
+         * 这样mutation可以覆盖已有的数据
+         */
+        
+        /* 步骤1：先恢复aux_data到buffer（如果有的话） */
         ret = rr_replay_syscall_pure(env, num, args, g_current_record);
         
-        if (ret != -1) {
-            /* Pure Replay 成功：直接返回 */
-            RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
-            goto replay_success;
+        if (ret == -1) {
+            /* Pure replay失败，使用hybrid模式 */
+            RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
+            goto try_hybrid;
         }
         
-        /* Pure 失败：回退到 Hybrid */
-        RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
+        /* 步骤2：在fuzzing模式下，应用mutation覆盖已恢复的数据 */
+        if (g_rr_framework->mode == RR_MODE_FUZZING) {
+            uint32_t syscall_index = g_current_record->index;
+            RR_INFO("🎯 FUZZING: Applying mutations AFTER aux_data restore for syscall %d at index %u", 
+                    num, syscall_index);
+            
+            /* 应用变异到args和已恢复的guest内存 */
+            int mutation_result = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+            
+            if (mutation_result > 0) {
+                RR_INFO("🎯 FUZZING: Buffer mutation applied, overwrote aux_data");
+            }
+        }
+        
+        /* Pure Replay成功：直接返回 */
+        RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
+        goto replay_success;
+        
+try_hybrid:
+        /* 继续原来的hybrid逻辑 */
+        {}
     }
 
     if ((num == TARGET_NR_clone
@@ -575,7 +612,7 @@ replay_success:
     /* 动态跟踪：系统调用退出（二进制重放路径） */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
-                                    g_rr_framework->replay_index - 1, 0);
+                                    g_rr_framework->replay_index - 1, has_mutation);
 #endif
 
     RR_VERBOSE("REPLAY_SYSCALL: Successfully replayed syscall %u: %d -> %d",

@@ -6,6 +6,7 @@
 #define RR_DEBUG 1
 
 #include "../core/rr_framework.h"
+#include "../core/rr_bb_trace.h"
 #include "rr_aux_data.h"
 #include "../core/rr_constants.h"
 #include <fcntl.h>
@@ -124,6 +125,13 @@ int rr_start_recording(const char *trace_file)
     fwrite(&version, sizeof(version), 1, g_trace_file);
     fwrite(&placeholder_count, sizeof(placeholder_count), 1, g_trace_file);
 
+    /* 初始化BB trace */
+    if (rr_bb_trace_init(trace_file) < 0) {
+        RR_WARN("Failed to initialize BB trace (continuing without BB trace)");
+    } else {
+        RR_INFO("BB trace initialized successfully");
+    }
+
     RR_INFO("Recording started successfully to: %s", trace_file);
     return 0;
 }
@@ -133,6 +141,9 @@ int rr_start_recording(const char *trace_file)
  */
 void rr_stop_recording(void)
 {
+    /* 清理BB trace */
+    rr_bb_trace_cleanup();
+    
     if (g_trace_file) {
         RR_VERBOSE("STOP_RECORDING: Finalizing trace file");
 
@@ -1326,6 +1337,9 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
 
     RR_VERBOSE("RECORD_SYSCALL: Recording index=%u, syscall=%d, ret=%ld",
             record->index, record->syscall_nr, record->retval);
+    
+    /* 更新BB trace的syscall索引 */
+    rr_bb_trace_update_syscall_idx(record->index);
 
     /* 检测FD创建 */
     record->creates_fd = syscall_creates_fd(num, ret);

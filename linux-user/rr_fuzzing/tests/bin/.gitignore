@@ -1,0 +1,4 @@
+# 忽略所有编译后的二进制文件
+*
+# 但保留 .gitignore 本身
+!.gitignore

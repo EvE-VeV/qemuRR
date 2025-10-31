@@ -68,6 +68,7 @@ static rr_debug_level_t parse_debug_level(const char *level_str)
 /**
  * 解析布尔值字符串
  */
+__attribute__((unused))
 static bool parse_bool(const char *str, bool default_val)
 {
     if (!str) {

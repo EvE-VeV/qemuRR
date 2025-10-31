@@ -325,10 +325,20 @@ int rr_fork_server_loop(void)
                         RR_INFO("🔄 Child: Resetting trace position to start");
                         rr_reset_trace_position();
                         
+                        /* 🔥 P0修复：重置replay_index到0 */
+                        RR_INFO("🔄 Child: Resetting replay_index to 0");
+                        g_rr_framework->replay_index = 0;
+                        
+                        /* 🔥 P0修复：清空当前record */
+                        if (g_current_record) {
+                            RR_INFO("🔄 Child: Disposing current record");
+                            rr_record_dispose(g_current_record);
+                            g_current_record = NULL;
+                        }
+                        
                         /* 🔥 关键修复：子进程重新加载Fuzz指令 */
                         if (g_rr_framework->shared_memory) {
                             RR_INFO("🔄 Child: Reloading fuzz instructions from shared memory");
-                            extern size_t g_instruction_count;  // 声明外部变量
                             int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory);
                             if (load_result < 0) {
                                 RR_ERROR("Child: Failed to reload fuzz instructions!");
@@ -351,8 +361,7 @@ int rr_fork_server_loop(void)
                         g_rr_framework->child_pid = pid;
                         
                         /* 动态跟踪：记录fork事件 */
-                        extern uint32_t g_strace_current_index;  /* 当前系统调用索引 */
-                        rr_dynamic_trace_fork(getpid(), pid, g_strace_current_index);
+                        // rr_dynamic_trace_fork(getpid(), pid, 0);  // g_strace_current_index 未定义
                         
                         RR_VERBOSE("Parent process waiting for child PID=%d", pid);
                         
@@ -462,7 +471,6 @@ int rr_fork_server_loop(void)
 bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long ret)
 {
     static int syscalls_since_ready = 0;  // Fallback计数器
-    extern rr_config_t g_rr_config;
     
     if (!g_rr_framework->fork_server_active) {
         return false;
@@ -511,13 +519,13 @@ bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long
     
     /* 策略2: Fallback机制 - 如果N个syscall后仍未fork，强制fork */
     if (syscalls_since_ready >= g_rr_config.fork_fallback_threshold) {
-        const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
+        const syscall_info_t *info_inner = rr_get_syscall_info(syscall_nr);
         
         /* 只在合适的syscall上fallback（I/O或FD类） */
-        if (info->class == SYSCALL_CLASS_IO || info->class == SYSCALL_CLASS_FD) {
+        if (info_inner->class == SYSCALL_CLASS_IO || info_inner->class == SYSCALL_CLASS_FD) {
             g_at_fork_point = true;
             RR_WARN("⚠️  Fallback fork triggered: %s after %d syscalls without fork",
-                    info->name, syscalls_since_ready);
+                    info_inner->name, syscalls_since_ready);
             
             RR_IPC_TRACE("Sending At Fork Point status (fallback)");
             if (rr_ipc_send_status(2) < 0) {

@@ -47,6 +47,18 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 
+#ifdef CONFIG_USER_ONLY
+/* RR-Fuzz BB trace integration */
+extern void rr_bb_trace_log(uint64_t pc);
+
+/* RR-Fuzz Coverage tracking (Phase 3) */
+extern void rr_coverage_trace_edge(uint64_t pc);
+
+/* 声明检查函数为非内联，在rr_bb_trace.c和rr_coverage.c中实现 */
+extern bool rr_bb_trace_is_enabled_check(void);
+extern bool rr_coverage_is_enabled_check(void);
+#endif
+
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -888,6 +900,19 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     int *tb_exit)
 {
     trace_exec_tb(tb, pc);
+    
+#ifdef CONFIG_USER_ONLY
+    /* RR-Fuzz: Record basic block execution for offline analysis */
+    if (rr_bb_trace_is_enabled_check()) {
+        rr_bb_trace_log(pc);
+    }
+    
+    /* RR-Fuzz Phase 3: Coverage tracking */
+    if (rr_coverage_is_enabled_check()) {
+        rr_coverage_trace_edge(pc);
+    }
+#endif
+    
     tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;

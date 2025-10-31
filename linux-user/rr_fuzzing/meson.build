@@ -7,6 +7,7 @@ rr_fuzz_sources = files(
   'core/rr_main.c',
   'core/rr_config.c',
   'core/rr_debug.c',
+  'core/rr_bb_trace.c',
   
   # Record - 录制模块
   'record/rr_record.c',
@@ -16,12 +17,12 @@ rr_fuzz_sources = files(
   'replay/rr_replay.c',              # 二进制 trace Hybrid 重放
   'replay/rr_replay_pure.c',         # 二进制 trace Pure 重放（EnvFuzz 风格）
   'replay/rr_replay_pure_reapply.c', # Phase 1: Pure Replay 重新应用
-  'replay/rr_replay_strace_optimized.c',  # Strace 文本重放
+  'replay/rr_replay_strace_optimized.c',  # Strace 文本重放 (暂时禁用，需要修复类型不匹配)
   
-  # Fuzzing - Fuzzing引擎
-  'fuzzing/rr_fuzz_engine.c',
-  'fuzzing/rr_fuzz_aux_mutations.c',  # Phase 1: aux_data 变异引擎
-  'fuzzing/rr_coverage.c',            # Phase 3: 覆盖率追踪
+  # Fuzzing - Fuzzing引擎（QEMU集成层）
+  'fuzzing/qemu_integration/rr_fuzz_engine.c',
+  'fuzzing/qemu_integration/rr_fuzz_aux_mutations.c',  # Phase 1: aux_data 变异引擎
+  'fuzzing/qemu_integration/rr_coverage.c',            # Phase 3: 覆盖率追踪（实现完成）
   
   # Utils - 工具模块
   'utils/rr_mapping_manager.c',
@@ -48,3 +49,4 @@ if rr_fuzzing.enabled()
 else
   message('RR-Fuzz support disabled')
 endif
+

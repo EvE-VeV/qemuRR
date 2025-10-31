@@ -12,6 +12,7 @@
 #include "../replay/rr_replay_strace.h"
 #include "../record/rr_aux_data.h"
 #include "../utils/rr_dynamic_trace.h"
+#include "../fuzzing/qemu_integration/rr_coverage.h"
 #include "rr_constants.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
@@ -266,6 +267,16 @@ int rr_framework_init(void)
     }
     RR_INFO("IPC subsystem initialized");
     
+    /* 初始化Coverage模块 (始终初始化，用于所有模式) */
+    RR_VERBOSE("Attempting to initialize coverage tracking...");
+    int cov_ret = rr_coverage_init(NULL);
+    RR_VERBOSE("rr_coverage_init() returned: %d", cov_ret);
+    if (cov_ret < 0) {
+        RR_WARN("Failed to initialize coverage tracking (non-fatal), return=%d", cov_ret);
+    } else {
+        RR_INFO("Coverage tracking initialized successfully");
+    }
+    
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     /* 初始化动态跟踪管道（用于树可视化） */
     const char *trace_pipe_path = getenv("RR_TRACE_PIPE");
@@ -411,6 +422,11 @@ void rr_framework_cleanup(void)
 
     /* 清理子系统 */
     RR_VERBOSE("Cleaning up subsystems");
+    
+    /* 清理Coverage模块 */
+    rr_coverage_cleanup();
+    RR_VERBOSE("Coverage tracking cleaned up");
+    
     rr_ipc_cleanup();
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE

@@ -37,7 +37,6 @@ meson_options_help() {
   printf "%s\n" '  --enable-fdt[=CHOICE]    Whether and how to find the libfdt library'
   printf "%s\n" '                           (choices: auto/disabled/enabled/internal/system)'
   printf "%s\n" '  --enable-fuzzing         build fuzzing targets'
-  printf "%s\n" '  --enable-rr-fuzzing      RR-Fuzz record-replay fuzzing framework support'
   printf "%s\n" '  --enable-gcov            Enable coverage tracking.'
   printf "%s\n" '  --enable-lto             Use link time optimization'
   printf "%s\n" '  --enable-malloc=CHOICE   choose memory allocator to use [system] (choices:'
@@ -178,6 +177,7 @@ meson_options_help() {
   printf "%s\n" '  rbd             Ceph block device driver'
   printf "%s\n" '  rdma            Enable RDMA-based migration'
   printf "%s\n" '  replication     replication support'
+  printf "%s\n" '  rr-fuzzing      RR-Fuzz record-replay fuzzing framework support'
   printf "%s\n" '  rust            Rust support'
   printf "%s\n" '  rutabaga-gfx    rutabaga_gfx support'
   printf "%s\n" '  sdl             SDL user interface'
@@ -322,8 +322,6 @@ _meson_option_parse() {
     --disable-fuse-lseek) printf "%s" -Dfuse_lseek=disabled ;;
     --enable-fuzzing) printf "%s" -Dfuzzing=true ;;
     --disable-fuzzing) printf "%s" -Dfuzzing=false ;;
-    --enable-rr-fuzzing) printf "%s" -Drr_fuzzing=enabled ;;
-    --disable-rr-fuzzing) printf "%s" -Drr_fuzzing=disabled ;;
     --enable-gcrypt) printf "%s" -Dgcrypt=enabled ;;
     --disable-gcrypt) printf "%s" -Dgcrypt=disabled ;;
     --enable-gettext) printf "%s" -Dgettext=enabled ;;
@@ -470,6 +468,8 @@ _meson_option_parse() {
     --disable-replication) printf "%s" -Dreplication=disabled ;;
     --enable-rng-none) printf "%s" -Drng_none=true ;;
     --disable-rng-none) printf "%s" -Drng_none=false ;;
+    --enable-rr-fuzzing) printf "%s" -Drr_fuzzing=enabled ;;
+    --disable-rr-fuzzing) printf "%s" -Drr_fuzzing=disabled ;;
     --rtsig-map=*) quote_sh "-Drtsig_map=$2" ;;
     --enable-rust) printf "%s" -Drust=enabled ;;
     --disable-rust) printf "%s" -Drust=disabled ;;

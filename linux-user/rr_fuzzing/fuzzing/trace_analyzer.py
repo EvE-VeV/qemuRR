@@ -15,8 +15,18 @@ RR-Fuzz Trace Analyzer
 
 import struct
 import os
+import sys
 from enum import IntEnum
 from typing import List, Dict, Tuple, Optional
+
+# 添加analysis目录到path以导入bb_trace_parser
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'analysis'))
+try:
+    from bb_trace_parser import BBTraceParser, BBEntry
+    BB_TRACE_AVAILABLE = True
+except ImportError:
+    BB_TRACE_AVAILABLE = False
+    print("[TraceAnalyzer] ⚠️  BB trace parser not available")
 
 
 class AuxDataType(IntEnum):
@@ -139,6 +149,14 @@ class TraceAnalyzer:
             'time': 0,
             'process': 0
         }
+        
+        # BB trace相关
+        self.bb_trace_parser: Optional[BBTraceParser] = None
+        self.bb_trace_available = False
+        self.merged_execution_sequence = []  # 合并的执行序列
+        
+        # 自动解析trace文件
+        self.analyze()
     
     def analyze(self) -> bool:
         """分析 trace 文件"""
@@ -158,12 +176,19 @@ class TraceAnalyzer:
                 # 分类和统计
                 self._classify_and_stats()
                 
+                # 尝试加载BB trace
+                self._load_bb_trace()
+                
                 print(f"[TraceAnalyzer] ✅ Analysis completed:")
                 print(f"  Total syscalls: {self.stats['total']}")
                 print(f"  Pure Replay:    {self.stats['pure_replay']} "
                       f"({self.stats['pure_replay'] * 100 // max(self.stats['total'], 1)}%)")
                 print(f"  Hybrid Replay:  {self.stats['hybrid_replay']} "
                       f"({self.stats['hybrid_replay'] * 100 // max(self.stats['total'], 1)}%)")
+                if self.bb_trace_available:
+                    print(f"  BB Trace:       ✅ Available ({self.bb_trace_parser.stats['total_bbs']} BBs)")
+                else:
+                    print(f"  BB Trace:       ❌ Not available")
                 
                 return True
                 
@@ -332,6 +357,49 @@ class TraceAnalyzer:
             if record.category in self.stats:
                 self.stats[record.category] += 1
     
+    def _load_bb_trace(self):
+        """加载并解析BB trace文件"""
+        if not BB_TRACE_AVAILABLE:
+            return
+        
+        # 构造BB trace文件路径 (trace_file + ".bbl")
+        bb_trace_file = self.trace_file + ".bbl"
+        
+        if not os.path.exists(bb_trace_file):
+            print(f"[TraceAnalyzer] BB trace file not found: {bb_trace_file}")
+            return
+        
+        try:
+            self.bb_trace_parser = BBTraceParser(bb_trace_file)
+            if self.bb_trace_parser.parse():
+                self.bb_trace_available = True
+                # 合并执行序列
+                self._merge_execution_sequence()
+        except Exception as e:
+            print(f"[TraceAnalyzer] Failed to load BB trace: {e}")
+    
+    def _merge_execution_sequence(self):
+        """合并syscall trace和BB trace，生成完整执行序列"""
+        if not self.bb_trace_available or not self.bb_trace_parser:
+            return
+        
+        # 简化版：按syscall索引组织BB
+        self.merged_execution_sequence = []
+        current_syscall_idx = 0
+        
+        for entry in self.bb_trace_parser.entries:
+            # 当syscall索引变化时，插入syscall标记
+            if entry.syscall_idx > current_syscall_idx:
+                # 查找对应的syscall记录
+                for syscall in self.syscalls:
+                    if syscall.index == entry.syscall_idx:
+                        self.merged_execution_sequence.append(('syscall', syscall))
+                        break
+                current_syscall_idx = entry.syscall_idx
+            
+            # 添加BB
+            self.merged_execution_sequence.append(('bb', entry.pc))
+    
     def classify_syscalls(self, syscalls):
         """分类系统调用"""
         pure = [s for s in syscalls if s['has_aux_data']]
@@ -420,6 +488,69 @@ class TraceAnalyzer:
             json.dump(data, f, indent=2)
         
         print(f"[TraceAnalyzer] ✅ Exported to {output_file}")
+    
+    # ========== BB Trace相关方法 ==========
+    
+    def has_bb_trace(self) -> bool:
+        """检查是否有BB trace数据"""
+        return self.bb_trace_available and self.bb_trace_parser is not None
+    
+    def get_bb_sequence(self) -> List[int]:
+        """获取完整的BB执行序列（PC地址列表）"""
+        if not self.has_bb_trace():
+            return []
+        return self.bb_trace_parser.get_bb_sequence()
+    
+    def get_bb_between_syscalls(self, start_syscall_idx: int, end_syscall_idx: int) -> List[int]:
+        """获取两个syscall之间的BB序列"""
+        if not self.has_bb_trace():
+            return []
+        return self.bb_trace_parser.get_bb_between_syscalls(start_syscall_idx, end_syscall_idx)
+    
+    def get_merged_execution_sequence(self) -> List[Tuple[str, any]]:
+        """
+        获取合并的执行序列
+        
+        返回: [('bb', pc), ('syscall', SyscallRecord), ...]
+        """
+        return self.merged_execution_sequence
+    
+    def get_bb_coverage_summary(self) -> Dict[str, any]:
+        """获取BB覆盖率摘要"""
+        if not self.has_bb_trace():
+            return {'error': 'BB trace not available'}
+        return self.bb_trace_parser.get_coverage_summary()
+    
+    def export_bb_trace_to_json(self, output_file: str):
+        """导出BB trace为JSON格式（用于离线分析）"""
+        if not self.has_bb_trace():
+            print("[TraceAnalyzer] ❌ No BB trace available")
+            return
+        
+        import json
+        
+        data = {
+            'trace_file': self.trace_file,
+            'bb_trace_file': self.trace_file + ".bbl",
+            'stats': self.bb_trace_parser.stats,
+            'bb_sequence': [
+                {
+                    'pc': hex(entry.pc),
+                    'syscall_idx': entry.syscall_idx,
+                    'flags': entry.flags
+                }
+                for entry in self.bb_trace_parser.entries
+            ],
+            'syscall_bb_map': {
+                str(k): [hex(pc) for pc in v]
+                for k, v in self.bb_trace_parser.get_syscall_bb_map().items()
+            }
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"[TraceAnalyzer] ✅ BB trace exported to {output_file}")
 
 
 def main():

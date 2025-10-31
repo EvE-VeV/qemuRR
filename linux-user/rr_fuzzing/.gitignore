@@ -6,6 +6,17 @@ test/test_fuzz_target
 test/simple_test
 test_fixed
 test_debug
+tests/test_bb_trace
+tests/complex_test_*
+
+# Trace文件
+*.dat
+*.dat.bbl
+/tmp/trace.dat*
+/tmp/fuzz_demo/
+/tmp/complex_test_suite/
+/tmp/integrated_test/
+/tmp/conductor_test/
 
 # 测试日志和临时文件
 *.log
@@ -14,12 +25,21 @@ test/*.strace
 test/rr_test_file.txt
 test/simple_qemu_test.log
 compare/
+
+# 文档归档（旧文档）
+docs/old-archive/
+
+# tests/
+
 # Python缓存
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.txt
+
+# Fuzzing输出
+fuzzing_summary_*.json
+*.html
 
 # 编辑器临时文件
 *~

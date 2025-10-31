@@ -164,7 +164,6 @@ const syscall_info_t *rr_get_syscall_info(int syscall_nr)
 bool rr_should_auto_fork(int syscall_nr, abi_long ret)
 {
     const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
-    extern rr_config_t g_rr_config;  // 使用全局配置
     
     /*
      * 改进的 Fork 策略（支持多种模式）

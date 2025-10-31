@@ -178,7 +178,7 @@ int rr_ipc_receive_command(void)
     RR_VERBOSE("Calling read() on cmd_pipe_fd=%d...", g_rr_framework->cmd_pipe_fd);
     ssize_t n = read(g_rr_framework->cmd_pipe_fd, &cmd, 1);
     RR_INFO("📥 IPC read: fd=%d, n=%zd, cmd='%c' (%d)", g_rr_framework->cmd_pipe_fd, n, 
-            (n == 1 && cmd > 0 && cmd < 128) ? cmd : '?', (int)(unsigned char)cmd);
+            (n == 1 && cmd > 0) ? cmd : '?', (int)(unsigned char)cmd);
     
     if (n != 1) {
         if (n < 0) {
