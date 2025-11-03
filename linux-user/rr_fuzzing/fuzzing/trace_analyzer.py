@@ -26,7 +26,7 @@ try:
     BB_TRACE_AVAILABLE = True
 except ImportError:
     BB_TRACE_AVAILABLE = False
-    print("[TraceAnalyzer] ⚠️  BB trace parser not available")
+    # BB trace 是可选功能，静默失败
 
 
 class AuxDataType(IntEnum):
@@ -129,7 +129,11 @@ class SyscallRecord:
 class TraceAnalyzer:
     """Binary Trace 分析器"""
     
-    TRACE_MAGIC = 0x52525254  # "RRTR"
+    # 支持多种 trace 格式的 magic numbers
+    VALID_TRACE_MAGICS = {
+        0x52525452: "RTRR",  # 旧格式或文档中的格式
+        0x52525254: "TRRR",  # QEMU 实际生成的格式 (当前)
+    }
     TRACE_VERSION = 1
     
     def __init__(self, trace_file: str):
@@ -160,6 +164,11 @@ class TraceAnalyzer:
     
     def analyze(self) -> bool:
         """分析 trace 文件"""
+        # 处理None或空trace_file
+        if self.trace_file is None:
+            print(f"[TraceAnalyzer] ⚠️  No trace file provided, skipping analysis")
+            return False
+        
         if not os.path.exists(self.trace_file):
             print(f"[TraceAnalyzer] ❌ Trace file not found: {self.trace_file}")
             return False
@@ -187,8 +196,7 @@ class TraceAnalyzer:
                       f"({self.stats['hybrid_replay'] * 100 // max(self.stats['total'], 1)}%)")
                 if self.bb_trace_available:
                     print(f"  BB Trace:       ✅ Available ({self.bb_trace_parser.stats['total_bbs']} BBs)")
-                else:
-                    print(f"  BB Trace:       ❌ Not available")
+                # BB trace 是可选的，不显示 "Not available" 避免误解
                 
                 return True
                 
@@ -200,9 +208,15 @@ class TraceAnalyzer:
         """读取 trace header"""
         # 魔数 (4 bytes)
         magic = struct.unpack('I', f.read(4))[0]
-        if magic != self.TRACE_MAGIC:
+        if magic not in self.VALID_TRACE_MAGICS:
+            valid_magics_str = ", ".join([f"0x{m:08X} ({n})" for m, n in self.VALID_TRACE_MAGICS.items()])
             print(f"[TraceAnalyzer] ❌ Invalid trace magic: 0x{magic:08X}")
+            print(f"[TraceAnalyzer]    Expected one of: {valid_magics_str}")
             return False
+        
+        # 记录实际使用的格式
+        format_name = self.VALID_TRACE_MAGICS[magic]
+        print(f"[TraceAnalyzer] Detected trace format: {format_name} (0x{magic:08X})")
         
         # 版本 (4 bytes)
         version = struct.unpack('I', f.read(4))[0]

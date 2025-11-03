@@ -34,6 +34,7 @@ import threading
 import select
 import struct
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -137,6 +138,7 @@ class FuzzConductor:
         self.crashes = []
         self.new_seeds = []
         self.start_time = None
+        self.fuzzing_log = []  # 记录每次迭代的详细信息
         
         print(f"[Conductor] ✅ 初始化完成")
     
@@ -213,6 +215,8 @@ class FuzzConductor:
         Returns:
             执行状态字符串，失败返回 None
         """
+        iteration_start = time.time()
+        
         # 写入共享内存
         self.shm.write_instructions(instructions)
         
@@ -242,17 +246,33 @@ class FuzzConductor:
             elif status == 1:  # Ready
                 continue
             elif status == 3:  # Normal Exit
-                return "正常退出"
+                status_name = "正常退出"
             elif status == 4:  # Crash
                 self.crashes.append(self.total_executions + 1)
                 print(f"[Conductor] 💥 崩溃！ (执行 #{self.total_executions + 1})")
-                return "崩溃"
+                status_name = "崩溃"
             elif status == 5:  # Other Signal
-                return "其他信号"
+                status_name = "其他信号"
             else:
-                return f"未知状态({status})"
+                status_name = f"未知状态({status})"
+            
+            # 记录本次迭代
+            self.fuzzing_log.append({
+                'iteration': self.total_executions + 1,
+                'instructions': [{'syscall_index': i.syscall_index, 'cmd': i.cmd} for i in instructions],
+                'status': status_name,
+                'duration': time.time() - iteration_start
+            })
+            
+            return status_name
         
         print("[Conductor] ⚠️  执行超时")
+        self.fuzzing_log.append({
+            'iteration': self.total_executions + 1,
+            'instructions': [{'syscall_index': i.syscall_index, 'cmd': i.cmd} for i in instructions],
+            'status': 'timeout',
+            'duration': time.time() - iteration_start
+        })
         return None
     
     def run(self, rounds: int):
@@ -319,6 +339,118 @@ class FuzzConductor:
         if self.total_executions > 0:
             print(f"平均迭代耗时: {elapsed/self.total_executions:.3f}s")
         print(f"{'='*60}\n")
+    
+    def save_summary(self, output_file=None):
+        """保存fuzzing摘要到JSON文件"""
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"fuzzing_summary_{timestamp}.json"
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        
+        summary = {
+            'fuzzing_session': {
+                'target': self.target_binary,
+                'trace_file': self.trace_file,
+                'start_time': datetime.fromtimestamp(self.start_time).isoformat() if self.start_time else None,
+                'duration_seconds': round(duration, 2),
+                'total_iterations': self.total_executions
+            },
+            'statistics': {
+                'total_executions': self.total_executions,
+                'crashes_found': len(self.crashes),
+                'crash_iterations': self.crashes,
+                'new_seeds_found': len(self.new_seeds),
+                'avg_iteration_time': round(duration / self.total_executions, 3) if self.total_executions > 0 else 0
+            },
+            'coverage': self.coverage_tracker.get_stats(),
+            'mutable_syscalls': {
+                'total': len(self.mutator.mutable_candidates),
+                'pure_replay_total': len(self.mutator.pure_candidates),
+                'hybrid_replay_total': len(self.mutator.hybrid_candidates)
+            },
+            'iterations': self.fuzzing_log
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\n[Conductor] 📊 Fuzzing summary saved to: {output_file}")
+        print(f"[Conductor]    Total iterations: {self.total_executions}")
+        print(f"[Conductor]    Crashes found: {len(self.crashes)}")
+        print(f"[Conductor]    Duration: {round(duration, 2)}s")
+        
+        return output_file
+    
+    def save_trace_file(self, output_file=None):
+        """保存可读的 syscall trace 文件"""
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"fuzzing_trace_{timestamp}.txt"
+        
+        # 重新创建analyzer
+        analyzer = TraceAnalyzer(self.trace_file)
+        if not analyzer.analyze():
+            print(f"[Conductor] ⚠️  Failed to re-analyze trace for output")
+            return None
+        
+        with open(output_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("RR-Fuzz Syscall Trace\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Target:     {self.target_binary}\n")
+            f.write(f"Trace File: {self.trace_file}\n")
+            f.write(f"Timestamp:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Iterations: {self.total_executions}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # 1. Original Trace Summary
+            f.write("📋 ORIGINAL TRACE SUMMARY\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Total syscalls: {len(analyzer.syscalls)}\n")
+            f.write(f"Pure replay candidates: {len(self.mutator.pure_candidates)}\n")
+            f.write(f"Hybrid replay candidates: {len(self.mutator.hybrid_candidates)}\n")
+            f.write(f"Mutable syscalls: {len(self.mutator.mutable_candidates)}\n\n")
+            
+            # 2. Syscall List with Details
+            f.write("📜 SYSCALL SEQUENCE\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"{'Index':<6} {'Syscall':<20} {'Mutable':<8}\n")
+            f.write("-" * 80 + "\n")
+            
+            for sc in analyzer.syscalls:
+                is_mutable = any(c.index == sc.index for c in self.mutator.mutable_candidates)
+                f.write(f"{sc.index:<6} {sc.name:<20} {'✓' if is_mutable else '✗':<8}\n")
+            
+            f.write("\n")
+            
+            # 3. Fuzzing Iterations Detail
+            if self.fuzzing_log:
+                f.write("🎯 FUZZING ITERATIONS\n")
+                f.write("-" * 80 + "\n")
+                for log_entry in self.fuzzing_log:
+                    f.write(f"\nIteration #{log_entry['iteration']} - Status: {log_entry['status']} - Duration: {log_entry['duration']:.3f}s\n")
+                    
+                    for instr in log_entry['instructions']:
+                        syscall_idx = instr['syscall_index']
+                        cmd_type = instr['cmd']
+                        
+                        # Find syscall name
+                        syscall_name = "unknown"
+                        for sc in analyzer.syscalls:
+                            if sc.index == syscall_idx:
+                                syscall_name = sc.name
+                                break
+                        
+                        f.write(f"  ⚡ Mutated: syscall[{syscall_idx}] {syscall_name} - Command: {cmd_type}\n")
+            
+            f.write("\n")
+            f.write("=" * 80 + "\n")
+            f.write("End of Trace\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"[Conductor] 📝 Syscall trace saved to: {output_file}")
+        return output_file
     
     def cleanup(self):
         """清理资源"""
@@ -391,6 +523,9 @@ def main():
     parser.add_argument('--init-mode', default='adaptive',
                        choices=['adaptive', 'static', 'disabled'],
                         help='初始化检测模式（默认: adaptive）')
+    parser.add_argument('--output-format', type=str, default='all',
+                        choices=['txt', 'json', 'all', 'none'],
+                        help='输出格式: txt=文本trace, json=JSON摘要, all=全部, none=无输出（默认: all）')
     
     args = parser.parse_args()
     
@@ -423,6 +558,20 @@ def main():
         
         # 运行模糊测试
         conductor.run(args.iterations)
+        
+        # 保存输出（根据output_format配置）
+        if conductor.total_executions > 0 and args.output_format != 'none':
+            print(f"\n[Conductor] 💾 保存输出文件 (格式: {args.output_format})...")
+            
+            # JSON summary
+            if args.output_format in ['json', 'all']:
+                conductor.save_summary()
+            
+            # Text trace
+            if args.output_format in ['txt', 'all']:
+                conductor.save_trace_file()
+        elif args.output_format == 'none':
+            print("[Conductor] ⚠️  输出已禁用 (--output-format none)")
         
         # 清理
         conductor.cleanup()

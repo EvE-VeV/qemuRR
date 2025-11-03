@@ -138,6 +138,15 @@ void rr_bb_trace_log(uint64_t pc)
         return;
     }
     
+    /* 地址过滤：只记录主程序的BB */
+    if (g_bb_trace->filter_enabled) {
+        if (pc < g_bb_trace->main_start || pc >= g_bb_trace->main_end) {
+            /* 这是库函数BB，跳过 */
+            g_bb_trace->filtered_bbs++;
+            return;
+        }
+    }
+    
     /* 检查缓冲区是否已满 */
     if (g_bb_trace->buffer_pos >= g_bb_trace->buffer_size) {
         rr_bb_trace_flush();
@@ -225,5 +234,43 @@ void rr_bb_trace_print_stats(void)
         RR_INFO("  Avg BBs per flush: %.2f", 
                 (double)g_bb_trace->total_bbs / (double)g_bb_trace->total_flushes);
     }
+    
+    if (g_bb_trace->filter_enabled) {
+        RR_INFO("  Filtered BBs (lib): %lu", g_bb_trace->filtered_bbs);
+        RR_INFO("  Main program range: 0x%lx - 0x%lx",
+                g_bb_trace->main_start, g_bb_trace->main_end);
+    }
+}
+
+void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code)
+{
+    fprintf(stderr, "[BB_TRACE] set_main_range called: 0x%lx - 0x%lx (g_bb_trace=%p)\n", 
+            start_code, end_code, (void*)g_bb_trace);
+    
+    if (!g_bb_trace) {
+        fprintf(stderr, "[BB_TRACE] ERROR: g_bb_trace is NULL!\n");
+        return;
+    }
+    
+    g_bb_trace->main_start = start_code;
+    g_bb_trace->main_end = end_code;
+    
+    fprintf(stderr, "[BB_TRACE] Range set successfully: 0x%lx - 0x%lx\n", 
+            start_code, end_code);
+}
+
+void rr_bb_trace_set_filter(bool enabled)
+{
+    fprintf(stderr, "[BB_TRACE] set_filter called: %s (g_bb_trace=%p)\n",
+            enabled ? "enabled" : "disabled", (void*)g_bb_trace);
+    
+    if (!g_bb_trace) {
+        fprintf(stderr, "[BB_TRACE] ERROR: g_bb_trace is NULL!\n");
+        return;
+    }
+    
+    g_bb_trace->filter_enabled = enabled;
+    
+    fprintf(stderr, "[BB_TRACE] Filter %s successfully\n", enabled ? "enabled" : "disabled");
 }
 

@@ -59,6 +59,7 @@
 #include "exec/page-vary.h"
 #ifdef CONFIG_RR_FUZZING
 #include "rr_fuzzing/core/rr_framework.h"
+#include "rr_fuzzing/core/rr_bb_trace.h"
 #endif
 
 #ifdef CONFIG_SEMIHOSTING
@@ -1040,6 +1041,13 @@ int main(int argc, char **argv, char **envp)
     if (rr_framework_init() < 0) {
         error_report("Failed to initialize RR-Fuzz framework");
         exit(EXIT_FAILURE);
+    }
+    
+    /* 设置主程序地址范围（用于BB trace过滤） */
+    /* 注意：只有在BB trace已初始化时才设置过滤 */
+    if (rr_bb_trace_is_enabled()) {
+        rr_bb_trace_set_main_range(info->start_code, info->end_code);
+        rr_bb_trace_set_filter(true);  /* 启用地址过滤 */
     }
 #endif
 

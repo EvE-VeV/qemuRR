@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 """
-SmartMutator - Intelligent Mutation Engine
+Mutator - Mutation Engine (Layer 2)
 
-This module provides smart mutation capabilities that:
-1. Analyzes trace files to identify mutable syscalls
-2. Filters out initialization-phase syscalls
-3. Supports recipe-driven mutation (PathFinder integration)
-4. Implements 11 different mutation strategies
-5. Dynamically adjusts mutation intensity
+Provides base and smart mutation capabilities:
+- BaseMutator: Simple random mutation
+- SmartMutator: Intelligent mutation with trace analysis and recipe support
 
-Mutation Strategies:
-- FLIP_BITS: Light bit flipping
-- LIGHT_MUTATION: 1-2 bit flipping
-- INTERESTING_VALUES: Special boundary values
-- BOUNDARY_VALUE: Boundary value testing
-- TRUNCATE: Data truncation
-- EXTEND: Data extension
-- REPLACE_BUFFER: Buffer replacement (small/large)
-- MUTATE_AUX_BUFFER: Auxiliary data mutation
-- MUTATE_FLAGS: Flag bit mutation
-- Special patterns: Format strings, injections, etc.
+Architecture: DETAILED_ARCHITECTURE.md Layer 2 (Line 87-106, 293-315)
 """
 
 import os
@@ -28,6 +15,7 @@ import struct
 import random
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # Add analysis directory to path for trace_analyzer import
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
@@ -40,6 +28,79 @@ from .constants import (
     INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS
 )
 from .instruction import FuzzInstruction
+
+
+class BaseMutator:
+    """
+    Base Mutation Engine (Simple Random Mutation)
+    
+    Provides basic random mutation without trace analysis.
+    Used as fallback or for standalone fuzzing.
+    
+    Architecture: DETAILED_ARCHITECTURE.md Line 87-106
+    """
+    
+    def __init__(self):
+        """Initialize BaseMutator"""
+        self.iteration_count = 0
+        print("[BaseMutator] Initialized (random mutation mode)")
+    
+    def mutate(self, trace) -> List[FuzzInstruction]:
+        """
+        Generate random mutations
+        
+        Args:
+            trace: Trace object (may be None for BaseMutator)
+        
+        Returns:
+            List of FuzzInstructions
+        
+        Architecture: DETAILED_ARCHITECTURE.md Line 90-101
+        """
+        self.iteration_count += 1
+        
+        # Generate 1-3 random mutations
+        num_mutations = random.randint(1, 3)
+        instructions = []
+        
+        for _ in range(num_mutations):
+            # Random syscall index (0-99)
+            syscall_index = random.randint(0, 99)
+            
+            # Random mutation type
+            mutation_types = [
+                FUZZ_CMD_FLIP_BITS,
+                FUZZ_CMD_INTERESTING_VALUES,
+                FUZZ_CMD_BOUNDARY_VALUE,
+                FUZZ_CMD_REPLACE_BUFFER,
+                FUZZ_CMD_MUTATE_FLAGS
+            ]
+            cmd = random.choice(mutation_types)
+            
+            # Generate random data
+            if cmd == FUZZ_CMD_FLIP_BITS:
+                data = struct.pack('I', random.randint(1, 8))
+            elif cmd == FUZZ_CMD_INTERESTING_VALUES:
+                value = random.choice([0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF])
+                data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
+            elif cmd == FUZZ_CMD_BOUNDARY_VALUE:
+                value = random.choice([0, -1, 0x7FFFFFFF, 0xFFFFFFFF])
+                data = struct.pack('q', value)
+            elif cmd == FUZZ_CMD_REPLACE_BUFFER:
+                size = random.choice([4, 8, 16, 32])
+                data = bytes([random.randint(0, 255) for _ in range(size)])
+            else:  # MUTATE_FLAGS
+                data = struct.pack('q', random.randint(0, 0xFFFFFFFF))
+            
+            instruction = FuzzInstruction(
+                syscall_index=syscall_index,
+                cmd=cmd,
+                arg_index=1,
+                data=data
+            )
+            instructions.append(instruction)
+        
+        return instructions
 
 
 class SmartMutator:
@@ -394,6 +455,20 @@ class SmartMutator:
                 print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(multi bits)")
             return FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, flag_mutation)
     
+    def mutate(self, trace) -> List['FuzzInstruction']:
+        """
+        Generate mutations for a trace (interface compatibility)
+        
+        Args:
+            trace: Trace object (unused, uses internal candidates)
+        
+        Returns:
+            list: FuzzInstruction list
+        """
+        # Use iteration from trace or default to 0
+        iteration = getattr(trace, 'exec_count', 0)
+        return self.build_instructions(iteration)
+    
     def build_instructions(self, iteration):
         """
         Build Fuzz instructions
@@ -441,8 +516,23 @@ class SmartMutator:
             offset = (iteration * num_mutations + i) % num_candidates
             target_candidate = self.mutable_candidates[offset]
             
-            # Select mutation strategy (0-10, 11 strategies total)
-            strategy_type = random.randint(0, 10)
+            # Select mutation strategy with weighted probability
+            # Increase probability of EXTEND (type 3) and REPLACE_BUFFER (type 7)
+            # to improve crash discovery rate for buffer overflow vulnerabilities
+            strategy_weights = [
+                10,  # 0: FLIP_BITS
+                10,  # 1: INTERESTING_VALUES
+                10,  # 2: TRUNCATE
+                25,  # 3: EXTEND (increased from ~9% to ~20%)
+                8,   # 4: LIGHT_MUTATION
+                8,   # 5: MUTATE_AUX_BUFFER
+                8,   # 6: REPLACE_BUFFER (small)
+                15,  # 7: REPLACE_BUFFER (large, increased)
+                8,   # 8: BOUNDARY_VALUE
+                8,   # 9: MUTATE_FLAGS
+                8,   # 10: OVERWRITE_AT_OFFSET
+            ]
+            strategy_type = random.choices(range(11), weights=strategy_weights)[0]
             
             # Generate advanced mutation instruction
             instr = self._generate_advanced_mutation(target_candidate, strategy_type, iteration)

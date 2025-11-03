@@ -23,7 +23,15 @@ class FuzzSharedMemory:
     """Shared Memory Manager"""
     
     def __init__(self, shm_name, size=FUZZ_SHM_SIZE):
+        # Ensure shm_name doesn't contain /dev/shm/ prefix
+        # QEMU's shm_open() expects just the name, not the full path
+        if shm_name.startswith("/dev/shm/"):
+            shm_name = shm_name[9:]  # Remove "/dev/shm/" prefix
+        elif shm_name.startswith("/"):
+            shm_name = shm_name[1:]  # Remove leading "/"
+        
         self.shm_name = shm_name
+        self.shm_path = f"/dev/shm/{shm_name}"
         self.size = size
         self.shm_fd = None
         self.mem = None
@@ -32,16 +40,17 @@ class FuzzSharedMemory:
     def create(self):
         """Create shared memory"""
         # Use /dev/shm (Linux shared memory)
-        shm_path = f"/dev/shm/{self.shm_name}"
+        # Use self.shm_path instead of recreating it
         
         # Create or open shared memory file
-        self.shm_fd = os.open(shm_path, os.O_CREAT | os.O_RDWR, 0o666)
+        self.shm_fd = os.open(self.shm_path, os.O_CREAT | os.O_RDWR, 0o666)
         os.ftruncate(self.shm_fd, self.size)
         
         # Map to memory
         self.mem = mmap.mmap(self.shm_fd, self.size)
         
-        print(f"[Conductor] Created shared memory: {shm_path} ({self.size} bytes)")
+        print(f"[Conductor] Created shared memory: {self.shm_path} ({self.size} bytes)")
+        print(f"[Conductor] Shared memory name for QEMU: {self.shm_name}")
         return self
     
     def write_instructions(self, instructions, capture_seed=False):
@@ -105,9 +114,8 @@ class FuzzSharedMemory:
         
         # Clean up shared memory file
         try:
-            shm_path = f"/dev/shm/{self.shm_name}"
-            if os.path.exists(shm_path):
-                os.unlink(shm_path)
+            if os.path.exists(self.shm_path):
+                os.unlink(self.shm_path)
         except:
             pass
 

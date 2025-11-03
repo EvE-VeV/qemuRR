@@ -1,0 +1,44 @@
+graph TD
+    subgraph conductor
+        M0[fuzz_conductor]
+        M1[mutator]
+        M2[shared_memory]
+        M3[__init__]
+        M4[init_detector]
+        M5[constants]
+        M6[mutation_strategies]
+        M7[instruction]
+        M8[coverage]
+        M9[bb_trace_parser]
+    end
+    subgraph multiprocess
+        M10[crash_analyzer]
+        M11[multiprocess_extensions]
+        M12[seed_types]
+        M13[energy_scheduler]
+        M14[seed_queue_advanced]
+        M15[__init__]
+        M16[path_finder]
+        M17[corpus_manager]
+        M18[coverage_feedback]
+        M19[shared_resources]
+        M20[fuzz_master]
+        M21[fuzz_master_fixed]
+        M22[syscall_extractor]
+    end
+    subgraph core
+        M23[trace_analyzer]
+        M24[realtime_tree_visualizer]
+        M25[log_analyzer]
+    end
+    M0 --> M23
+    M1 --> M23
+    M11 --> M0
+    M20 --> M16
+    M20 --> M10
+    M20 --> M13
+    M20 --> M18
+    M20 --> M0
+    M20 --> M14
+    M20 --> M17
+    M21 --> M0

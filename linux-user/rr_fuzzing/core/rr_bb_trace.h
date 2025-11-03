@@ -49,6 +49,12 @@ typedef struct {
     uint64_t total_bbs;                    // 总BB数
     uint64_t total_flushes;                // 总刷新次数
     uint32_t current_syscall_idx;          // 当前syscall索引
+    
+    /* 地址过滤（只记录主程序BB） */
+    bool filter_enabled;                   // 是否启用地址过滤
+    uint64_t main_start;                   // 主程序起始地址
+    uint64_t main_end;                     // 主程序结束地址
+    uint64_t filtered_bbs;                 // 被过滤的BB数（统计）
 } rr_bb_trace_t;
 
 /* ================= 全局变量 ================= */
@@ -129,6 +135,21 @@ void rr_bb_trace_get_stats(uint64_t *total_bbs, uint64_t *total_flushes);
  * 打印BB trace统计信息
  */
 void rr_bb_trace_print_stats(void);
+
+/**
+ * 设置主程序地址范围（用于过滤库函数BB）
+ * 
+ * @param start_code 主程序代码段起始地址
+ * @param end_code 主程序代码段结束地址
+ */
+void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code);
+
+/**
+ * 启用/禁用地址过滤
+ * 
+ * @param enabled 是否启用过滤
+ */
+void rr_bb_trace_set_filter(bool enabled);
 
 #endif /* RR_BB_TRACE_H */
 

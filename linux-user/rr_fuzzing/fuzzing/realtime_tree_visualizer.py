@@ -706,8 +706,39 @@ class RealtimeTreeBuilder:
         if verbose:
             print(f"\n[Visualizer] ✅ HTML generated: {output_file}")
     
-    def _node_to_json(self, node: TreeNode) -> dict:
-        """节点转JSON"""
+    def _node_to_json(self, node: TreeNode, depth: int = 0, visited: set = None) -> dict:
+        """节点转JSON（带递归深度保护和循环检测）"""
+        # 初始化visited集合
+        if visited is None:
+            visited = set()
+        
+        # 检测循环引用
+        if node.node_id in visited:
+            return {
+                'node_id': node.node_id,
+                'syscall_name': f"⚠️ CIRCULAR: {node.syscall_name}",
+                'error': 'circular_reference',
+                'children': []
+            }
+        
+        # 检查递归深度（最多500层）
+        if depth > 500:
+            return {
+                'node_id': node.node_id,
+                'syscall_name': f"⚠️ DEPTH_LIMIT: {node.syscall_name}",
+                'error': 'max_depth_exceeded',
+                'children': []
+            }
+        
+        # 标记为已访问
+        visited.add(node.node_id)
+        
+        # 递归转换子节点
+        children_json = []
+        for child in node.children:
+            child_json = self._node_to_json(child, depth + 1, visited.copy())
+            children_json.append(child_json)
+        
         return {
             'node_id': node.node_id,
             'syscall_index': node.syscall_index,
@@ -715,7 +746,7 @@ class RealtimeTreeBuilder:
             'retval': node.retval,
             'pid': node.pid,
             'was_fuzzed': node.was_fuzzed,
-            'children': [self._node_to_json(child) for child in node.children]
+            'children': children_json
         }
 
 def main():
