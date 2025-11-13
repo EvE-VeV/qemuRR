@@ -18,6 +18,7 @@
 #include "qemu/osdep.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 
 /* ================= 配置常量 ================= */
 
@@ -34,6 +35,8 @@ typedef struct {
     uint8_t *coverage_map;          // Coverage bitmap (共享内存)
     int shm_fd;                     // 共享内存文件描述符
     uint64_t prev_pc;               // 前一个PC（用于计算边）
+    bool file_backed;               // 是否使用文件作为共享内存
+    char backing_path[PATH_MAX];    // 文件路径（仅file_backed模式使用）
     
     /* 统计信息 */
     uint64_t total_edges;           // 总边数

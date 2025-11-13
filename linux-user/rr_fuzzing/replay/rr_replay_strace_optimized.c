@@ -35,19 +35,22 @@ typedef struct {
     bool strict_mode;
     bool skip_unmatched;
     int max_lookahead;
-    
+
     /* 统计信息 */
     uint64_t total_syscalls;
     uint64_t matched_syscalls;
     uint64_t skipped_syscalls;
     uint64_t error_syscalls;
     uint64_t fallback_syscalls;
-    
+
     /* 状态信息 */
     char *trace_filename;
     size_t current_record_index;
     bool trace_exhausted;
     bool allow_fallback_execution;
+
+    /* 🔥 修复：跟踪当前syscall的变异状态 */
+    bool current_syscall_was_fuzzed;
 } rr_strace_replay_state_t;
 
 static rr_strace_replay_state_t g_strace_state = {0};
@@ -479,6 +482,25 @@ void rr_strace_replay_cleanup(void) {
 abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long *args) {
     STRACE_DEBUG("Processing syscall %d", num);
     
+    /* DEBUG: 打印第一个syscall的silent mode状态 */
+    static int first_call = 1;
+    static pid_t last_pid = 0;
+    pid_t current_pid = getpid();
+    
+    if (first_call) {
+        first_call = 0;
+        RR_INFO("🔍 First syscall in replay: silent_replay_mode=%d, checkpoint_target=%u",
+                g_rr_framework->silent_replay_mode, g_rr_framework->checkpoint_target);
+    }
+    
+    /* DEBUG: 每个进程的第一个syscall打印详细状态 */
+    if (current_pid != last_pid) {
+        last_pid = current_pid;
+        RR_INFO("🔍 [PID %d] First syscall: trace_exhausted=%d, current_record_index=%zu, parser=%p, enabled=%d",
+                current_pid, g_strace_state.trace_exhausted, g_strace_state.current_record_index, 
+                g_strace_parser, g_strace_state.enabled);
+    }
+    
     if (!g_strace_state.enabled) {
         STRACE_ERROR("Module not initialized");
         return -1;
@@ -546,15 +568,23 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     g_strace_current_index = g_strace_state.current_record_index;
     
     STRACE_VERBOSE("Found matching record: %s, ret=%ld", record->syscall_name, record->ret_value);
-    
-    /* 动态跟踪：系统调用进入 */
-    rr_dynamic_trace_syscall_enter(
-        env, 
-        num, 
-        (uint64_t*)args, 
-        g_strace_state.current_record_index,
-        false  /* 尚未变异 */
-    );
+
+    /* 🔥 修复：初始化变异状态为false */
+    g_strace_state.current_syscall_was_fuzzed = false;
+
+    /* 动态跟踪：系统调用进入 (✅ silent mode时不发送) */
+    if (!g_rr_framework->silent_replay_mode) {
+        rr_dynamic_trace_syscall_enter(
+            env, 
+            num, 
+            (uint64_t*)args, 
+            g_strace_state.current_record_index,
+            false  /* 尚未变异 */
+        );
+    } else {
+        RR_INFO("🔇 Silent mode: skipping trace for syscall[%u] %s", 
+                g_strace_state.current_record_index, record->syscall_name);
+    }
     
     /* 🔥 修复：uname 不使用固定字符串，从 trace 获取或返回 -1 让宿主执行 */
     
@@ -609,23 +639,28 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         }
         (void)pre_fuzz_args;  /* 可能在调试关闭时未使用 */
         
-        // 调用Fuzz引擎应用变异
-        rr_fuzz_mutate_syscall(env, syscall_index, args, num);
-        
-        // 检测参数是否被Fuzz变异
-        bool fuzz_modified = false;
+        // 🔥 修复：调用Fuzz引擎应用变异并获取结果
+        int mutation_result = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+
+        // 🔥 修复：检测参数是否被Fuzz变异 (结合返回值)
+        bool fuzz_modified = (mutation_result > 0);  // buffer mutations
+
+        // 额外检查参数变化（用于调试和统计）
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (pre_fuzz_args[i] != args[i]) {
-                fuzz_modified = true;
-                STRACE_VERBOSE("FUZZ_MUTATED: %s arg[%d] %ld -> %ld", 
+                fuzz_modified = true;  // 任何参数变化都算作变异
+                STRACE_VERBOSE("FUZZ_MUTATED: %s arg[%d] %ld -> %ld",
                           record->syscall_name, i, pre_fuzz_args[i], args[i]);
             }
         }
         
         if (fuzz_modified) {
-            STRACE_INFO("🎯 FUZZING: %s at index %u - parameters mutated", 
+            STRACE_INFO("🎯 FUZZING: %s at index %u - parameters mutated",
                    record->syscall_name, syscall_index);
         }
+
+        // 🔥 修复：保存变异状态供动态跟踪使用
+        g_strace_state.current_syscall_was_fuzzed = fuzz_modified;
     }
     
     // 保存当前记录供POST-HOOK使用
@@ -650,16 +685,34 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
     // 使用优化的POST处理
     rr_syscall_post_hook_optimized(num, g_current_record_strace, ret, args);
     
-    /* 动态跟踪：系统调用退出 */
-    bool was_fuzzed = (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING);
-    rr_dynamic_trace_syscall_exit(
-        env,
-        num,
-        (uint64_t*)args,
-        ret,
-        g_strace_state.current_record_index,
-        was_fuzzed
-    );
+    /* 动态跟踪：系统调用退出 (✅ silent mode时不发送) */
+    if (!g_rr_framework->silent_replay_mode) {
+        // 🔥 修复：使用实际的变异状态而不是整体fuzzing模式
+        bool was_fuzzed = g_strace_state.current_syscall_was_fuzzed;
+        rr_dynamic_trace_syscall_exit(
+            env,
+            num,
+            (uint64_t*)args,
+            ret,
+            g_strace_state.current_record_index,
+            was_fuzzed
+        );
+    }
+    
+    /* ✅ 检查是否到达fork_point，关闭silent mode */
+    if (g_rr_framework->silent_replay_mode) {
+        uint32_t target_fork_point = g_rr_framework->checkpoint_target;  // 借用这个字段存fork_point
+        if (g_strace_state.current_record_index >= target_fork_point) {
+            g_rr_framework->silent_replay_mode = false;
+            RR_INFO("✅ Reached fork_point[%u], switching to normal mode", target_fork_point);
+            
+            // ✅ 现在发送iteration消息（child正式开始）
+            extern int g_dynamic_trace_pipe_fd;
+            if (g_dynamic_trace_pipe_fd >= 0) {
+                rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
+            }
+        }
+    }
     
     // 清理当前记录
     g_current_record = NULL;

@@ -53,6 +53,7 @@ class TraceManager:
     2. Track coverage information per trace
     3. Implement AFL-style energy-based selection
     4. Maintain active traces (high-energy subset)
+    5. 新增：收集syscall级别的执行统计
     
     Architecture: DETAILED_ARCHITECTURE.md Line 18-51
     """
@@ -75,6 +76,13 @@ class TraceManager:
         # Selection parameters
         self.exploit_probability = 0.8  # 80% exploit, 20% explore
         
+        # ✅ 新增：Syscall级别的执行统计
+        # 格式: {trace_id: {syscall_index: {exec_count, fork_count, mutations, ...}}}
+        self.syscall_stats: Dict[str, Dict[int, Dict]] = {}
+        
+        # ✅ P0 FIX: 多样性追踪 - 记住上次选择的trace
+        self._last_selected_id: Optional[str] = None
+        
         # Add initial trace if provided
         if initial_trace:
             self.add_initial_trace(initial_trace)
@@ -85,7 +93,7 @@ class TraceManager:
         metadata = TraceMetadata(
             creation_time=time.time(),
             parent_trace_id=None,
-            energy=10.0  # Initial trace gets high energy
+            energy=3.0  # ✅ P0 FIX: 降低initial trace energy (10.0→3.0) 提高多样性
         )
         
         trace = Trace(
@@ -148,11 +156,14 @@ class TraceManager:
     
     def select_trace(self) -> Optional[Trace]:
         """
-        Select a trace for fuzzing using AFL-style energy-based selection
+        ✅ 改进的trace选择策略 - 增加diversity，减少重复
         
         Strategy:
-        - 80% probability: Select from active_traces (exploitation)
-        - 20% probability: Select from entire trace_pool (exploration)
+        - 60% probability: Select from active_traces (exploitation) - 降低从80%
+        - 40% probability: Select from entire trace_pool (exploration) - 提高从20%
+        - 使用更激进的权重衰减 (1.5→2.0)
+        - 添加多样性惩罚 (避免连续选择同一trace)
+        - 对新发现的trace给予更高权重
         
         Returns:
             Trace: Selected trace or None if pool is empty
@@ -160,8 +171,11 @@ class TraceManager:
         if not self.trace_pool:
             return None
         
+        # ✅ 改进1: 降低exploitation比例，提高exploration
+        exploit_prob = 0.60  # 从0.8降低到0.6
+        
         # Decide: Exploit or Explore
-        if random.random() < self.exploit_probability and self.active_traces:
+        if random.random() < exploit_prob and self.active_traces:
             # Exploit: Select from high-energy traces
             pool = self.active_traces
             source = "active"
@@ -170,12 +184,27 @@ class TraceManager:
             pool = self.trace_pool
             source = "all"
         
-        # Weight selection by energy (inverse of exec_count)
+        # ✅ 改进2: 更激进的权重衰减 + 多样性惩罚
         weights = []
         for trace in pool:
-            # Energy decreases with exec count (AFL-style)
-            energy = trace.metadata.energy / (1 + trace.metadata.exec_count)
-            weights.append(energy)
+            # 基础energy
+            base_energy = trace.metadata.energy
+            
+            # ✅ 对新trace给予3倍权重boost
+            if trace.metadata.new_coverage_count > 0:
+                base_energy *= 3.0
+            
+            # ✅ P0 FIX: 更激进的衰减：1.5 → 2.0
+            # 这样高exec_count的trace权重会快速下降
+            exec_penalty = (1 + trace.metadata.exec_count) ** 2.0
+            
+            # ✅ P0 FIX: 多样性惩罚 - 避免连续选择同一个trace
+            diversity_penalty = 1.0
+            if trace.id == self._last_selected_id:
+                diversity_penalty = 0.1  # ✅ 加强惩罚: 0.3→0.1 (权重降到10%)
+            
+            energy = (base_energy / exec_penalty) * diversity_penalty
+            weights.append(max(energy, 0.01))  # 确保最小权重
         
         # Select trace
         if sum(weights) == 0:
@@ -187,8 +216,11 @@ class TraceManager:
         # Update exec count
         selected.metadata.exec_count += 1
         
+        # ✅ P0 FIX: 记住这次选择，用于下次的多样性惩罚
+        self._last_selected_id = selected.id
+        
         print(f"[TraceManager] Selected trace: {selected.id} from {source} pool "
-              f"(exec_count={selected.metadata.exec_count})")
+              f"(exec_count={selected.metadata.exec_count}, energy={selected.metadata.energy:.2f})")
         
         return selected
     
@@ -230,6 +262,131 @@ class TraceManager:
             'traces_saved': self.traces_saved
         }
     
+    def record_execution(self, trace_id: str, trace_file: str, mutations: list, 
+                         has_new_coverage: bool = False):
+        """
+        ✅ P0 FIX: 记录一次trace执行（包括所有syscall的统计，不仅仅是被mutate的）
+        
+        Args:
+            trace_id: Trace ID
+            trace_file: Trace文件路径（用于解析所有syscalls）
+            mutations: List of FuzzInstructions applied
+            has_new_coverage: Whether new coverage was found
+        """
+        # 初始化trace的syscall_stats（如果不存在）
+        if trace_id not in self.syscall_stats:
+            self.syscall_stats[trace_id] = {}
+        
+        # ✅ NEW: 解析trace文件，获取所有syscalls
+        # 这样可以记录所有执行的syscalls，不仅仅是被mutate的
+        try:
+            import sys
+            from pathlib import Path
+            analysis_path = Path(__file__).parent.parent / 'analysis'
+            if str(analysis_path) not in sys.path:
+                sys.path.insert(0, str(analysis_path))
+            
+            from trace_analyzer import TraceAnalyzer
+            analyzer = TraceAnalyzer(trace_file)
+            
+            # ✅ 记录所有syscalls的基础执行统计
+            for i, sc in enumerate(analyzer.syscalls):
+                if i not in self.syscall_stats[trace_id]:
+                    self.syscall_stats[trace_id][i] = {
+                        'exec_count': 0,
+                        'fork_count': 0,
+                        'mutation_applied': False,
+                        'mutation_types': [],
+                        'arg_modifications': {},
+                        'new_coverage': 0,
+                        'syscall_name': sc.name,
+                        'syscall_nr': sc.syscall_nr  # ✅ FIX: 使用syscall_nr而不是nr
+                    }
+                
+                # 增加执行计数（每个syscall都被记录）
+                self.syscall_stats[trace_id][i]['exec_count'] += 1
+        
+        except Exception as e:
+            # 如果解析失败，回退到只记录mutations
+            print(f"[TraceManager] ⚠️  Failed to parse trace for full stats: {e}")
+        
+        # ✅ 更新受mutation影响的syscall统计（额外的mutation信息）
+        for mutation in mutations:
+            syscall_idx = mutation.syscall_index
+            
+            # 确保该syscall存在于stats中
+            if syscall_idx not in self.syscall_stats[trace_id]:
+                self.syscall_stats[trace_id][syscall_idx] = {
+                    'exec_count': 1,
+                    'fork_count': 0,
+                    'mutation_applied': False,
+                    'mutation_types': [],
+                    'arg_modifications': {},
+                    'new_coverage': 0
+                }
+            
+            stat = self.syscall_stats[trace_id][syscall_idx]
+            
+            # 标记mutation相关信息
+            stat['fork_count'] += 1  # 每次mutation都会fork
+            stat['mutation_applied'] = True
+            
+            # 记录mutation类型
+            cmd_name = self._get_mutation_name(mutation.cmd)
+            if cmd_name not in stat['mutation_types']:
+                stat['mutation_types'].append(cmd_name)
+            
+            # 记录参数修改
+            arg_key = f"arg[{mutation.arg_index}]"
+            if arg_key not in stat['arg_modifications']:
+                stat['arg_modifications'][arg_key] = {
+                    'modification_count': 0,
+                    'mutation_commands': []
+                }
+            stat['arg_modifications'][arg_key]['modification_count'] += 1
+            if cmd_name not in stat['arg_modifications'][arg_key]['mutation_commands']:
+                stat['arg_modifications'][arg_key]['mutation_commands'].append(cmd_name)
+            
+            # 如果发现新coverage，记录
+            if has_new_coverage:
+                stat['new_coverage'] += 1
+    
+    def _get_mutation_name(self, cmd: int) -> str:
+        """将mutation命令转换为名称"""
+        from .constants import (
+            FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
+            FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
+            FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
+            FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET
+        )
+        
+        cmd_names = {
+            FUZZ_CMD_FLIP_BITS: "FLIP_BITS",
+            FUZZ_CMD_LIGHT_MUTATION: "LIGHT_MUTATION",
+            FUZZ_CMD_INTERESTING_VALUES: "INTERESTING_VALUES",
+            FUZZ_CMD_BOUNDARY_VALUE: "BOUNDARY_VALUE",
+            FUZZ_CMD_TRUNCATE: "TRUNCATE",
+            FUZZ_CMD_EXTEND: "EXTEND",
+            FUZZ_CMD_REPLACE_BUFFER: "REPLACE_BUFFER",
+            FUZZ_CMD_MUTATE_AUX_BUFFER: "MUTATE_AUX_BUFFER",
+            FUZZ_CMD_MUTATE_FLAGS: "MUTATE_FLAGS",
+            FUZZ_CMD_MUTATE_ARG: "MUTATE_ARG",
+            FUZZ_CMD_OVERWRITE_AT_OFFSET: "OVERWRITE_AT_OFFSET"
+        }
+        return cmd_names.get(cmd, f"UNKNOWN({cmd})")
+    
+    def get_syscall_stats(self, trace_id: str) -> Dict[int, Dict]:
+        """
+        获取指定trace的syscall统计信息
+        
+        Args:
+            trace_id: Trace ID
+        
+        Returns:
+            Dict mapping syscall_index to stats dict
+        """
+        return self.syscall_stats.get(trace_id, {})
+    
     def save_corpus(self, output_dir: str):
         """Save all traces and metadata to corpus directory"""
         corpus_dir = Path(output_dir) / "corpus"
@@ -254,7 +411,9 @@ class TraceManager:
                     'energy': trace.metadata.energy,
                     'exec_count': trace.metadata.exec_count,
                     'new_coverage_count': trace.metadata.new_coverage_count,
-                    'coverage_info': self.coverage_map.get(trace.id, {})
+                    'coverage_info': self.coverage_map.get(trace.id, {}),
+                    # ✅ 保存syscall统计信息
+                    'syscall_stats': self.syscall_stats.get(trace.id, {})
                 }, f, indent=2)
         
         print(f"[TraceManager] Saved {len(self.trace_pool)} traces to {corpus_dir}")

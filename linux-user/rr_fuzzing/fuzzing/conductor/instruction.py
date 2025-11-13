@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-FuzzInstruction - Fuzzing Instruction Representation
+FuzzInstruction - Fuzzing指令表示
 
-This module provides the FuzzInstruction class that represents a single
-fuzzing instruction to be sent to QEMU via shared memory.
+本模块提供FuzzInstruction类，表示通过共享内存发送到QEMU的单个
+fuzzing指令。
 
-The binary format matches the C-side structure defined in rr_framework.h:
+二进制格式与rr_framework.h中定义的C端结构匹配:
     typedef struct {
-        fuzz_cmd_type_t cmd;        // Command type (uint32)
-        uint32_t syscall_index;     // Syscall index
-        uint32_t arg_index;         // Argument index
-        uint32_t offset;            // Offset (Phase 2)
-        uint32_t size;              // Size (Phase 2)
-        uint32_t data_len;          // Data length
-        uint8_t data[256];          // Data payload
+        fuzz_cmd_type_t cmd;        // 命令类型 (uint32)
+        uint32_t syscall_index;     // 系统调用索引
+        uint32_t arg_index;         // 参数索引
+        uint32_t offset;            // 偏移 (第2阶段)
+        uint32_t size;              // 大小 (第2阶段)
+        uint32_t data_len;          // 数据长度
+        uint8_t data[256];          // 数据负载
     } FuzzInstruction;
 """
 
@@ -23,20 +23,20 @@ from .constants import FUZZ_INSTRUCTION_DATA
 
 class FuzzInstruction:
     """
-    Single Fuzz Instruction (Phase 2 Enhanced)
+    单条Fuzz指令 (第2阶段增强)
     
-    Represents one mutation command to apply during fuzzing.
+    表示在fuzzing期间应用的一个变异命令。
     """
     
     def __init__(self, syscall_index, cmd, arg_index, data, offset=0, size=None):
         """
-        Args:
-            syscall_index: System call index
-            cmd: Command type
-            arg_index: Argument index
-            data: Mutation data
-            offset: Offset (Phase 2 new)
-            size: Data size (Phase 2 new, if None uses data length)
+        参数:
+            syscall_index: 系统调用索引
+            cmd: 命令类型
+            arg_index: 参数索引
+            data: 变异数据
+            offset: 偏移 (第2阶段新增)
+            size: 数据大小 (第2阶段新增, 如果为None则使用数据长度)
         """
         self.syscall_index = syscall_index
         self.cmd = cmd
@@ -47,35 +47,43 @@ class FuzzInstruction:
     
     def pack(self):
         """
-        Pack to binary format (matches C struct)
+        打包为二进制格式 (与C结构体匹配)
         
-        🔥 Phase 2 Fix: C-side structure definition (rr_framework.h:70-78):
+        🔥 第2阶段修复: C端结构定义 (rr_framework.h:70-78):
         typedef struct {
-            fuzz_cmd_type_t cmd;        // Field 1 (uint32)
-            uint32_t syscall_index;     // Field 2
-            uint32_t arg_index;         // Field 3
-            uint32_t offset;            // Field 4 (Phase 2 new)
-            uint32_t size;              // Field 5 (Phase 2 new)
-            uint32_t data_len;          // Field 6
-            uint8_t data[256];          // Field 7
+            fuzz_cmd_type_t cmd;        // 字段1 (uint32)
+            uint32_t syscall_index;     // 字段2
+            uint32_t arg_index;         // 字段3
+            uint32_t offset;            // 字段4 (第2阶段新增)
+            uint32_t size;              // 字段5 (第2阶段新增)
+            uint32_t data_len;          // 字段6
+            uint8_t data[256];          // 字段7
         } FuzzInstruction;
         
-        Returns:
-            bytes: Packed binary data
+        返回:
+            bytes: 打包后的二进制数据
         """
         data_bytes = self.data if isinstance(self.data, bytes) else struct.pack('q', self.data)
         data_len = len(data_bytes)
         
-        # Pad to 256 bytes
+        # 填充到256字节
         padded_data = data_bytes + b'\x00' * (FUZZ_INSTRUCTION_DATA - data_len)
         
-        # Pack in C-side field order (Phase 2: includes offset and size)
+        # 按C端字段顺序打包 (第2阶段: 包含offset和size)
         return struct.pack('IIIIII256s', 
-                          self.cmd,                # Field 1: cmd
-                          self.syscall_index,      # Field 2: syscall_index  
-                          self.arg_index,          # Field 3: arg_index
-                          self.offset,             # Field 4: offset (Phase 2 new)
-                          self.size,               # Field 5: size (Phase 2 new)
-                          data_len,                # Field 6: data_len
-                          padded_data)             # Field 7: data
+                          self.cmd,                # 字段1: cmd
+                          self.syscall_index,      # 字段2: syscall_index  
+                          self.arg_index,          # 字段3: arg_index
+                          self.offset,             # 字段4: offset (第2阶段新增)
+                          self.size,               # 字段5: size (第2阶段新增)
+                          data_len,                # 字段6: data_len
+                          padded_data)             # 字段7: data
+
+    @property
+    def struct_size(self):
+        """
+        🔥 修复：返回C结构体的固定大小
+        6个uint32_t + data[256] = 24 + 256 = 280字节
+        """
+        return 280
 

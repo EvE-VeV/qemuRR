@@ -158,16 +158,21 @@ static void extend_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     __attribute__((unused)) uint32_t old_size = aux->size;
     uint32_t new_size;
     
-    // 从 instr->data[0] 读取扩展倍数（默认 2 倍）
-    if (instr->data_len > 0 && instr->data[0] > 0 && instr->data[0] <= 10) {
-        new_size = aux->size * instr->data[0];
+    // 🔥 修复：从 instr->data 读取绝对扩展字节数（不是倍数！）
+    uint32_t extend_by;
+    if (instr->data_len >= 4) {
+        // Python端用struct.pack('I', extend_by)发送4字节的绝对值
+        memcpy(&extend_by, instr->data, 4);
     } else {
-        new_size = aux->size * 2;
+        // 回退到默认值
+        extend_by = 64;
     }
-    
-    // 限制最大大小（256 字节）
-    if (new_size > 256) {
-        new_size = 256;
+
+    new_size = aux->size + extend_by;
+
+    // 🔥 提高最大大小限制以支持缓冲区溢出测试（1024 字节）
+    if (new_size > 1024) {
+        new_size = 1024;
     }
     
     // 如果没有增长，跳过
@@ -274,26 +279,84 @@ static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction 
         case TARGET_NR_recvfrom:
 #endif
         {
-            /* 输入数据特殊值 */
-            if (aux->size >= 4) {
-                // 注入魔数（如果提供）
-                if (instr->data_len >= 4) {
-                    memcpy(aux->data, instr->data, 4);
-                    RR_INFO("🔧 FUZZ_AUX: Injected magic bytes");
-                } else {
-                    // 默认：0xFFFFFFFF
-                    memset(aux->data, 0xFF, 4);
-                    RR_INFO("🔧 FUZZ_AUX: Injected 0xFFFFFFFF");
+            /* 🎯 增强：支持多种漏洞模式的特殊值注入 */
+            if (instr->data_len > 0) {
+                uint8_t pattern_type = instr->data[0] % 8;  // 8种模式
+
+                switch (pattern_type) {
+                    case 0: {
+                        // 格式化字符串攻击
+                        const char *fmt_patterns[] = {"%s%s%s%n", "%p%p%p", "%x%x%x"};
+                        const char *pattern = fmt_patterns[instr->data[1] % 3];
+                        size_t pattern_len = strlen(pattern);
+                        size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
+                        memcpy(aux->data, pattern, copy_len);
+                        RR_INFO("🔧 FUZZ_AUX: Injected format string pattern");
+                        break;
+                    }
+                    case 1: {
+                        // 缓冲区溢出模式 (重复字符)
+                        uint8_t overflow_char = (instr->data_len > 1) ? instr->data[1] : 0x41;  // 'A'
+                        memset(aux->data, overflow_char, aux->size);
+                        RR_INFO("🔧 FUZZ_AUX: Injected overflow pattern (0x%02x)", overflow_char);
+                        break;
+                    }
+                    case 2: {
+                        // NULL字节注入
+                        memset(aux->data, 0x00, aux->size);
+                        RR_INFO("🔧 FUZZ_AUX: Injected NULL bytes");
+                        break;
+                    }
+                    case 3: {
+                        // 高位字节测试
+                        memset(aux->data, 0xFF, aux->size);
+                        RR_INFO("🔧 FUZZ_AUX: Injected high bytes (0xFF)");
+                        break;
+                    }
+                    case 4: {
+                        // 整数边界值
+                        if (aux->size >= 4) {
+                            uint32_t boundary_vals[] = {0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF};
+                            uint32_t val = boundary_vals[(instr->data[1] % 5)];
+                            memcpy(aux->data, &val, 4);
+                            RR_INFO("🔧 FUZZ_AUX: Injected boundary value 0x%08x", val);
+                        }
+                        break;
+                    }
+                    case 5: {
+                        // 路径遍历注入
+                        const char *path_pattern = "/../../../etc/passwd";
+                        size_t pattern_len = strlen(path_pattern);
+                        size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
+                        memcpy(aux->data, path_pattern, copy_len);
+                        RR_INFO("🔧 FUZZ_AUX: Injected path traversal");
+                        break;
+                    }
+                    case 6: {
+                        // 命令注入模式
+                        const char *cmd_pattern = "$(id)";
+                        size_t pattern_len = strlen(cmd_pattern);
+                        size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
+                        memcpy(aux->data, cmd_pattern, copy_len);
+                        RR_INFO("🔧 FUZZ_AUX: Injected command injection");
+                        break;
+                    }
+                    default: {
+                        // 通用魔数注入
+                        if (instr->data_len >= 4) {
+                            memcpy(aux->data, instr->data + 1, (instr->data_len - 1 < aux->size) ? instr->data_len - 1 : aux->size);
+                            RR_INFO("🔧 FUZZ_AUX: Injected custom magic bytes");
+                        } else {
+                            memset(aux->data, 0xFF, aux->size);
+                            RR_INFO("🔧 FUZZ_AUX: Injected default 0xFF pattern");
+                        }
+                        break;
+                    }
                 }
-            }
-            
-            // 如果有足够的空间，注入更多特殊值
-            if (aux->size >= 8) {
-                // 注入边界值
-                ((uint32_t *)aux->data)[1] = 0x7FFFFFFF;  // INT_MAX
-            }
-            if (aux->size >= 12) {
-                ((uint32_t *)aux->data)[2] = 0x80000000;  // INT_MIN
+            } else {
+                // 回退到原有逻辑
+                memset(aux->data, 0xFF, aux->size);
+                RR_INFO("🔧 FUZZ_AUX: Injected 0xFF pattern (fallback)");
             }
             break;
         }

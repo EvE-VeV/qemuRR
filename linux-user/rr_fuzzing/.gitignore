@@ -8,6 +8,7 @@ test_fixed
 test_debug
 tests/test_bb_trace
 tests/complex_test_*
+tests/programs/test_programs/
 
 # Trace文件
 *.dat
@@ -40,6 +41,7 @@ __pycache__/
 # Fuzzing输出
 fuzzing_summary_*.json
 *.html
+analysis_reports/
 
 # 编辑器临时文件
 *~

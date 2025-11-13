@@ -107,6 +107,44 @@ static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long ac
     }
 #endif
     
+    /* set_tid_address 返回线程ID,每次运行都会不同 */
+#ifdef TARGET_NR_set_tid_address
+    if (syscall_nr == TARGET_NR_set_tid_address) {
+        return true;
+    }
+#endif
+    
+    /* readlink 返回值可能因为路径长度变化 */
+#ifdef TARGET_NR_readlink
+    if (syscall_nr == TARGET_NR_readlink) {
+        return true;
+    }
+#endif
+#ifdef TARGET_NR_readlinkat
+    if (syscall_nr == TARGET_NR_readlinkat) {
+        return true;
+    }
+#endif
+    
+    /* gettid 返回线程ID */
+#ifdef TARGET_NR_gettid
+    if (syscall_nr == TARGET_NR_gettid) {
+        return true;
+    }
+#endif
+    
+    /* getpid/getppid 可能会变化 */
+    // 处理架构差异：某些架构使用不同的syscall名称
+#ifdef TARGET_NR_getpid
+    if (syscall_nr == TARGET_NR_getpid) return true;
+#endif
+#ifdef TARGET_NR_getxpid  // alpha架构
+    if (syscall_nr == TARGET_NR_getxpid) return true;
+#endif
+#ifdef TARGET_NR_getppid
+    if (syscall_nr == TARGET_NR_getppid) return true;
+#endif
+    
     return false;
 }
 
@@ -478,6 +516,33 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
     RR_VERBOSE("RR_DO_SYSCALL: Framework enabled, mode=%d", g_rr_framework->mode);
 
+    /* ✅ FIX: 在第一个syscall之前进入fork server (方案B)
+     * 
+     * 策略：在target程序执行第一个syscall之前进入fork server loop
+     *      这样fork出的子进程会从main()开始自然执行
+     *      
+     * 优点：子进程自动replay整个trace，mutation自动应用
+     */
+    static bool fork_server_entered = false;
+    if (!fork_server_entered && g_rr_framework->mode == RR_MODE_FUZZING && 
+        g_rr_framework->fork_server_active) {
+        
+        fork_server_entered = true;
+        RR_INFO("🚀 [EARLY FORK] Entering fork server BEFORE first syscall");
+        RR_INFO("🚀 [EARLY FORK] This ensures child processes replay from main()");
+        
+        int fork_result = rr_fork_server_loop();
+        
+        if (fork_result < 0) {
+            RR_INFO("🔄 Fork server received quit command, exiting");
+            exit(0);
+        } else if (fork_result > 0) {
+            RR_INFO("🔄 Child process %d will now execute syscalls from the beginning", getpid());
+        } else {
+            RR_INFO("🔄 Parent process %d continuing in fork server loop", getpid());
+        }
+    }
+
     /* 添加醒目的系统调用入口提示 - 调试阶段使用 */
     const char* syscall_name = get_syscall_name(num);
     RR_INFO("===============================================================");    
@@ -531,28 +596,58 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
                 ret = rr_replay_syscall(env, num, args);
             }
             
+            // Baseline mode: exit after first IO syscall (fork point)
+            if (g_rr_framework->baseline_mode && is_io_syscall(num)) {
+                RR_INFO("Baseline mode: reached first IO syscall %s at index %u, exiting",
+                        get_syscall_name(num), g_rr_framework->replay_index);
+                exit(0);
+            }
+            
             /* 
-             * 自动检测 Fork 点（EnvFuzz 策略）
-             * 只对 P_IO 类的输入系统调用进行 fork
-             * 必须在执行后检查，因为需要返回值来判断是否有数据
+             * ✅ FIX: 禁用旧的auto fork point检查
+             * 
+             * 原因：我们已经在第一个syscall之前进入fork server了（EARLY FORK）
+             *      不需要在syscall执行后再次fork
+             *      
+             * 保留代码作为参考，但添加条件永远为false
              */
             {
                 const char *syscall_name_auto = get_syscall_name(num);
                 
-                if (rr_check_auto_fork_point(num, syscall_name_auto, ret)) {
+                // ✅ 禁用：fork_server_entered总是true，所以永远不会进入
+                if (false && !fork_server_entered && rr_check_auto_fork_point(num, syscall_name_auto, ret)) {
                     /* 进入Fork Server主循环 */
                     RR_INFO("🔄 Entering fork server loop after %s", syscall_name_auto);
                     int fork_result = rr_fork_server_loop();
                     RR_INFO("🔄 Fork server loop returned: %d", fork_result);
+                    
+                    // ✅ DEBUG: 检查fork server返回后的状态
+                    fprintf(stderr, "[DEBUG-AFTER-FORK] PID=%d, fork_result=%d\n", getpid(), fork_result);
+                    fprintf(stderr, "[DEBUG-AFTER-FORK]   g_instruction_count=%zu\n", g_instruction_count);
+                    fflush(stderr);
+                    
                     if (fork_result < 0) {
                         RR_INFO("🔄 Exiting due to quit command");
                         exit(0); // 收到退出命令
                     } else if (fork_result > 0) {
                         /* 子进程继续Fuzzing执行 */
                         RR_INFO("🔄 Child process %d continuing fuzzing", getpid());
+                        fprintf(stderr, "[DEBUG-CHILD-CONTINUE] PID=%d will execute syscalls now\n", getpid());
+                        fprintf(stderr, "[DEBUG-CHILD-CONTINUE]   g_instruction_count=%zu at this point\n", g_instruction_count);
+                        fflush(stderr);
                     } else {
                         RR_INFO("🔄 Parent process %d continuing after fork", getpid());
                     }
+                }
+                
+                /* ✅ 新增：Autonomous nested fork检查
+                 * 
+                 * 如果是autonomous child（depth > 0），在IO syscalls上检查是否应该嵌套fork
+                 */
+                if (g_rr_framework->is_autonomous_child && 
+                    rr_should_nested_fork(num, syscall_name_auto, ret)) {
+                    uint32_t fork_index = g_rr_framework->replay_index;
+                    rr_autonomous_nested_fork(fork_index);
                 }
             }
             break;
@@ -790,6 +885,13 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             g_pending_mmap_length = 0;
         }
 
+        /* ✅ 修复：真实执行的syscall也要发送dynamic trace exit */
+        if (!g_rr_framework->silent_replay_mode) {
+            abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+            rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
+                                           g_rr_framework->replay_index - 1, false);  // -1因为已递增
+        }
+        
         RR_VERBOSE("POST_HOOK: Replay mode, syscall=%d, ret=%d", num, (int)ret);
         return;
     }

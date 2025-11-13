@@ -11,10 +11,11 @@ RR-Fuzz 多进程模糊测试模块
 - path_finder: 路径查找器（离线CFG分析和配方生成）
 """
 
-# 导出主要类
-from .fuzz_master import FuzzMaster, WorkerConfig, WorkerStats
-from .shared_resources import SharedCoverage, WorkerSeedQueue
-from .recipe_pool import RecipePool, RecipeStats
+# ✅ 修复：延迟导入，避免循环依赖
+# 不要在__init__.py直接导入，而是让用户显式导入
+# from .fuzz_master import FuzzMaster, WorkerConfig, WorkerStats
+# from .shared_resources import SharedCoverage, WorkerSeedQueue
+# from .recipe_pool import RecipePool, RecipeStats
 
 # PathFinder 是可选的（需要 angr）
 try:
@@ -36,16 +37,6 @@ __all__ = [
     'shared_resources',
     'path_finder',
     'recipe_pool',
-    # 类名（用于 from multiprocess import ClassName）
-    'FuzzMaster',
-    'WorkerConfig',
-    'WorkerStats',
-    'SharedCoverage',
-    'WorkerSeedQueue',
-    'RecipePool',
-    'RecipeStats',
-    'PathFinder',
-    'MutationRecipe',
-    'PathFinderConfig',
+    'dynamic_fork_controller',
 ]
 

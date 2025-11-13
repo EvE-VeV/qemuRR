@@ -54,33 +54,43 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr)
         return -1;
     }
 
-    // 验证校验和（防止读到部分写入的数据）
-    uint32_t expected_checksum = shm->magic ^ shm->sequence ^ shm->instruction_count;
+    // ✅ 新结构：匹配Python端的checksum计算
+    // Python: checksum = FUZZ_MAGIC ^ sequence ^ num_variants ^ fork_point ^ depth
+    uint32_t expected_checksum = shm->magic ^ shm->sequence ^ shm->num_variants ^ shm->fork_point ^ shm->current_depth;
     if (shm->checksum != expected_checksum) {
-        RR_WARN("Shared memory checksum mismatch: got 0x%x, expected 0x%x (sequence=%u, count=%u)",
-                shm->checksum, expected_checksum, shm->sequence, shm->instruction_count);
+        RR_WARN("Shared memory checksum mismatch: got 0x%x, expected 0x%x (seq=%u, variants=%u, fork_pt=%u, depth=%u)",
+                shm->checksum, expected_checksum, shm->sequence, shm->num_variants, shm->fork_point, shm->current_depth);
         RR_WARN("Possible incomplete write, skipping this round");
         g_instruction_count = 0;
         return -1;  // 返回错误，让调用方知道数据不完整
     }
 
-    // 检查指令数量
-    if (shm->instruction_count == 0) {
-        RR_VERBOSE("No fuzz instructions in shared memory");
+    // ✅ 简化：直接从variants[0]加载（兼容旧行为）
+    if (shm->num_variants > 0) {
+        FuzzVariant *variant = &shm->variants[0];
+        g_instruction_count = variant->instruction_count;
+        
+        if (g_instruction_count > FUZZ_MAX_INSTRUCTIONS) {
+            RR_ERROR("Too many instructions: %zu (max %d)", 
+                     g_instruction_count, FUZZ_MAX_INSTRUCTIONS);
+            return -1;
+        }
+        
+        // 复制指令到本地缓冲区
+        memcpy(g_fuzz_instructions, variant->instructions, 
+               sizeof(FuzzInstruction) * g_instruction_count);
+    } else {
+        // 无variants，表示无指令
+        RR_VERBOSE("No fuzz instructions in shared memory (num_variants=0)");
         g_instruction_count = 0;
         return 0;
     }
 
-    if (shm->instruction_count > FUZZ_MAX_INSTRUCTIONS) {
-        RR_ERROR("Too many instructions: %u (max %d)", 
-                 shm->instruction_count, FUZZ_MAX_INSTRUCTIONS);
-        return -1;
-    }
-
-    // 复制指令到本地缓冲区
-    g_instruction_count = shm->instruction_count;
-    memcpy(g_fuzz_instructions, shm->instructions, 
-           sizeof(FuzzInstruction) * g_instruction_count);
+    // ✅ DEBUG: 详细验证加载后的状态
+    fprintf(stderr, "[DEBUG-LOAD] PID=%d, g_instruction_count=%zu (address=%p)\n", 
+            getpid(), g_instruction_count, &g_instruction_count);
+    fprintf(stderr, "[DEBUG-LOAD] First instruction: syscall_idx=%u, cmd=%d\n",
+            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
 
     RR_INFO("Loaded %zu fuzz instructions from shared memory (seq=%u, checksum=0x%x)", 
             g_instruction_count, shm->sequence, shm->checksum);
@@ -137,12 +147,20 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
 {
     int has_buffer_mutation = 0;  // 标记是否应用了buffer mutation
     
-    fprintf(stderr, "[APPLY] START: syscall_index=%u, nr=%d, g_instruction_count=%zu\n", 
-            syscall_index, syscall_nr, g_instruction_count);
+    // ✅ DEBUG: 详细检查进入apply时的状态
+    fprintf(stderr, "\n[APPLY] ========== START ==========\n");
+    fprintf(stderr, "[APPLY] PID=%d, syscall_index=%u, nr=%d\n", getpid(), syscall_index, syscall_nr);
+    fprintf(stderr, "[APPLY] g_instruction_count=%zu (address=%p, value_at_addr=%zu)\n", 
+            g_instruction_count, &g_instruction_count, *(size_t*)&g_instruction_count);
+    if (g_instruction_count > 0) {
+        fprintf(stderr, "[APPLY] First instruction: syscall_idx=%u, cmd=%d\n",
+                g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
+    }
     fflush(stderr);
     
     if (g_instruction_count == 0) {
         fprintf(stderr, "[APPLY] ERROR: g_instruction_count is 0!\n");
+        fprintf(stderr, "[APPLY] This means instructions were cleared after reload!\n");
         fflush(stderr);
         return 0;  // 没有变异指令
     }

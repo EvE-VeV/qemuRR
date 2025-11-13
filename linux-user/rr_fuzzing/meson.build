@@ -32,7 +32,9 @@ rr_fuzz_sources = files(
   'utils/rr_ipc.c',
   'utils/rr_dynamic_trace.c',
   'utils/rr_snapshot.c',
+  'utils/rr_checkpoint.c',       # ✅ checkpoint机制
   'utils/rr_fork_server.c',
+  'utils/rr_nested_fork.c',      # ✅ autonomous nested fork
 )
 
 # RR-Fuzz configuration option

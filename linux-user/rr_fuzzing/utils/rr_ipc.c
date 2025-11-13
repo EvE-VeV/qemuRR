@@ -9,11 +9,16 @@
 #endif
 
 #include "../core/rr_framework.h"
+#include "../core/rr_constants.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdio.h>
 
+static void *rr_map_shared_memory(const char *identifier);
 /**
  * 初始化IPC系统
  * 使用统一配置系统
@@ -71,21 +76,13 @@ int rr_ipc_init(void)
 
     /* 初始化共享内存 */
     if (g_rr_config.shared_memory_name) {
-        int shm_fd = shm_open(g_rr_config.shared_memory_name, O_RDWR, 0666);
-        if (shm_fd >= 0) {
-            g_rr_framework->shared_memory = mmap(NULL, g_rr_config.shared_memory_size,
-                                               PROT_READ | PROT_WRITE,
-                                               MAP_SHARED, shm_fd, 0);
-            if (g_rr_framework->shared_memory != MAP_FAILED) {
-                RR_IPC_TRACE("Mapped shared memory: %s (%zu bytes)",
-                            g_rr_config.shared_memory_name, g_rr_config.shared_memory_size);
-            } else {
-                RR_WARN("Failed to map shared memory: %s", g_rr_config.shared_memory_name);
-                g_rr_framework->shared_memory = NULL;
-            }
-            close(shm_fd);
+        g_rr_framework->shared_memory = rr_map_shared_memory(g_rr_config.shared_memory_name);
+        if (!g_rr_framework->shared_memory) {
+            RR_WARN("Failed to initialize shared memory '%s'", g_rr_config.shared_memory_name);
         } else {
-            RR_WARN("Failed to open shared memory: %s", g_rr_config.shared_memory_name);
+            RR_IPC_TRACE("Shared memory ready: %s (size=%zu)",
+                         g_rr_config.shared_memory_name,
+                         g_rr_config.shared_memory_size);
         }
     } else {
         RR_IPC_TRACE("No shared memory configured");
@@ -199,6 +196,12 @@ int rr_ipc_receive_command(void)
     switch (cmd) {
         case 'F': // Fork命令
             return 'F';
+        case 'B': // Batch fork命令
+            return 'B';
+        case 'C': // Checkpoint fork命令
+            return 'C';
+        case 'E': // Baseline execution命令
+            return 'E';
         case 'Q': // 退出命令
             return 'Q';
         case 'S': // 保存Snapshot命令
@@ -209,4 +212,67 @@ int rr_ipc_receive_command(void)
             RR_LOG("Unknown command: %c", cmd);
             return 0;
     }
+}
+static void *rr_map_posix_shared_memory(const char *name)
+{
+    int shm_fd = shm_open(name, O_RDWR, 0666);
+    char prefixed_name[RR_MAX_PATH_LENGTH];
+    
+    if (shm_fd < 0 && name && name[0] != '/') {
+        /* Some platforms require a leading slash */
+        snprintf(prefixed_name, sizeof(prefixed_name), "/%s", name);
+        shm_fd = shm_open(prefixed_name, O_RDWR, 0666);
+    }
+    
+    if (shm_fd < 0) {
+        RR_WARN("Failed to open posix shared memory '%s' (errno=%d)", name, errno);
+        return NULL;
+    }
+    
+    void *addr = mmap(NULL, g_rr_config.shared_memory_size,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (addr == MAP_FAILED) {
+        RR_WARN("Failed to mmap shared memory '%s' (errno=%d)", name, errno);
+        close(shm_fd);
+        return NULL;
+    }
+    
+    close(shm_fd);
+    RR_IPC_TRACE("Mapped POSIX shared memory '%s'", name);
+    return addr;
+}
+
+static void *rr_map_file_backed_memory(const char *path)
+{
+    int fd = open(path, O_RDWR, 0);
+    if (fd < 0) {
+        RR_WARN("Failed to open file-backed shared memory '%s' (errno=%d)", path, errno);
+        return NULL;
+    }
+    
+    void *addr = mmap(NULL, g_rr_config.shared_memory_size,
+                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        RR_WARN("Failed to mmap file-backed shared memory '%s' (errno=%d)", path, errno);
+        close(fd);
+        return NULL;
+    }
+    
+    close(fd);
+    RR_IPC_TRACE("Mapped file-backed shared memory '%s'", path);
+    return addr;
+}
+
+static void *rr_map_shared_memory(const char *identifier)
+{
+    if (!identifier) {
+        return NULL;
+    }
+    
+    if (strncmp(identifier, "file:", 5) == 0) {
+        const char *path = identifier + 5;
+        return rr_map_file_backed_memory(path);
+    }
+    
+    return rr_map_posix_shared_memory(identifier);
 }

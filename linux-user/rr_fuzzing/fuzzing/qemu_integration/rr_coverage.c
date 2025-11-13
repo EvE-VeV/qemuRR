@@ -21,13 +21,99 @@ rr_coverage_t *g_coverage = NULL;
 
 /**
  * 创建共享内存
+ * 
+ * 支持两种模式：
+ * 1. AFL-style: 使用固定名称 (从环境变量RR_COVERAGE_SHM读取)
+ * 2. Legacy: 使用PID后缀 (fallback)
  */
 static int create_shared_memory(const char *shm_name)
 {
     char shm_path[256];
-    snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", shm_name, getpid());
+    bool use_global_shm = false;
+    bool file_backed = false;
+    char file_backing_path[PATH_MAX] = {0};
     
-    // 创建共享内存文件
+    // ✅ NEW: Check for global shared memory name from environment
+    const char *env_shm_name = getenv("RR_COVERAGE_SHM");
+    if (env_shm_name && env_shm_name[0] != '\0') {
+        if (strncmp(env_shm_name, "file:", 5) == 0) {
+            file_backed = true;
+            snprintf(file_backing_path, sizeof(file_backing_path), "%s", env_shm_name + 5);
+            RR_INFO("Using file-backed coverage: %s", file_backing_path);
+        } else {
+            // AFL-style: Use fixed name without PID (shared across processes)
+            snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s", env_shm_name);
+            use_global_shm = true;
+            RR_INFO("Using global shared coverage: %s", shm_path);
+        }
+    } else {
+        // Legacy: Use PID suffix (per-process)
+        snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", shm_name, getpid());
+        RR_INFO("Using per-process coverage: %s", shm_path);
+    }
+
+    if (file_backed) {
+        int fd = open(file_backing_path, O_CREAT | O_RDWR, 0666);
+        if (fd < 0) {
+            RR_ERROR("Failed to open file-backed coverage '%s': %s",
+                    file_backing_path, strerror(errno));
+            return -1;
+        }
+        
+        if (ftruncate(fd, RR_COVERAGE_MAP_SIZE) < 0) {
+            RR_ERROR("Failed to resize file-backed coverage '%s': %s",
+                    file_backing_path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        
+        void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0);
+        if (mem == MAP_FAILED) {
+            RR_ERROR("Failed to mmap file-backed coverage '%s': %s",
+                    file_backing_path, strerror(errno));
+            close(fd);
+            return -1;
+        }
+        
+        memset(mem, 0, RR_COVERAGE_MAP_SIZE);
+        g_coverage->coverage_map = (uint8_t *)mem;
+        g_coverage->shm_fd = fd;
+        g_coverage->file_backed = true;
+        snprintf(g_coverage->backing_path, sizeof(g_coverage->backing_path),
+                 "%s", file_backing_path);
+        RR_INFO("✅ File-backed coverage ready: %s (%d bytes)",
+                file_backing_path, RR_COVERAGE_MAP_SIZE);
+        return 0;
+    }
+    
+    // If global SHM, try to open existing first
+    if (use_global_shm) {
+        // Try to open existing shared memory
+        int fd = open(shm_path, O_RDWR, 0666);
+        if (fd >= 0) {
+            // Existing shared memory found, just map it
+            void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+            if (mem == MAP_FAILED) {
+                RR_ERROR("Failed to mmap existing shared memory '%s': %s", 
+                        shm_path, strerror(errno));
+                close(fd);
+                return -1;
+            }
+            
+            g_coverage->coverage_map = (uint8_t *)mem;
+            g_coverage->shm_fd = fd;
+            
+            RR_INFO("✅ Opened existing global coverage shared memory: %s (%d bytes)", 
+                    shm_path, RR_COVERAGE_MAP_SIZE);
+            return 0;
+        }
+        // If opening failed, we'll create it below
+        RR_VERBOSE("Global shared memory doesn't exist yet, will create");
+    }
+    
+    // Create new shared memory file
     int fd = open(shm_path, O_CREAT | O_RDWR, 0666);
     if (fd < 0) {
         RR_ERROR("Failed to create shared memory file '%s': %s (errno=%d)", 
@@ -35,31 +121,35 @@ static int create_shared_memory(const char *shm_name)
         return -1;
     }
     
-    // 设置大小
+    // Set size
     if (ftruncate(fd, RR_COVERAGE_MAP_SIZE) < 0) {
         RR_ERROR("Failed to resize shared memory: %s", strerror(errno));
         close(fd);
-        unlink(shm_path);
+        if (!use_global_shm) {
+            unlink(shm_path);  // Only unlink per-process SHM
+        }
         return -1;
     }
     
-    // 映射到内存
+    // Map to memory
     void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
                      MAP_SHARED, fd, 0);
     if (mem == MAP_FAILED) {
         RR_ERROR("Failed to mmap shared memory: %s", strerror(errno));
         close(fd);
-        unlink(shm_path);
+        if (!use_global_shm) {
+            unlink(shm_path);  // Only unlink per-process SHM
+        }
         return -1;
     }
     
-    // 清零
+    // Clear bitmap (only if we created it)
     memset(mem, 0, RR_COVERAGE_MAP_SIZE);
     
     g_coverage->coverage_map = (uint8_t *)mem;
     g_coverage->shm_fd = fd;
     
-    RR_INFO("Created coverage shared memory: %s (%d bytes)", 
+    RR_INFO("✅ Created coverage shared memory: %s (%d bytes)", 
             shm_path, RR_COVERAGE_MAP_SIZE);
     
     return 0;
@@ -124,11 +214,24 @@ void rr_coverage_cleanup(void)
     if (g_coverage->shm_fd >= 0) {
         close(g_coverage->shm_fd);
         
-        // 删除共享内存文件
-        char shm_path[256];
-        snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", 
-                RR_COVERAGE_SHM_NAME, getpid());
-        unlink(shm_path);
+        if (g_coverage->file_backed && g_coverage->backing_path[0] != '\0') {
+            unlink(g_coverage->backing_path);
+            RR_VERBOSE("Deleted file-backed coverage file: %s", g_coverage->backing_path);
+        } else {
+            // ✅ FIXED: Only delete per-process SHM files, NOT global shared memory
+            const char *env_shm_name = getenv("RR_COVERAGE_SHM");
+            if (!env_shm_name || env_shm_name[0] == '\0') {
+                // Legacy per-process mode: delete the file
+                char shm_path[256];
+                snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", 
+                        RR_COVERAGE_SHM_NAME, getpid());
+                unlink(shm_path);
+                RR_VERBOSE("Deleted per-process coverage file: %s", shm_path);
+            } else {
+                // Global shared memory mode: DON'T delete (shared by all processes)
+                RR_VERBOSE("Keeping global shared coverage (shared by all processes)");
+            }
+        }
     }
     
     free(g_coverage);

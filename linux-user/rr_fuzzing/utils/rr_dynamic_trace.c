@@ -18,8 +18,8 @@
 #include <unistd.h>
 
 /* 全局跟踪管道 */
-static int g_dynamic_trace_pipe_fd = -1;
-static bool g_dynamic_trace_enabled = false;
+int g_dynamic_trace_pipe_fd = -1;  // 改为非static，让其他文件可以访问
+bool g_dynamic_trace_enabled = false;  // 改为非static，让其他文件可以访问
 
 void rr_dynamic_trace_init(int write_fd) {
     RR_INFO("=== Dynamic Trace Init START ===");
@@ -293,6 +293,24 @@ void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t for
     RR_VERBOSE("Dynamic trace: fork %u -> %u @ syscall[%u]", parent_pid, child_pid, fork_syscall_index);
 }
 
+/* ✅ 新增：发送iteration开始事件 */
+void rr_dynamic_trace_iteration(uint32_t iteration_id, uint32_t pid) {
+    if (!g_dynamic_trace_enabled) return;
+    
+    rr_dynamic_trace_msg_t msg = {
+        .type = RR_DYN_MSG_ITERATION,
+        .pid = pid,
+        .parent_pid = 0
+    };
+    
+    /* 使用syscall_info.index来传递iteration_id */
+    msg.syscall_info.index = iteration_id;
+    
+    send_trace_msg(&msg);
+    
+    RR_VERBOSE("Dynamic trace: iteration %u started (pid=%u)", iteration_id, pid);
+}
+
 void rr_dynamic_trace_exec(uint32_t pid) {
     if (!g_dynamic_trace_enabled) return;
     
@@ -317,4 +335,23 @@ void rr_dynamic_trace_exit(uint32_t pid, int exit_code) {
     msg.syscall_info.retval = exit_code;
     
     send_trace_msg(&msg);
+}
+
+/* 在fork子进程中重新启用dynamic trace
+ * fork()后子进程继承父进程的FD，所以trace pipe FD仍然有效
+ * 只需要确保g_dynamic_trace_enabled=true
+ */
+void rr_dynamic_trace_enable_in_child(void) {
+    RR_INFO("[CHILD-TRACE] enable_in_child called: PID=%d, current_fd=%d, current_enabled=%d", 
+            getpid(), g_dynamic_trace_pipe_fd, g_dynamic_trace_enabled);
+    
+    if (g_dynamic_trace_pipe_fd >= 0) {
+        g_dynamic_trace_enabled = true;
+        RR_INFO("[CHILD-TRACE] ✅ Dynamic trace re-enabled (PID=%d, fd=%d)", 
+                getpid(), g_dynamic_trace_pipe_fd);
+    } else {
+        RR_WARN("[CHILD-TRACE] ❌ Cannot enable: pipe fd=%d invalid", g_dynamic_trace_pipe_fd);
+    }
+    
+    RR_INFO("[CHILD-TRACE] After enable: enabled=%d", g_dynamic_trace_enabled);
 }

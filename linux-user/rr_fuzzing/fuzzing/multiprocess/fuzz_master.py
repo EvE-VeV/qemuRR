@@ -46,6 +46,7 @@ class WorkerConfig:
     worker_dir: Path
     mutator_type: str = "smart"  # "base" or "smart"
     recipe_file: Optional[str] = None
+    enable_pathfinder: bool = True  # ✅ 默认启用PathFinder
 
 
 @dataclass
@@ -87,7 +88,8 @@ class FuzzMaster:
         sync_dir: str = "sync_dir",
         mutator_type: str = "smart",
         recipe_file: Optional[str] = None,
-        master_timeout: Optional[int] = None
+        master_timeout: Optional[int] = None,
+        enable_pathfinder: bool = True  # ✅ 默认启用PathFinder
     ):
         """
         Initialize FuzzMaster
@@ -110,6 +112,7 @@ class FuzzMaster:
         self.mutator_type = mutator_type
         self.recipe_file = recipe_file
         self.master_timeout = master_timeout
+        self.enable_pathfinder = enable_pathfinder  # ✅ 保存PathFinder配置
         
         # Worker management
         self.workers: List[mp.Process] = []
@@ -184,7 +187,8 @@ class FuzzMaster:
             sync_dir=self.sync_dir,
             worker_dir=worker_dir,
             mutator_type=self.mutator_type,
-            recipe_file=self.recipe_file
+            recipe_file=self.recipe_file,
+            enable_pathfinder=self.enable_pathfinder  # ✅ 传递PathFinder配置
         )
     
     @staticmethod
@@ -222,7 +226,10 @@ class FuzzMaster:
                 target_binary=config.target_binary,
                 initial_trace=config.initial_trace,
                 output_dir=str(config.worker_dir),
-                mutator=mutator
+                mutator=mutator,
+                enable_pathfinder=config.enable_pathfinder,  # ✅ 传递PathFinder配置
+                enable_tree_viz=False,  # 多进程模式下禁用tree viz避免冲突
+                enable_monitoring=False
             )
             
             print(f"[Worker{worker_id}] FuzzingCore initialized")

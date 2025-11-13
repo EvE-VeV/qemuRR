@@ -93,9 +93,9 @@ class SyscallRecord:
         return syscall_map.get(nr, f'syscall_{nr}')
     
     def _categorize(self) -> str:
-        """分类系统调用"""
-        if self.has_aux_data:
-            return 'pure_replay'
+        """分类系统调用 - 返回功能类别，不是pure/hybrid分类"""
+        # ✅ FIX: Pure syscalls也应该根据功能分类，不要返回'pure_replay'
+        # 'pure_replay'和'hybrid_replay'是统计字段，不是category
         
         # 根据系统调用名称分类
         if self.name in ['read', 'pread64', 'readv', 'preadv',
@@ -107,7 +107,7 @@ class SyscallRecord:
             return 'output_io'
         elif self.name in ['open', 'openat', 'creat',
                            'stat', 'fstat', 'lstat', 'newfstatat',
-                           'access', 'faccessat']:
+                           'access', 'faccessat', 'close']:
             return 'file_ops'
         elif self.name in ['mmap', 'mmap2', 'munmap', 'mprotect', 'brk']:
             return 'memory_mgmt'
@@ -115,10 +115,11 @@ class SyscallRecord:
             return 'network'
         elif self.name in ['gettimeofday', 'clock_gettime', 'time']:
             return 'time'
-        elif self.name in ['fork', 'clone', 'vfork', 'execve']:
+        elif self.name in ['fork', 'clone', 'vfork', 'execve', 'exit', 'exit_group']:
             return 'process'
         else:
-            return 'hybrid_replay'
+            # ✅ FIX: 未知syscall返回'unknown'，不是'hybrid_replay'
+            return 'unknown'
     
     def __repr__(self):
         return (f"SyscallRecord(index={self.index}, name={self.name}, "
@@ -151,7 +152,8 @@ class TraceAnalyzer:
             'memory_mgmt': 0,
             'network': 0,
             'time': 0,
-            'process': 0
+            'process': 0,
+            'unknown': 0  # ✅ FIX: 添加unknown类别
         }
         
         # BB trace相关
@@ -159,11 +161,18 @@ class TraceAnalyzer:
         self.bb_trace_available = False
         self.merged_execution_sequence = []  # 合并的执行序列
         
+        # ✅ FIX: Track if already analyzed to prevent re-analysis
+        self._analyzed = False
+        
         # 自动解析trace文件
         self.analyze()
     
     def analyze(self) -> bool:
         """分析 trace 文件"""
+        # ✅ FIX: Skip if already analyzed (for cached analyzers)
+        if self._analyzed:
+            return True
+        
         # 处理None或空trace_file
         if self.trace_file is None:
             print(f"[TraceAnalyzer] ⚠️  No trace file provided, skipping analysis")
@@ -198,6 +207,8 @@ class TraceAnalyzer:
                     print(f"  BB Trace:       ✅ Available ({self.bb_trace_parser.stats['total_bbs']} BBs)")
                 # BB trace 是可选的，不显示 "Not available" 避免误解
                 
+                # ✅ FIX: Mark as analyzed
+                self._analyzed = True
                 return True
                 
         except Exception as e:
@@ -356,18 +367,26 @@ class TraceAnalyzer:
     
     def _classify_and_stats(self):
         """分类和统计"""
+        # ✅ FIX: Clear lists before classifying (in case called multiple times)
+        self.pure_syscalls = []
+        self.hybrid_syscalls = []
+        # Reset stats counters (pure_replay and hybrid_replay are separate from categories)
+        self.stats['pure_replay'] = 0
+        self.stats['hybrid_replay'] = 0
+        for cat in ['input_io', 'output_io', 'file_ops', 'memory_mgmt', 'network', 'time', 'process', 'unknown']:
+            self.stats[cat] = 0
+        
         for record in self.syscalls:
-            # 分类 Pure/Hybrid
+            # 分类 Pure/Hybrid (这是一个维度)
             if record.has_aux_data:
                 self.pure_syscalls.append(record)
                 self.stats['pure_replay'] += 1
-                # 🔥 调试：打印pure syscalls
-                print(f"[TraceAnalyzer] Pure syscall: index={record.index}, name={record.name}, nr={record.syscall_nr}")
             else:
                 self.hybrid_syscalls.append(record)
                 self.stats['hybrid_replay'] += 1
             
-            # 按类别统计
+            # ✅ FIX: 按功能类别统计 (另一个维度，与pure/hybrid正交)
+            # Category现在只包含功能类别（input_io, file_ops等），不包含pure_replay/hybrid_replay
             if record.category in self.stats:
                 self.stats[record.category] += 1
     

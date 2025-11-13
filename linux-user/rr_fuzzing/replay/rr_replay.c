@@ -20,8 +20,9 @@
 #include <sys/mman.h>
 #include <stdint.h>
 
-static FILE *g_trace_file = NULL;
+FILE *g_trace_file = NULL;  // ✅ 改为非static，让fork_server可以访问
 syscall_record_t *g_current_record = NULL;  // 非static，供fork_server访问
+char *g_rr_trace_path = NULL;  // ✅ 保存trace文件路径，供child重新打开
 
 /* 标记：当前系统调用是否已从 trace 读取并递增索引 */
 __thread bool g_syscall_already_consumed = false;
@@ -39,6 +40,12 @@ int rr_start_replay(const char *trace_file)
         RR_INFO("Using default trace file: %s", trace_file);
     }
 
+    /* ✅ 保存trace路径，供child重新打开 */
+    if (g_rr_trace_path == NULL || strcmp(g_rr_trace_path, trace_file) != 0) {
+        if (g_rr_trace_path) free(g_rr_trace_path);
+        g_rr_trace_path = strdup(trace_file);
+    }
+    
     /* 如果文件已打开，重置文件指针而不是重新打开 */
     if (g_trace_file) {
         RR_INFO("Trace file already open, rewinding to start");
@@ -343,6 +350,21 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
      * 🔥 修复：不跳过任何 syscall，与 record 策略保持一致
      */
 
+    /* ✅ 检查是否到达fork_point，关闭silent mode */
+    if (g_rr_framework->silent_replay_mode) {
+        uint32_t target_fork_point = g_rr_framework->checkpoint_target;
+        if (g_rr_framework->replay_index >= target_fork_point) {
+            g_rr_framework->silent_replay_mode = false;
+            RR_INFO("✅ [Hybrid] Reached fork_point[%u], switching to normal mode", target_fork_point);
+            
+            // ✅ 发送iteration消息
+            extern int g_dynamic_trace_pipe_fd;
+            if (g_dynamic_trace_pipe_fd >= 0) {
+                rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
+            }
+        }
+    }
+    
     /* 维护全局索引同步 - design.md的核心要求 */
     RR_VERBOSE("REPLAY_SYSCALL: replay_index=%u, g_current_record=%p", g_rr_framework->replay_index, g_current_record);
     if (g_rr_framework->replay_index == 0 || !g_current_record) {
@@ -354,6 +376,26 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
             /* EnvFuzz风格：找不到record时，不崩溃，真实执行 */
             RR_WARN("REPLAY_SYSCALL: End of trace at index %u for syscall %d, executing directly", 
                     g_rr_framework->replay_index, num);
+            
+            /* ✅ 修复：真实执行也要发送dynamic trace！*/
+            extern bool g_dynamic_trace_enabled;
+            extern int g_dynamic_trace_pipe_fd;
+            RR_INFO("🔍 About to send dynamic trace: silent=%d, enabled=%d, pipe_fd=%d",
+                    g_rr_framework->silent_replay_mode, g_dynamic_trace_enabled, g_dynamic_trace_pipe_fd);
+            if (!g_rr_framework->silent_replay_mode) {
+                uint64_t args_copy[8];
+                for (int i = 0; i < 8; i++) {
+                    args_copy[i] = ((uint64_t*)args)[i];
+                }
+                rr_dynamic_trace_syscall_enter(env, num, args_copy, 
+                                                g_rr_framework->replay_index, false);
+                RR_INFO("✅ Sent dynamic trace for syscall %d at index %u",
+                        num, g_rr_framework->replay_index);
+            }
+            
+            /* ✅ 递增replay_index（即使真实执行也要计数）*/
+            g_rr_framework->replay_index++;
+            
             return -1;  /* 真实执行系统调用 */
         }
         RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",

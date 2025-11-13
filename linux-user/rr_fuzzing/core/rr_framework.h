@@ -81,17 +81,37 @@ typedef struct {
 } FuzzInstruction;
 
 /**
+ * 单个variant的mutation instructions
+ */
+typedef struct {
+    uint32_t instruction_count;         // 该variant的指令数量
+    FuzzInstruction instructions[32];   // 指令数组
+} FuzzVariant;
+
+/**
  * 共享内存协议结构
  * 添加序列号防止并发读写冲突
+ * ✅ 扩展支持批量variants（用于动态fork）
+ * ✅ 扩展支持嵌套fork（depth字段）
  */
 typedef struct {
     uint32_t magic;                     // 魔数：0x46555A5A ("FUZZ")
     uint32_t sequence;                  // 序列号（每次写入递增，用于检测更新）
-    uint32_t instruction_count;         // 指令数量
-    uint32_t checksum;                  // 简单校验和（magic ^ sequence ^ instruction_count）
-    uint32_t flags;                     // 控制标志（Phase 3: bit 0 = capture_seed）
-    uint32_t reserved[3];               // 保留字段
+    uint32_t num_variants;              // Variant数量（复用原instruction_count字段）
+    uint32_t checksum;                  // 简单校验和（magic ^ sequence ^ num_variants ^ fork_point ^ depth）
+    uint32_t iteration_id;              // Iteration编号（复用原flags字段）
+    uint32_t reserved_1;                // 保留字段
+    
+    // ✅ 新增：嵌套fork支持
+    uint32_t fork_point;                // Fork点（0=从头，N=mid-point）
+    uint32_t current_depth;             // 当前fork深度（0=顶层，1=一级嵌套，...）
+    uint32_t reserved_2;                // 保留字段
+    
+    // 单variant模式（兼容）
     FuzzInstruction instructions[32];   // 指令数组（最多32条）
+    
+    // ✅ 批量variant模式
+    FuzzVariant variants[10];           // 最多10个variants
 } FuzzSharedMemory;
 
 /* Phase 3: FuzzSharedMemory flags位定义 */
@@ -181,6 +201,22 @@ typedef struct {
     /* Fork Server */
     bool fork_server_active;            // Fork Server是否活跃
     pid_t child_pid;                    // 子进程PID
+    
+    /* ✅ 新增：Checkpoint机制 */
+    uint32_t checkpoint_target;         // Checkpoint目标index（0表示无checkpoint）
+    bool at_checkpoint;                 // 是否已到达checkpoint
+    
+    /* ✅ 新增：嵌套fork支持 */
+    bool is_autonomous_child;           // 是否是自治子进程（会自动在IO点fork）
+    uint32_t current_depth;             // 当前fork深度
+    uint32_t forks_this_iteration;      // 本iteration已fork次数
+    uint32_t current_iteration_id;      // 当前iteration ID
+    
+    /* ✅ 新增：Silent replay支持（真正的mid-point fork） */
+    bool silent_replay_mode;            // true=快速replay到fork_point，不发送dynamic trace
+    
+    /* ✅ 新增：Baseline mode支持（只执行到第一个fork point） */
+    bool baseline_mode;                 // true=执行到第一个fork point就exit
 
     /* 统计信息 */
     uint64_t total_syscalls;            // 总系统调用数
@@ -280,6 +316,18 @@ bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_
 bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long ret);
 int rr_fork_server_loop(void);
 void rr_reset_fork_point(void);
+
+/* ✅ 新增：嵌套fork支持 */
+bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long ret);
+void rr_autonomous_nested_fork(int fork_index);
+bool is_io_syscall(int syscall_nr);
+
+/* ✅ 新增：Checkpoint模块 */
+int rr_save_lightweight_checkpoint(uint32_t index);
+int rr_restore_lightweight_checkpoint(void);
+int rr_checkpoint_fork_simple(uint32_t checkpoint_index);
+bool rr_is_at_checkpoint(void);
+void rr_clear_checkpoint(void);
 
 /* IPC模块 */
 int rr_ipc_init(void);

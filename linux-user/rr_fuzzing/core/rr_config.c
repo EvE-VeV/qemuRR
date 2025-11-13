@@ -255,7 +255,17 @@ int rr_config_init(void)
         load_config_file(config_file);
     }
 
-    /* 环境变量可以覆盖配置文件 */
+    /* ✅ FIX: 检查RR_MODE，如果设置了就自动启用 */
+    const char *mode_str = getenv("RR_MODE");
+    if (mode_str) {
+        g_rr_config.mode = parse_mode(mode_str);
+        /* 如果设置了mode，自动启用RR-Fuzz */
+        if (g_rr_config.mode != RR_MODE_DISABLED) {
+            g_rr_config.enabled = true;
+        }
+    }
+    
+    /* 环境变量可以覆盖配置文件和自动启用 */
     const char *rr_enabled = getenv("RR_FUZZING_ENABLED");
     if (rr_enabled) {
         g_rr_config.enabled = parse_bool(rr_enabled, g_rr_config.enabled);
@@ -264,12 +274,6 @@ int rr_config_init(void)
     if (!g_rr_config.enabled) {
         RR_INFO("RR-Fuzz disabled via configuration");
         return 0;
-    }
-
-    /* 环境变量覆盖其他配置 */
-    const char *mode_str = getenv("RR_MODE");
-    if (mode_str) {
-        g_rr_config.mode = parse_mode(mode_str);
     }
 
     const char *trace_file = getenv("RR_TRACE_FILE");

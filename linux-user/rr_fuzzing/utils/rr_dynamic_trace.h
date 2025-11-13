@@ -21,7 +21,8 @@ typedef enum {
     RR_DYN_MSG_EXEC = 3,
     RR_DYN_MSG_EXIT = 4,
     RR_DYN_MSG_INIT = 5,
-    RR_DYN_MSG_CLEANUP = 6
+    RR_DYN_MSG_CLEANUP = 6,
+    RR_DYN_MSG_ITERATION = 7    /* ✅ 新增：iteration开始事件 */
 } rr_dynamic_msg_type_t;
 
 /* 系统调用信息 */
@@ -58,8 +59,14 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
 void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args, 
                                     int32_t ret, uint32_t trace_index, uint8_t is_fuzzed);
 void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t fork_syscall_index);
+void rr_dynamic_trace_iteration(uint32_t iteration_id, uint32_t pid);  /* ✅ 新增 */
 void rr_dynamic_trace_exec(uint32_t pid);
 void rr_dynamic_trace_exit(uint32_t pid, int exit_code);
+void rr_dynamic_trace_enable_in_child(void);  /* 在fork子进程中重新启用trace */
+
+/* 全局变量声明 - 允许直接访问 */
+extern int g_dynamic_trace_pipe_fd;
+extern bool g_dynamic_trace_enabled;
 
 #ifdef __cplusplus
 }

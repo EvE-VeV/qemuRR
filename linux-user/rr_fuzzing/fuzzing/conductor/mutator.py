@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Mutator - Mutation Engine (Layer 2)
+变异器 - 变异引擎 (第2层)
 
-Provides base and smart mutation capabilities:
-- BaseMutator: Simple random mutation
-- SmartMutator: Intelligent mutation with trace analysis and recipe support
-
-Architecture: DETAILED_ARCHITECTURE.md Layer 2 (Line 87-106, 293-315)
+提供基础和智能变异能力:
+- BaseMutator: 简单随机变异
+- SmartMutator: 基于trace分析的智能变异和recipe支持
 """
 
 import os
@@ -17,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-# Add analysis directory to path for trace_analyzer import
+# 将分析目录添加到路径以导入trace_analyzer
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
 
 from .constants import (
@@ -25,49 +23,58 @@ from .constants import (
     FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
     FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
     FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
-    INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS
+    INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
+    PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS
 )
 from .instruction import FuzzInstruction
 
 
 class BaseMutator:
     """
-    Base Mutation Engine (Simple Random Mutation)
+    基础变异引擎 (简单随机变异)
     
-    Provides basic random mutation without trace analysis.
-    Used as fallback or for standalone fuzzing.
+    提供不需要trace分析的基础随机变异。
+    用作备用方案或独立fuzzing。
     
-    Architecture: DETAILED_ARCHITECTURE.md Line 87-106
+    架构: DETAILED_ARCHITECTURE.md 第87-106行
     """
     
     def __init__(self):
-        """Initialize BaseMutator"""
+        """初始化BaseMutator"""
         self.iteration_count = 0
-        print("[BaseMutator] Initialized (random mutation mode)")
+        print("[BaseMutator] 已初始化 (随机变异模式)")
     
-    def mutate(self, trace) -> List[FuzzInstruction]:
+    def mutate(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
         """
-        Generate random mutations
+        生成随机变异
         
-        Args:
-            trace: Trace object (may be None for BaseMutator)
+        参数:
+            trace: Trace对象 (对于BaseMutator可能为None)
+            fork_point: Syscall index of fork point (for compatibility with SmartMutator)
         
-        Returns:
-            List of FuzzInstructions
-        
-        Architecture: DETAILED_ARCHITECTURE.md Line 90-101
+        返回:
+            FuzzInstruction列表
         """
         self.iteration_count += 1
         
-        # Generate 1-3 random mutations
+        # 生成1-3个随机变异
         num_mutations = random.randint(1, 3)
         instructions = []
         
-        for _ in range(num_mutations):
-            # Random syscall index (0-99)
-            syscall_index = random.randint(0, 99)
+        for i in range(num_mutations):
+            # 🔥 修复：如果指定了fork_point，第一个mutation目标是fork_point
+            if i == 0 and fork_point is not None:
+                syscall_index = fork_point
+                print(f"[BaseMutator] Mutation {i+1} targeting fork_point={fork_point}")
+            else:
+                # 随机syscall索引，但确保 >= fork_point (如果指定)
+                if fork_point is not None:
+                    syscall_index = random.randint(fork_point, max(fork_point + 20, 99))
+                else:
+                    syscall_index = random.randint(0, 99)
+                print(f"[BaseMutator] Mutation {i+1} targeting random syscall_index={syscall_index}")
             
-            # Random mutation type
+            # 随机变异类型
             mutation_types = [
                 FUZZ_CMD_FLIP_BITS,
                 FUZZ_CMD_INTERESTING_VALUES,
@@ -77,7 +84,7 @@ class BaseMutator:
             ]
             cmd = random.choice(mutation_types)
             
-            # Generate random data
+            # 生成随机数据
             if cmd == FUZZ_CMD_FLIP_BITS:
                 data = struct.pack('I', random.randint(1, 8))
             elif cmd == FUZZ_CMD_INTERESTING_VALUES:
@@ -100,168 +107,361 @@ class BaseMutator:
             )
             instructions.append(instruction)
         
-        return instructions
+        return instructions  # 这个是给Qemu读取的内容，以FuzzInstruction包装这样的一个Fuzz指令
 
 
 class SmartMutator:
     """
-    Smart Mutation Engine
+    智能变异引擎
     
-    Analyzes trace files, filters mutable syscalls, and generates intelligent
-    mutation instructions using multiple strategies.
+    分析trace文件，过滤可变异的syscall，并使用多种策略
+    生成智能变异指令。
     """
     
-    def __init__(self, trace_file, recipe_file=None):
+    # 类级别缓存，避免重复解析相同的trace
+    _trace_cache = {}  # {trace_file: TraceAnalyzer}
+    
+    def __init__(self, trace_file, recipe_file=None, target_binary=None):
         """
-        Initialize SmartMutator
-        
-        Args:
-            trace_file: Trace file path
-            recipe_file: Recipe file path (optional, Phase 2)
+        初始化SmartMutator
+
+        参数:
+            trace_file: Trace文件路径
+            recipe_file: Recipe文件路径 (可选, 第2阶段)
+            target_binary: 目标二进制文件路径 (用于PathFinder CFG分析)
         """
-        # ✅ Fix: Auto-parse using fixed TraceAnalyzer
-        print(f"[Mutator] Analyzing trace file: {trace_file}")
+        # 如果可用则使用缓存的TraceAnalyzer
+        if trace_file in SmartMutator._trace_cache:
+            print(f"[Mutator] 使用缓存的分析结果: {trace_file}")
+            self.analyzer = SmartMutator._trace_cache[trace_file]
+        else:
+            # 使用修复后的TraceAnalyzer自动解析
+            print(f"[Mutator] 分析trace文件: {trace_file}")
+            
+            # 导入并使用修复后的TraceAnalyzer
+            from trace_analyzer import TraceAnalyzer
+            
+            # TraceAnalyzer在__init__中自动调用analyze()
+            self.analyzer = TraceAnalyzer(trace_file)
+            
+            # 缓存以供将来使用
+            SmartMutator._trace_cache[trace_file] = self.analyzer
         
-        # Import and use fixed TraceAnalyzer
-        from trace_analyzer import TraceAnalyzer
-        
-        self.analyzer = TraceAnalyzer(trace_file)
-        if not self.analyzer.analyze():
-            raise RuntimeError(f"Failed to analyze trace: {trace_file}")
-        
-        # Get all pure syscalls (syscalls with aux_data)
+        # 获取所有纯重放syscall (带aux_data的syscall)
         pure_syscalls = self.analyzer.get_pure_syscalls()
         
-        # Define Candidate class
+        # 定义Candidate类
         class Candidate:
             def __init__(self, index, name, nr):
                 self.index = index
                 self.name = name
                 self.syscall_nr = nr
         
-        # Convert to Candidate objects
+        # 转换为Candidate对象
         self.pure_candidates = [
             Candidate(sc.index, sc.name, sc.syscall_nr)
             for sc in pure_syscalls
         ]
         
-        # Get hybrid syscalls (syscalls without aux_data)
+        # 获取混合重放syscall (不带aux_data的syscall)
         hybrid_syscalls = self.analyzer.get_hybrid_syscalls()
         self.hybrid_candidates = [
             Candidate(sc.index, sc.name, sc.syscall_nr)
             for sc in hybrid_syscalls
         ]
         
-        # Save all syscalls for later use
+        # 保存所有syscall以备后用
         self.syscalls = self.analyzer.syscalls
         
-        print(f"[Mutator] ✅ Found {len(self.pure_candidates)} pure replay syscalls:")
-        for cand in self.pure_candidates[:10]:  # Only print first 10
+        # 这些其实也需要删除
+        print(f"[Mutator] 发现 {len(self.pure_candidates)} 个纯重放syscall:")
+        for cand in self.pure_candidates[:10]:  # 只打印前10个
             print(f"[Mutator]   index={cand.index}, name={cand.name}, nr={cand.syscall_nr}")
         if len(self.pure_candidates) > 10:
-            print(f"[Mutator]   ... and {len(self.pure_candidates) - 10} more")
+            print(f"[Mutator]   ... 以及 {len(self.pure_candidates) - 10} 个更多")
         
-        # Phase 1: Filter non-mutable syscalls
+        # 第1阶段: 过滤不可变异的syscall
         self.mutable_candidates = self._filter_mutable_candidates()
         
-        # ━━━━ Phase 2: Recipe-driven mode ━━━━
+        # ━━━━ 第2阶段: PathFinder & Recipe驱动模式 ━━━━
         self.recipes = []
         self.recipe_mode = False
+        self.path_finder = None
+        self.target_binary = target_binary
+
+        # PathFinder集成（自动recipe生成）
+        if target_binary:
+            self._init_pathfinder(trace_file, target_binary)
+
+        # 手动recipe文件加载
         if recipe_file and os.path.exists(recipe_file):
             self._load_recipes(recipe_file)
             self.recipe_mode = True
-            print(f"[Mutator] 🧪 Recipe-driven mode enabled ({len(self.recipes)} recipes loaded)")
+            print(f"[Mutator] 🧪 Recipe驱动模式已启用 (手动:{len(self.recipes)}个recipes)")
+
+        # 尝试从PathFinder自动生成recipes
+        auto_recipes = self._generate_automatic_recipes()
+        if auto_recipes:
+            self.recipes.extend(auto_recipes)
+            print(f"[Mutator] 🤖 自动生成{len(auto_recipes)}个recipes (总计:{len(self.recipes)}个)")
+
+        if len(self.recipes) > 0:
+            self.recipe_mode = True
+            print(f"[Mutator] 🧪 Recipe驱动模式已启用 (总计:{len(self.recipes)}个recipes)")
         else:
-            print(f"[Mutator] 🎲 Random mutation mode (no recipe file provided)")
+            print(f"[Mutator] 🎲 随机变异模式 (未提供recipe文件且自动生成失败)")
+        
+        # P1修复: 停滞检测（Stagnation Detection）
+        self.last_new_coverage_iter = 0  # 上次发现新coverage的迭代
+        self.stagnation_threshold = 1000  # 🔥 提高阈值: 1000次迭代无新coverage = 停滞
+        self.is_stagnant = False  # 当前是否停滞
+        self.total_iterations = 0  # 总迭代次数
+        print(f"[Mutator] 🔍 停滞检测已启用 (阈值={self.stagnation_threshold} 次迭代)")
     
     def _should_skip_mutation(self, syscall_info, index):
         """
-        Determine whether to skip this syscall's mutation
+        判断是否应该跳过该syscall的变异
         
-        Args:
-            syscall_info: System call information object
-            index: Index position in trace
+        参数:
+            syscall_info: 系统调用信息对象
+            index: 在trace中的索引位置
         
-        Returns:
-            bool: True means skip, False means can mutate
+        返回:
+            bool: True表示跳过, False表示可以变异
         """
         syscall_name = getattr(syscall_info, 'name', '').lower()
         
-        # 🔥 Critical fix: Important IO syscalls never skip
+        # 重要的IO syscall永不跳过
         if syscall_name in IMPORTANT_SYSCALLS:
-            print(f"[Mutator] ✅ Keeping important IO syscall: {syscall_name} (index={index})")
-            return False  # Never skip
+            print(f"[Mutator] 保留重要的IO syscall: {syscall_name} (index={index})")
+            return False  # 永不跳过
         
-        # 1. Skip critical syscalls in initialization phase (use dynamic threshold)
-        # Note: dynamic_threshold will be set by Conductor during first fuzzing
+        # 在初始化阶段跳过关键syscall (使用动态阈值)
+        # 注意: dynamic_threshold将在第一次fuzzing时由Conductor设置
         threshold = getattr(self, 'dynamic_threshold', INIT_PHASE_THRESHOLD)
         if index < threshold:
             if any(init_sc in syscall_name for init_sc in INIT_SYSCALLS):
-                print(f"[Mutator] ⏭️  Skipping init syscall: {syscall_name} (index={index}, threshold={threshold})")
+                print(f"[Mutator] ⏭️  跳过初始化syscall: {syscall_name} (index={index}, threshold={threshold})")
                 return True
         
-        # 2. Skip syscalls without mutable data (can be extended later)
-        # Currently TraceAnalyzer has filtered out pure/hybrid candidates
+        # 2. 跳过没有可变异数据的syscall (以后可以扩展)
+        # 当前TraceAnalyzer已经过滤出了pure/hybrid候选
         
         return False
     
     def _filter_mutable_candidates(self):
         """
-        Filter out truly mutable candidates
-        
-        Returns:
-            list: List of safely mutable syscall candidates
+        过滤出真正可变异的候选 - 扩展策略保留更多候选
+
+        🔥 P0修复: 扩展候选池 (4个 → 15个+)
+
+        新设计原则：
+        1. 只排除明确危险的syscalls (FORBIDDEN_MUTATION_SYSCALLS)
+        2. 保留所有safe的syscalls，不只是IO
+        3. 优先级分层：Important > Primary IO > Secondary IO > Others
+
+        返回:
+            list: 安全可变异的syscall候选列表
         """
-        mutable = []
-        
-        # Merge pure and hybrid candidates
+        important = []   # 重要的syscalls (必须mutate)
+        primary_io = []  # Primary IO syscalls
+        secondary_io = [] # Secondary IO syscalls
+        others = []      # 其他安全的syscalls
+
         all_candidates = list(self.pure_candidates) + list(self.hybrid_candidates)
-        
-        print(f"[Mutator] 📋 Filtering {len(all_candidates)} candidates...")
-        
+
+        print(f"[Mutator] Filtering {len(all_candidates)} candidates (Enhanced mode)...")
+
         for candidate in all_candidates:
-            if not self._should_skip_mutation(candidate, candidate.index):
-                mutable.append(candidate)
-        
-        print(f"[Mutator] ✅ Filtered result: {len(mutable)} mutable candidates")
-        print(f"[Mutator] 📝 Mutable candidates:")
-        for i, cand in enumerate(mutable):
-            print(f"[Mutator]   [{i}] index={cand.index}, name={cand.name}")
-        
+            syscall_name = candidate.name
+
+            # 1. 跳过禁止的syscalls (内存管理、信号、进程控制)
+            if syscall_name in FORBIDDEN_MUTATION_SYSCALLS:
+                continue
+
+            # 2. 跳过初始化阶段的关键syscalls
+            if self._should_skip_mutation(candidate, candidate.index):
+                continue
+
+            # 3. 🔥 新策略: 按优先级分类，但保留所有safe的syscalls
+            if syscall_name in IMPORTANT_SYSCALLS:
+                important.append(candidate)
+            elif syscall_name in PRIMARY_IO_SYSCALLS:
+                primary_io.append(candidate)
+            elif syscall_name in SECONDARY_IO_SYSCALLS:
+                secondary_io.append(candidate)
+            else:
+                # 🔥 关键改进: 保留其他syscalls (之前被丢弃)
+                others.append(candidate)
+
+        # 🔥 按优先级合并，保留所有候选
+        mutable = important + primary_io + secondary_io + others
+
+        print(f"[Mutator] Enhanced syscall candidates:")
+        print(f"  Important:    {len(important)} syscalls")
+        if important:
+            print(f"    Examples: {[f'{c.name}@{c.index}' for c in important[:3]]}")
+        print(f"  Primary IO:   {len(primary_io)} syscalls")
+        if primary_io:
+            print(f"    Examples: {[f'{c.name}@{c.index}' for c in primary_io[:3]]}")
+        print(f"  Secondary IO: {len(secondary_io)} syscalls")
+        if secondary_io:
+            print(f"    Examples: {[f'{c.name}@{c.index}' for c in secondary_io[:3]]}")
+        print(f"  Others:       {len(others)} syscalls")
+        if others:
+            print(f"    Examples: {[f'{c.name}@{c.index}' for c in others[:3]]}")
+        print(f"  Total mutable: {len(mutable)} syscalls (was {len(primary_io) + len(secondary_io)} in old version)")
+
+        if len(mutable) == 0:
+            print(f"[Mutator] WARNING: No syscalls found for mutation!")
+            print(f"[Mutator] All candidates: {[(c.name, c.index) for c in all_candidates[:10]]}")
+
         return mutable
-    
+
+    def _init_pathfinder(self, trace_file, target_binary):
+        """
+        初始化PathFinder进行CFG分析
+        """
+        try:
+            # 尝试导入PathFinder
+            import sys
+            from pathlib import Path
+
+            # 添加multiprocess目录到路径
+            multiprocess_dir = Path(__file__).parent.parent / "multiprocess"
+            if str(multiprocess_dir) not in sys.path:
+                sys.path.insert(0, str(multiprocess_dir))
+
+            from path_finder import PathFinder, PathFinderConfig
+
+            # 创建配置（保守设置）
+            config = PathFinderConfig(
+                verbose=False,
+                timeout=30,  # 30秒超时
+                max_cfg_nodes=5000,  # 限制节点数
+                graceful_disable=True,  # 出错时禁用而不是抛异常
+                enable_auto_fast_mode=True  # 自动简化模式
+            )
+
+            # 初始化PathFinder
+            self.path_finder = PathFinder(target_binary, config)
+            print(f"[Mutator] ✅ PathFinder已初始化")
+
+            # 尝试从trace构建动态CFG
+            if self.path_finder.build_from_trace(trace_file):
+                print(f"[Mutator] ✅ PathFinder动态CFG已构建")
+            else:
+                print(f"[Mutator] ⚠️  PathFinder动态CFG构建失败")
+
+        except Exception as e:
+            print(f"[Mutator] ⚠️  PathFinder初始化失败: {e}")
+            self.path_finder = None
+
+    def _generate_automatic_recipes(self):
+        """
+        从PathFinder自动生成recipes
+        """
+        if not self.path_finder or not self.path_finder.is_available():
+            return []
+
+        try:
+            # 分析未覆盖的分支（简化版本，基于动态CFG）
+            uncovered_branches = self._find_uncovered_branches()
+            if not uncovered_branches:
+                print(f"[Mutator] 📊 PathFinder未发现未覆盖分支")
+                return []
+
+            print(f"[Mutator] 📊 PathFinder发现{len(uncovered_branches)}个未覆盖分支")
+
+            # 生成recipes
+            raw_recipes = self.path_finder.generate_recipes(uncovered_branches, max_recipes=10)
+
+            # 转换为我们的格式
+            auto_recipes = []
+            for recipe in raw_recipes:
+                recipe_dict = {
+                    'source_branch': recipe.source_branch,
+                    'target_branch': recipe.target_branch,
+                    'mutation_type': recipe.mutation_type,
+                    'syscall_index': recipe.syscall_index,
+                    'syscall_name': recipe.syscall_name,
+                    'arg_index': recipe.arg_index,
+                    'suggested_values': recipe.suggested_values,
+                    'priority': recipe.priority,
+                    'reason': f"PathFinder自动生成: {recipe.reason}"
+                }
+                auto_recipes.append(recipe_dict)
+
+            return auto_recipes
+
+        except Exception as e:
+            print(f"[Mutator] ⚠️  PathFinder recipe生成失败: {e}")
+            return []
+
+    def _find_uncovered_branches(self):
+        """
+        基于动态CFG找到未覆盖的分支（简化实现）
+        """
+        if not self.path_finder:
+            return []
+
+        uncovered = []
+
+        # 简化逻辑：遍历所有动态节点，寻找只有一个出边的节点
+        # 这些节点可能有未探索的分支
+        for node_id, edges in self.path_finder.dynamic_edges.items():
+            if len(edges) == 1:  # 只有一个出边，可能有另一个分支未探索
+                edge = list(edges)[0]
+                # 构造一个假设的未覆盖分支
+                uncovered_branch = {
+                    'from': self.path_finder.dynamic_nodes.get(node_id, node_id),
+                    'to': self.path_finder.dynamic_nodes.get(edge, edge),
+                    'type': 'conditional',
+                    'has_syscall': node_id in self.path_finder.dynamic_syscalls,
+                    'distance': 1  # 简化距离计算
+                }
+
+                # 如果这个节点有syscall信息，添加到分支信息中
+                if node_id in self.path_finder.dynamic_syscalls:
+                    uncovered_branch['syscalls'] = self.path_finder.dynamic_syscalls[node_id]
+
+                uncovered.append(uncovered_branch)
+
+        # 限制数量，避免生成太多recipes
+        return uncovered[:15]
+
     def _load_recipes(self, recipe_file):
         """
-        Load recipes from JSON file
+        从JSON文件加载recipe
         
-        Args:
-            recipe_file: Recipe file path (recipes.json)
+        参数:
+            recipe_file: Recipe文件路径 (recipes.json)
         """
         try:
             with open(recipe_file, 'r') as f:
                 data = json.load(f)
             
             self.recipes = data.get('recipes', [])
-            print(f"[Mutator] Loaded {len(self.recipes)} recipes from {recipe_file}")
+            print(f"[Mutator] 从 {recipe_file} 加载了 {len(self.recipes)} 个recipe")
             
-            # Print first few recipes
+            # 打印前几个recipe, 这些需要删除后面
             for i, recipe in enumerate(self.recipes[:5]):
                 print(f"[Mutator]   Recipe {i}: {recipe['source_branch']} -> {recipe['target_branch']}, "
                       f"syscall_idx={recipe['syscall_index']}, type={recipe['mutation_type']}")
             
         except Exception as e:
-            print(f"[Mutator] ⚠️  Failed to load recipes: {e}")
+            print(f"[Mutator] ⚠️  加载recipe失败: {e}")
             self.recipes = []
     
     def _recipe_to_instruction(self, recipe):
         """
-        Convert recipe to FuzzInstruction
+        将recipe转换为FuzzInstruction
         
-        Args:
-            recipe: Recipe dictionary (from recipes.json)
+        参数:
+            recipe: Recipe字典 (来自recipes.json)
         
-        Returns:
-            FuzzInstruction or None
+        返回:
+            FuzzInstruction 或 None
         """
         try:
             syscall_index = recipe['syscall_index']
@@ -270,7 +470,7 @@ class SmartMutator:
             size = recipe.get('size', 4)
             data_template = recipe.get('data_template', 'RANDOM')
             
-            # Generate actual data based on data_template
+            # 基于data_template生成实际数据
             if data_template == 'RANDOM':
                 mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
             elif data_template == 'ZERO':
@@ -282,17 +482,17 @@ class SmartMutator:
                 mutation_data = ascii_data.encode('utf-8')
                 size = len(mutation_data)
             elif data_template.startswith('0x'):
-                # Hexadecimal value
+                # 十六进制值
                 val = int(data_template, 16)
                 mutation_data = struct.pack('Q', val)[:size]
             else:
-                # Default random
+                # 默认随机
                 mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
             
-            # Select command based on mutation_type
+            # 基于mutation_type选择命令
             if mutation_type == 'buffer_overwrite':
-                # Phase 2 new: Use FUZZ_CMD_OVERWRITE_AT_OFFSET
-                # Use offset and size from recipe to create precise overwrite instruction
+                # 第2阶段新功能: 使用FUZZ_CMD_OVERWRITE_AT_OFFSET
+                # 使用recipe中的offset和size创建精确的覆写指令
                 instr = FuzzInstruction(
                     syscall_index, 
                     FUZZ_CMD_OVERWRITE_AT_OFFSET, 
@@ -307,237 +507,520 @@ class SmartMutator:
             elif mutation_type == 'size_modify':
                 return FuzzInstruction(syscall_index, FUZZ_CMD_BOUNDARY_VALUE, 0, mutation_data, 0, size)
             else:
-                # Default use buffer replacement
+                # 默认使用缓冲区替换
                 return FuzzInstruction(syscall_index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data, 0, size)
                 
         except Exception as e:
-            print(f"[Mutator] ⚠️  Failed to convert recipe to instruction: {e}")
+            print(f"[Mutator] ⚠️  将recipe转换为指令失败: {e}")
             return None
     
     def _build_from_recipes(self, iteration):
         """
-        Generate Fuzz instructions from recipes
+        从recipe生成Fuzz指令
         
-        Args:
-            iteration: Current iteration number
+        参数:
+            iteration: 当前迭代次数
         
-        Returns:
-            list: FuzzInstruction list
+        返回:
+            list: FuzzInstruction列表
         """
         instrs = []
         
-        # Select recipe (cycle through)
+        # 选择recipe (循环使用)
         recipe_idx = iteration % len(self.recipes)
         recipe = self.recipes[recipe_idx]
         
-        print(f"[Mutator] 🧪 Using recipe {recipe_idx}/{len(self.recipes)}: "
+        # 记录使用的recipe（用于反馈）
+        self.last_recipe_used = recipe
+        
+        print(f"[Mutator] 🧪 使用recipe {recipe_idx}/{len(self.recipes)}: "
               f"{recipe['source_branch']} -> {recipe['target_branch']}")
         
-        # Convert to instruction
+        # 转换为指令
         instr = self._recipe_to_instruction(recipe)
         if instr:
             instrs.append(instr)
-            print(f"[Mutator]   Generated instruction: syscall_idx={recipe['syscall_index']}, "
+            print(f"[Mutator]   生成指令: syscall_idx={recipe['syscall_index']}, "
                   f"cmd={recipe['mutation_type']}")
         
         return instrs
     
+    def update_stagnation_status(self, iteration: int, has_new_coverage: bool):
+        """
+        P1修复: 更新停滞检测状态
+        
+        参数:
+            iteration: 当前迭代次数
+            has_new_coverage: 本次迭代是否发现新coverage
+        """
+        self.total_iterations = iteration
+        
+        if has_new_coverage:
+            # 发现新coverage，重置停滞计数
+            self.last_new_coverage_iter = iteration
+            was_stagnant = self.is_stagnant
+            self.is_stagnant = False
+            
+            if was_stagnant:
+                print(f"[Mutator] 在迭代{iteration}从停滞中恢复!")
+        else:
+            # 检查是否进入停滞
+            stagnation_duration = iteration - self.last_new_coverage_iter
+            
+            if stagnation_duration >= self.stagnation_threshold:
+                if not self.is_stagnant:
+                    # 首次进入停滞状态
+                    self.is_stagnant = True
+                    print(f"[Mutator] ⚠️  在迭代{iteration}检测到停滞!")
+                    print(f"[Mutator]   已{stagnation_duration}次迭代无新coverage")
+                    print(f"[Mutator]   切换到激进变异模式...")
+    
+    def _select_mutation_strategy(self):
+        """
+        使用平衡化概率选择变异策略
+
+        新设计原则：
+        1. 平衡各种漏洞类型的发现能力
+        2. 避免过度偏向单一漏洞类型
+        3. 支持多样化的变异模式
+
+        返回:
+            int: 策略类型 (0-10)
+        """
+        if self.is_stagnant:
+            # 🔥 停滞模式：更激进的策略分布
+            strategy_weights = [
+                8,   # 0: FLIP_BITS (位翻转) - 减少轻量变异
+                15,  # 1: INTERESTING_VALUES (特殊值) - 增强整数溢出发现
+                12,  # 2: TRUNCATE (截断) - 平衡
+                20,  # 3: EXTEND (扩展) - 保持缓冲区溢出能力但降低权重
+                5,   # 4: LIGHT_MUTATION (轻量变异) - 减少
+                10,  # 5: MUTATE_AUX_BUFFER (辅助缓冲区变异)
+                8,   # 6: REPLACE_BUFFER (小缓冲区替换)
+                12,  # 7: REPLACE_BUFFER (大缓冲区替换) - 显著降低
+                12,  # 8: BOUNDARY_VALUE (边界值) - 增强
+                10,  # 9: MUTATE_FLAGS (标志变异) - 增强
+                8,   # 10: OVERWRITE_AT_OFFSET (偏移覆写)
+            ]
+        else:
+            # 🎯 常规模式：平衡化策略分布
+            strategy_weights = [
+                12,  # 0: FLIP_BITS (位翻转) - 基础变异
+                12,  # 1: INTERESTING_VALUES (特殊值) - 整数漏洞
+                10,  # 2: TRUNCATE (截断) - 大小相关漏洞
+                14,  # 3: EXTEND (扩展) - 缓冲区溢出，权重大幅降低
+                8,   # 4: LIGHT_MUTATION (轻量变异) - 探索性变异
+                9,   # 5: MUTATE_AUX_BUFFER (辅助缓冲区变异) - 数据完整性
+                9,   # 6: REPLACE_BUFFER (小缓冲区替换) - 内容替换
+                10,  # 7: REPLACE_BUFFER (大缓冲区替换) - 权重大幅降低
+                10,  # 8: BOUNDARY_VALUE (边界值) - 边界条件漏洞
+                9,   # 9: MUTATE_FLAGS (标志变异) - 逻辑漏洞
+                7,   # 10: OVERWRITE_AT_OFFSET (偏移覆写) - 内存布局漏洞
+            ]
+
+        return random.choices(range(11), weights=strategy_weights)[0]
+    
     def _generate_advanced_mutation(self, target_candidate, strategy_type, iteration):
         """
-        Generate advanced mutation instruction (fully utilize 11 C-side mutation commands)
+        生成高级变异指令 (充分利用11个C端变异命令)
         
-        Args:
-            target_candidate: Target syscall candidate
-            strategy_type: Strategy type (0-10)
-            iteration: Iteration count
+        参数:
+            target_candidate: 目标syscall候选
+            strategy_type: 策略类型 (0-10)
+            iteration: 迭代计数
         
-        Returns:
-            FuzzInstruction: Generated mutation instruction
+        返回:
+            FuzzInstruction: 生成的变异指令
         """
         index = target_candidate.index
         
-        # Select mutation command based on strategy type
+        # 基于策略类型选择变异命令
         if strategy_type == 0:
-            # FLIP_BITS - Bit flipping (lightweight, keep most data unchanged)
-            num_flips = random.randint(1, 8)  # Flip 1-8 bits
+            # FLIP_BITS - 位翻转 (轻量级, 保持大部分数据不变)
+            num_flips = random.randint(1, 8)  # 翻转1-8个位
             mutation_data = struct.pack('I', num_flips)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=FLIP_BITS({num_flips} bits)")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=FLIP_BITS({num_flips} bits)")
             return FuzzInstruction(index, FUZZ_CMD_FLIP_BITS, 1, mutation_data)
         
         elif strategy_type == 1:
-            # INTERESTING_VALUES - Special value injection (boundary values, magic numbers, etc.)
-            interesting_values = [
-                0, 1, -1,                           # Basic boundaries
-                0x7F, 0x80, 0xFF,                   # 8-bit boundaries
-                0x7FFF, 0x8000, 0xFFFF,             # 16-bit boundaries
-                0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, # 32-bit boundaries
-                0x100, 0x400, 0x1000,               # Page size related
-            ]
-            value = random.choice(interesting_values)
-            mutation_data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=INTERESTING_VALUES(0x{value:x})")
+            # INTERESTING_VALUES - 智能特殊值注入 (根据系统调用类型选择)
+            syscall_name = target_candidate.name.lower()
+
+            if 'read' in syscall_name or 'recv' in syscall_name:
+                # 输入系统调用：使用多种攻击模式
+                pattern_type = random.randint(0, 7)  # 8种模式 (对应C端switch)
+                secondary_param = random.randint(0, 255)
+                mutation_data = struct.pack('BB', pattern_type, secondary_param)
+                print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=INTERESTING_VALUES(vuln_pattern={pattern_type})")
+            else:
+                # 其他系统调用：使用传统边界值
+                interesting_values = [
+                    0, 1, -1,                           # 基本边界
+                    0x7F, 0x80, 0xFF,                   # 8位边界
+                    0x7FFF, 0x8000, 0xFFFF,             # 16位边界
+                    0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, # 32位边界
+                    0x100, 0x400, 0x1000,               # 页面大小相关
+                ]
+                value = random.choice(interesting_values)
+                mutation_data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
+                print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=INTERESTING_VALUES(0x{value:x})")
             return FuzzInstruction(index, FUZZ_CMD_INTERESTING_VALUES, 1, mutation_data)
         
         elif strategy_type == 2:
-            # TRUNCATE - Truncate data (reduce size)
+            # TRUNCATE - 截断数据 (减少大小)
             truncate_to = random.choice([0, 1, 2, 4, 8, 16])
             mutation_data = struct.pack('I', truncate_to)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=TRUNCATE(to {truncate_to})")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=TRUNCATE(to {truncate_to})")
             return FuzzInstruction(index, FUZZ_CMD_TRUNCATE, 1, mutation_data)
         
         elif strategy_type == 3:
-            # EXTEND - Extend data (increase size)
-            extend_by = random.choice([1, 4, 16, 64, 256])
+            # EXTEND - 扩展数据 (增加大小)
+            # 🔥 增强扩展值以触发缓冲区溢出
+            if self.is_stagnant or iteration % 10 == 0:
+                # 停滞模式或每10次迭代使用更激进的扩展
+                extend_by = random.choice([64, 128, 256, 512, 1024])
+            else:
+                # 常规模式使用温和的扩展
+                extend_by = random.choice([1, 4, 16, 32, 64, 128])
             mutation_data = struct.pack('I', extend_by)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=EXTEND(by {extend_by})")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=EXTEND(by {extend_by})")
             return FuzzInstruction(index, FUZZ_CMD_EXTEND, 1, mutation_data)
         
         elif strategy_type == 4:
-            # LIGHT_MUTATION - Lightweight mutation (only flip 1-2 bits)
+            # LIGHT_MUTATION - 轻量变异 (只翻转1-2位)
             num_flips = random.randint(1, 2)
             mutation_data = struct.pack('I', num_flips)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=LIGHT_MUTATION({num_flips} bits)")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=LIGHT_MUTATION({num_flips} bits)")
             return FuzzInstruction(index, FUZZ_CMD_LIGHT_MUTATION, 1, mutation_data)
         
         elif strategy_type == 5:
-            # MUTATE_AUX_BUFFER - Mutate aux_data buffer
-            # Randomly change a few bytes in the buffer
+            # MUTATE_AUX_BUFFER - 变异辅助缓冲区
+            # 随机修改缓冲区中的几个字节
             num_changes = random.randint(1, 8)
             mutation_data = struct.pack('I', num_changes) + bytes([random.randint(0, 255) for _ in range(num_changes)])
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=MUTATE_AUX_BUFFER({num_changes} bytes)")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=MUTATE_AUX_BUFFER({num_changes} bytes)")
             return FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, mutation_data)
         
         elif strategy_type == 6:
-            # REPLACE_BUFFER - Completely replace buffer (small data)
+            # REPLACE_BUFFER - 完全替换缓冲区 (小数据)
             size = random.choice([4, 8, 16, 32])
             mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes)")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes)")
             return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data)
         
         elif strategy_type == 7:
-            # REPLACE_BUFFER - Large data replacement (test overflow)
-            size = random.choice([64, 128, 256])
-            mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes, large)")
+            # REPLACE_BUFFER - 大数据替换 (测试溢出)
+            # 🔥 增强大缓冲区变异以触发缓冲区溢出
+            if self.is_stagnant or iteration % 15 == 0:
+                # 停滞模式或周期性使用超大缓冲区
+                size = random.choice([128, 256, 512, 1024])
+                # 使用特定模式来增加崩溃几率 (重复字符)
+                pattern = random.choice([b'A', b'B', b'X', b'\x41'])
+                mutation_data = pattern * size
+            else:
+                # 常规模式
+                size = random.choice([64, 128, 256])
+                mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes, large)")
             return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data)
         
         elif strategy_type == 8:
-            # BOUNDARY_VALUE - Boundary value testing
+            # BOUNDARY_VALUE - 边界值测试
             boundary_vals = [0, -1, 0x7FFFFFFF, 0xFFFFFFFF, 0x7FFFFFFFFFFFFFFF]
             value = random.choice(boundary_vals)
             mutation_data = struct.pack('q', value)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=BOUNDARY_VALUE(0x{value:x})")
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=BOUNDARY_VALUE(0x{value:x})")
             return FuzzInstruction(index, FUZZ_CMD_BOUNDARY_VALUE, 1, mutation_data)
         
         elif strategy_type == 9:
-            # Special character sequences (format strings, SQL injection, etc.)
-            special_patterns = [
-                b'%s%s%s%s%n',        # Format string
-                b"'; DROP TABLE --",   # SQL injection
-                b'<script>alert(1)</script>',  # XSS
-                b'/../../../etc/passwd',  # Path traversal
-                b'\x00' * 16,          # NULL bytes
-                b'\xFF' * 16,          # 0xFF bytes
-            ]
-            mutation_data = random.choice(special_patterns)
-            print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER(special pattern)")
+            # 🎯 多样化漏洞类型支持 - 特殊模式注入
+            vuln_patterns = {
+                'format_string': [
+                    b'%s%s%s%s%n',           # 格式化字符串
+                    b'%x%x%x%x%x%x',         # 堆栈泄露
+                    b'%p%p%p%p',             # 指针泄露
+                    b'%08x.%08x.%08x',       # 内存转储
+                ],
+                'injection': [
+                    b"'; DROP TABLE users;--",  # SQL注入
+                    b"' OR '1'='1",            # SQL绕过
+                    b"$(id)",                  # 命令注入
+                    b"`whoami`",               # 命令替换
+                    b"|cat /etc/passwd",       # 管道注入
+                ],
+                'path_traversal': [
+                    b'/../../../etc/passwd',    # 路径遍历
+                    b'..\\..\\..\\windows\\system32\\drivers\\etc\\hosts',  # Windows路径
+                    b'/proc/self/environ',      # 环境变量读取
+                    b'/dev/urandom',            # 特殊设备
+                ],
+                'overflow_patterns': [
+                    b'A' * 256,                 # 经典缓冲区溢出
+                    b'\x41' * 512 + b'\x42\x43\x44\x45',  # 带标记的溢出
+                    b'%n' * 100,                # 格式化字符串溢出
+                ],
+                'special_chars': [
+                    b'\x00' * 32,               # NULL字节注入
+                    b'\xFF' * 32,               # 高位字节
+                    b'\x0A\x0D' * 16,          # 换行符注入
+                    b'\x80\x81\x82\x83',       # 非ASCII字符
+                ],
+                'unicode_attacks': [
+                    b'\xC0\xAE\xC0\xAE\x2f',  # UTF-8溢出
+                    b'\xEF\xBB\xBF',          # BOM注入
+                    b'\x00\x41\x00\x42',      # 宽字符注入
+                ],
+                'race_condition': [
+                    b'AAAAAAAAAAAAAAAA',        # 重复模式用于竞态
+                    b'1234567890' * 10,        # 数字序列
+                    b'test\x00test\x00',       # 分隔符注入
+                ]
+            }
+
+            # 根据系统调用类型选择合适的漏洞模式
+            syscall_name = target_candidate.name.lower()
+
+            if 'read' in syscall_name or 'recv' in syscall_name:
+                # 输入相关系统调用：使用各种注入模式
+                pattern_type = random.choice(['format_string', 'injection', 'overflow_patterns', 'special_chars'])
+            elif 'write' in syscall_name or 'send' in syscall_name:
+                # 输出相关：测试格式化字符串和特殊字符
+                pattern_type = random.choice(['format_string', 'special_chars', 'unicode_attacks'])
+            elif 'open' in syscall_name:
+                # 文件操作：路径遍历攻击
+                pattern_type = random.choice(['path_traversal', 'special_chars'])
+            else:
+                # 其他系统调用：通用模式
+                pattern_type = random.choice(['overflow_patterns', 'special_chars', 'race_condition'])
+
+            mutation_data = random.choice(vuln_patterns[pattern_type])
+            print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=VULN_PATTERN({pattern_type})")
             return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data)
         
         else:
-            # MUTATE_FLAGS - Flag bit mutation
+            # MUTATE_FLAGS - 标志位变异
             if iteration % 3 == 0:
-                # Single bit flip
+                # 单位翻转
                 flag_mutation = struct.pack('q', (1 << (iteration % 32)))
-                print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(single bit)")
+                print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(single bit)")
             else:
-                # Multi-bit flip
+                # 多位翻转
                 flag_mutation = struct.pack('q', random.randint(0, 0xFFFFFFFF))
-                print(f"[Mutator]   🎯 Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(multi bits)")
+                print(f"[Mutator]   🎯 目标: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(multi bits)")
             return FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, flag_mutation)
     
-    def mutate(self, trace) -> List['FuzzInstruction']:
+    def mutate(self, trace, fork_point: int = None) -> List['FuzzInstruction']:
         """
-        Generate mutations for a trace (interface compatibility)
-        
-        Args:
-            trace: Trace object (unused, uses internal candidates)
-        
-        Returns:
-            list: FuzzInstruction list
+        为trace生成变异 (接口兼容性)
+
+        参数:
+            trace: Trace对象 (使用metadata.exec_count作为迭代计数)
+            fork_point: Fork点的syscall index (确保mutation目标>=fork_point)
+
+        返回:
+            list: FuzzInstruction列表
         """
-        # Use iteration from trace or default to 0
-        iteration = getattr(trace, 'exec_count', 0)
-        return self.build_instructions(iteration)
+        # 🔥 修复: 使用trace.metadata.exec_count而不是trace.exec_count
+        iteration = getattr(trace.metadata, 'exec_count', 0) if hasattr(trace, 'metadata') else 0
+        return self.build_instructions(iteration, fork_point=fork_point)
     
-    def build_instructions(self, iteration):
+    def build_instructions(self, iteration, fork_point: int = None):
         """
-        Build Fuzz instructions
+        构建Fuzz指令
         
-        ━━━━ Phase 2.1 Enhancement: Fully utilize 11 mutation commands ━━━━
-        - If has recipes: Use recipes to generate precise mutation instructions
-        - If no recipes: Use enhanced random mutation mode
+        ━━━━ 第2.1阶段增强: 充分利用11个变异命令 ━━━━
+        - 如果有recipes: 使用recipes生成精确的变异指令
+        - 如果没有recipes: 使用增强的随机变异模式
         
-        🔥 Enhancement Strategy (Random Mode):
-        - Mutate 1-3 syscalls per round (dynamically adjust based on candidate count)
-        - Use all 11 mutation strategies:
-          * FLIP_BITS, LIGHT_MUTATION - Lightweight mutation
-          * INTERESTING_VALUES, BOUNDARY_VALUE - Boundary value testing
-          * TRUNCATE, EXTEND - Size mutation
-          * REPLACE_BUFFER, MUTATE_AUX_BUFFER - Buffer mutation
-          * MUTATE_FLAGS, MUTATE_ARG - Parameter mutation
-          * Special patterns - Format strings, injection attacks, etc.
+        增强策略 (随机模式):
+        - P1: 基于停滞状态动态调整变异数量
+        - P2: 只选择IO syscalls作为mutation目标
+        - P3: 确保mutation目标 >= fork_point
+        - P4: 如果指定fork_point，保证至少一个mutation目标是它
+        - 使用所有11种变异策略:
+          * FLIP_BITS, LIGHT_MUTATION - 轻量级变异
+          * INTERESTING_VALUES, BOUNDARY_VALUE - 边界值测试
+          * TRUNCATE, EXTEND - 大小变异
+          * REPLACE_BUFFER, MUTATE_AUX_BUFFER - 缓冲区变异
+          * MUTATE_FLAGS, MUTATE_ARG - 参数变异
+          * 特殊模式 - 格式化字符串、注入攻击等
         
-        Args:
-            iteration: Current iteration number
+        参数:
+            iteration: 当前迭代次数
+            fork_point: Fork点的syscall index (可选)
         
-        Returns:
-            list: FuzzInstruction list
+        返回:
+            list: FuzzInstruction列表
         """
         instrs = []
         
-        # ━━━━ Phase 2: Recipe-driven mode ━━━━
+        # ━━━━ 第2阶段: Recipe驱动模式 ━━━━
         if self.recipe_mode and self.recipes:
             return self._build_from_recipes(iteration)
         
-        # ━━━━ Enhancement: Random mutation mode ━━━━
+        # ━━━━ 增强: 随机变异模式 ━━━━
         if not self.mutable_candidates:
-            print("[Mutator] ⚠️  No mutable candidates found!")
+            print("[Mutator] ⚠️  未发现可变异候选!")
             return instrs
         
         num_candidates = len(self.mutable_candidates)
         
-        # Mutate 1-3 syscalls per round (dynamically adjust based on candidate count)
-        num_mutations = min(3, max(1, num_candidates // 10))
+        # 🔥 P0修复: 增强变异强度 - 提高所有模式的mutation数量
+        #
+        # 新正常模式（有新coverage）:
+        # - 候选<5个: mutate 2-3个 (提高)
+        # - 候选5-10个: mutate 3-5个 (提高)
+        # - 候选>10个: mutate 5-8个 (提高)
+        #
+        # 新停滞模式（长时间无新coverage）:
+        # - 候选<5个: mutate 3-4个 (更激进)
+        # - 候选5-10个: mutate 5-7个 (更激进)
+        # - 候选>10个: mutate 8-15个 (非常激进)
+
+        if self.is_stagnant:
+            # 🔥 停滞模式：非常激进的mutation
+            if num_candidates < 5:
+                num_mutations = min(4, max(3, num_candidates))
+            elif num_candidates < 10:
+                num_mutations = min(7, max(5, num_candidates))
+            else:
+                num_mutations = min(15, max(8, num_candidates // 2))
+
+            stagnation_duration = iteration - self.last_new_coverage_iter
+            print(f"[Mutator] 🔥 停滞模式: 变异{num_mutations}个syscall "
+                  f"(已停滞{stagnation_duration}次迭代)")
+        else:
+            # 🔥 正常模式：提高基础mutation数量
+            if num_candidates < 5:
+                num_mutations = min(3, max(2, num_candidates))
+            elif num_candidates < 10:
+                num_mutations = min(5, max(3, num_candidates))
+            else:
+                num_mutations = min(8, max(5, num_candidates // 3))
         
-        print(f"[Mutator] 🎯 Round {iteration}: Mutating {num_mutations} syscalls (Enhanced Mode)")
+        # P2: 过滤出 >= fork_point 的候选
+        valid_candidates = self.mutable_candidates
+        if fork_point is not None:
+            valid_candidates = [c for c in self.mutable_candidates if c.index >= fork_point]
+            print(f"[Mutator] Fork point={fork_point}, valid candidates after filter: {len(valid_candidates)}/{len(self.mutable_candidates)}")
+            if len(valid_candidates) == 0:
+                print(f"[Mutator] WARNING: No candidates >= fork_point, using all candidates")
+                valid_candidates = self.mutable_candidates
         
-        for i in range(num_mutations):
-            # Select different candidate syscalls (avoid duplicates)
-            offset = (iteration * num_mutations + i) % num_candidates
-            target_candidate = self.mutable_candidates[offset]
+        num_candidates = len(valid_candidates)
+        
+        print(f"[Mutator] Iteration {iteration}: Mutating {num_mutations} from {num_candidates} IO candidates")
+        
+        # P3: 分类候选（所有候选都已经是IO syscalls了）
+        primary_io = [c for c in valid_candidates if c.name in PRIMARY_IO_SYSCALLS]
+        secondary_io = [c for c in valid_candidates if c.name in SECONDARY_IO_SYSCALLS]
+        
+        print(f"[Mutator]   Primary IO: {len(primary_io)}, Secondary IO: {len(secondary_io)}")
+        
+        # P4: 如果指定了fork_point，保证至少有一个mutation目标是它
+        fork_point_candidate = None
+        if fork_point is not None:
+            for c in valid_candidates:
+                if c.index == fork_point:
+                    fork_point_candidate = c
+                    break
             
-            # Select mutation strategy with weighted probability
-            # Increase probability of EXTEND (type 3) and REPLACE_BUFFER (type 7)
-            # to improve crash discovery rate for buffer overflow vulnerabilities
-            strategy_weights = [
-                10,  # 0: FLIP_BITS
-                10,  # 1: INTERESTING_VALUES
-                10,  # 2: TRUNCATE
-                25,  # 3: EXTEND (increased from ~9% to ~20%)
-                8,   # 4: LIGHT_MUTATION
-                8,   # 5: MUTATE_AUX_BUFFER
-                8,   # 6: REPLACE_BUFFER (small)
-                15,  # 7: REPLACE_BUFFER (large, increased)
-                8,   # 8: BOUNDARY_VALUE
-                8,   # 9: MUTATE_FLAGS
-                8,   # 10: OVERWRITE_AT_OFFSET
-            ]
-            strategy_type = random.choices(range(11), weights=strategy_weights)[0]
-            
-            # Generate advanced mutation instruction
+            if fork_point_candidate:
+                strategy_type = self._select_mutation_strategy()
+                fork_instr = self._generate_advanced_mutation(fork_point_candidate, strategy_type, iteration)
+                instrs.append(fork_instr)
+                print(f"[Mutator] P4: Guaranteed mutation at fork_point={fork_point} ({fork_point_candidate.name})")
+                num_mutations -= 1
+            else:
+                print(f"[Mutator] WARNING: fork_point={fork_point} not in valid candidates")
+        
+        # 🔥 修复：选择剩余的mutation目标，避免重复性targeting
+        # 策略：基于迭代ID进行轮换选择，确保不同迭代探索不同syscalls
+        selected = []
+
+        # 合并所有候选，按索引排序以确保稳定的顺序
+        all_io_candidates = sorted(primary_io + secondary_io, key=lambda c: c.index)
+
+        if len(all_io_candidates) >= num_mutations:
+            # 🔥 修复：实现轮换选择而不是纯随机
+            selected = self._select_diverse_targets(all_io_candidates, num_mutations, iteration)
+        else:
+            # 如果候选数不够，使用所有候选
+            selected = all_io_candidates.copy()
+        
+        # 生成mutations
+        for target_candidate in selected:
+            strategy_type = self._select_mutation_strategy()
             instr = self._generate_advanced_mutation(target_candidate, strategy_type, iteration)
             if instr:
                 instrs.append(instr)
         
+        print(f"[Mutator] Generated {len(instrs)} mutation instructions")
         return instrs
+
+    def _select_diverse_targets(self, candidates: list, num_targets: int, iteration: int) -> list:
+        """
+        🔥 修复：选择多样化的mutation目标，避免重复性targeting
+
+        策略：
+        1. 轮换算法：基于迭代ID在不同候选间循环
+        2. 分散选择：确保选中的syscalls在索引上分散
+        3. 随机扰动：一定概率的随机选择保持不可预测性
+        4. 历史避免：避免连续迭代选择相同的目标
+
+        Args:
+            candidates: 可选候选列表 (已按索引排序)
+            num_targets: 需要选择的目标数量
+            iteration: 当前迭代ID
+
+        Returns:
+            选择的候选列表
+        """
+        if not candidates:
+            return []
+
+        if len(candidates) <= num_targets:
+            return candidates.copy()
+
+        selected = []
+
+        # 策略1: 基于迭代的轮换起始点
+        start_index = iteration % len(candidates)
+
+        # 策略2: 分散选择 - 尽量选择距离较远的候选
+        if num_targets == 1:
+            # 单个选择：基于迭代轮换
+            selected_index = start_index
+            selected.append(candidates[selected_index])
+        else:
+            # 多个选择：使用步进算法确保分散
+            step = max(1, len(candidates) // num_targets)
+            for i in range(num_targets):
+                index = (start_index + i * step) % len(candidates)
+                selected.append(candidates[index])
+
+        # 策略3: 随机扰动 (25%概率)
+        if random.random() < 0.25:
+            # 用随机候选替换一个选中的候选
+            if selected:
+                replace_idx = random.randint(0, len(selected) - 1)
+                selected[replace_idx] = random.choice(candidates)
+
+        # 去重处理（如果由于轮换产生重复）
+        seen = set()
+        unique_selected = []
+        for candidate in selected:
+            if candidate.index not in seen:
+                unique_selected.append(candidate)
+                seen.add(candidate.index)
+
+        # 如果去重后数量不足，补充选择
+        while len(unique_selected) < num_targets and len(unique_selected) < len(candidates):
+            for candidate in candidates:
+                if candidate.index not in seen:
+                    unique_selected.append(candidate)
+                    seen.add(candidate.index)
+                    break
+
+        return unique_selected[:num_targets]
 

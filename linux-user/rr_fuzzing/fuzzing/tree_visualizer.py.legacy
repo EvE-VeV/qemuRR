@@ -164,12 +164,12 @@ class TreeVisualizer:
                     if has_mutation:
                         new_types = sc_stat.get('mutation_types', [])
                         matching_child.mutation_types = list(set(
-                                matching_child.mutation_types + new_types
-                            ))
-                        
-                        matching_child.new_coverage_found += sc_stat.get('new_coverage', 0)
-                        merge_stats['matched'] += 1
-                        break
+                            matching_child.mutation_types + new_types
+                        ))
+                    
+                    matching_child.new_coverage_found += sc_stat.get('new_coverage', 0)
+                    merge_stats['matched'] += 1
+                    break
                 
                 if matching_child:
                     # 找到匹配，沿着这条路径继续
