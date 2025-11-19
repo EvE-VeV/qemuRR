@@ -19,14 +19,18 @@ import sys
 from enum import IntEnum
 from typing import List, Dict, Tuple, Optional
 
-# 添加analysis目录到path以导入bb_trace_parser
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'analysis'))
+# 🔥 修复: bb_trace_parser在conductor目录，不是analysis目录
+conductor_dir = os.path.join(os.path.dirname(__file__), 'conductor')
+if conductor_dir not in sys.path:
+    sys.path.insert(0, conductor_dir)
+
 try:
     from bb_trace_parser import BBTraceParser, BBEntry
     BB_TRACE_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     BB_TRACE_AVAILABLE = False
     # BB trace 是可选功能，静默失败
+    # print(f"[DEBUG] BB trace parser not available: {e}")
 
 
 class AuxDataType(IntEnum):

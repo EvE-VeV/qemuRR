@@ -28,7 +28,7 @@ class FuzzInstruction:
     表示在fuzzing期间应用的一个变异命令。
     """
     
-    def __init__(self, syscall_index, cmd, arg_index, data, offset=0, size=None):
+    def __init__(self, syscall_index, cmd, arg_index, data, offset=0, size=None, mutation_type='unknown'):
         """
         参数:
             syscall_index: 系统调用索引
@@ -37,6 +37,7 @@ class FuzzInstruction:
             data: 变异数据
             offset: 偏移 (第2阶段新增)
             size: 数据大小 (第2阶段新增, 如果为None则使用数据长度)
+            mutation_type: Mutation类型 (用于统计，不pack到C端)
         """
         self.syscall_index = syscall_index
         self.cmd = cmd
@@ -44,6 +45,7 @@ class FuzzInstruction:
         self.data = data
         self.offset = offset
         self.size = size if size is not None else (len(data) if isinstance(data, bytes) else 8)
+        self.mutation_type = mutation_type  # ✅ 2025-11-18: 添加mutation_type追踪
     
     def pack(self):
         """

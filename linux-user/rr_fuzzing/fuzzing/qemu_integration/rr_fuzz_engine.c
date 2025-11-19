@@ -18,13 +18,28 @@
 FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
 size_t g_instruction_count = 0;
 
+// ✅ 新增：IO返回值变异支持
+bool g_has_retval_override = false;
+abi_long g_retval_override = 0;
+
+// ✅ 2025-11-17: Buffer Content Mutation支持 (配合retval override)
+bool g_has_buffer_fill = false;           // 是否需要填充buffer
+target_ulong g_buffer_fill_addr = 0;      // buffer地址
+size_t g_buffer_fill_size = 0;            // 填充大小
+uint8_t g_buffer_fill_pattern[1024];      // 填充内容 (最大1KB)
+size_t g_buffer_fill_pattern_len = 0;     // 填充模式长度
+
 // 变异统计
 typedef struct {
     uint64_t total_mutations;       // 总变异次数
     uint64_t arg_mutations;         // 参数变异
     uint64_t buffer_mutations;      // 缓冲区变异
     uint64_t boundary_tests;        // 边界值测试
+    uint64_t retval_mutations;      // 返回值变异 (新增)
 } fuzz_stats_t;
+
+/* ✅ 2025-11-17: Forward declaration */
+static int get_input_io_buffer_arg_index(int syscall_nr);
 
 // ✅ Phase 1: 改为非 static，供 rr_fuzz_aux_mutations.c 使用
 fuzz_stats_t g_fuzz_stats = {0};
@@ -190,15 +205,15 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
         fprintf(stderr, "[APPLY]   *** MATCH FOUND! cmd=%d ***\n", instr->cmd);
         fflush(stderr);
 
-        // 检查参数索引有效性
-        fprintf(stderr, "[APPLY] Checking arg_index: %u (must be < 8)\n", instr->arg_index);
+        // 检查参数索引有效性 (允许 0xFF 用于返回值变异)
+        fprintf(stderr, "[APPLY] Checking arg_index: %u (0xFF=retval, else must be < 8)\n", instr->arg_index);
         fflush(stderr);
-        
-        if (instr->arg_index >= 8) {
+
+        if (instr->arg_index != 0xFF && instr->arg_index >= 8) {
             fprintf(stderr, "[APPLY] ERROR: Invalid arg_index %u for syscall %s\n",
                     instr->arg_index, syscall_name ? syscall_name : "unknown");
             fflush(stderr);
-            RR_WARN("Invalid arg_index %u for syscall %s", 
+            RR_WARN("Invalid arg_index %u for syscall %s",
                     instr->arg_index, syscall_name ? syscall_name : "unknown");
             continue;
         }
@@ -207,12 +222,57 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
         fflush(stderr);
 
         RR_VERBOSE("Applying mutation [%zu/%zu] to %s arg[%u]: cmd=%d",
-                   i + 1, g_instruction_count, 
+                   i + 1, g_instruction_count,
                    syscall_name ? syscall_name : "unknown",
                    instr->arg_index, instr->cmd);
 
         switch (instr->cmd) {
             case FUZZ_CMD_MUTATE_ARG:
+                // ✅ 特殊处理：arg_index == 0xFF 表示变异返回值
+                if (instr->arg_index == 0xFF) {
+                    if (instr->data_len >= sizeof(abi_long)) {
+                        g_retval_override = *(abi_long *)instr->data;
+                        g_has_retval_override = true;
+
+                        RR_INFO("🎯 MUTATE_RETVAL: %s return value → %ld (syscall_idx=%u)",
+                               syscall_name ? syscall_name : "unknown",
+                               g_retval_override, syscall_index);
+
+                        fprintf(stderr, "[APPLY] 🎯 IO RETVAL MUTATION: %s → %ld\n",
+                                syscall_name ? syscall_name : "unknown", g_retval_override);
+                        fflush(stderr);
+
+                        /* ✅ 2025-11-17: 泛化Buffer Fill - 如果是input IO syscall，自动设置buffer fill */
+                        int buf_arg_idx = get_input_io_buffer_arg_index(syscall_nr);
+                        if (buf_arg_idx >= 0 && g_retval_override > 0) {
+                            target_ulong buf_addr = args[buf_arg_idx];
+                            if (buf_addr != 0) {
+                                /* 从指令中提取填充模式，或使用默认模式 */
+                                const uint8_t *pattern = NULL;
+                                size_t pattern_len = 0;
+
+                                /* 如果指令包含额外数据（在retval之后），用作填充模式 */
+                                if (instr->data_len > sizeof(abi_long)) {
+                                    pattern = instr->data + sizeof(abi_long);
+                                    pattern_len = instr->data_len - sizeof(abi_long);
+                                }
+
+                                rr_fuzz_set_buffer_fill(buf_addr, (size_t)g_retval_override,
+                                                        pattern, pattern_len);
+
+                                fprintf(stderr, "[APPLY] 🎨 AUTO BUFFER FILL: addr=0x%lx, size=%ld\n",
+                                        buf_addr, g_retval_override);
+                                fflush(stderr);
+                            }
+                        }
+
+                        g_fuzz_stats.retval_mutations++;
+                    }
+                    break;
+                }
+
+                // 正常的参数变异
+
                 /* 变异参数值 - 适用于整数参数 */
                 if (instr->data_len >= sizeof(abi_long)) {
                     __attribute__((unused)) abi_long old_value = args[instr->arg_index];  // 🔥 P0修复：先保存旧值
@@ -514,6 +574,151 @@ FuzzInstruction *rr_fuzz_generate_mutations(uint32_t target_syscall, int target_
 
     RR_LOG("Generated %zu mutations for syscall %u arg %d", *out_count, target_syscall, target_arg);
     return mutations;
+}
+
+/**
+ * ✅ 新增：检查是否有返回值覆盖
+ */
+bool rr_fuzz_has_retval_override(void)
+{
+    return g_has_retval_override;
+}
+
+/**
+ * ✅ 新增：获取返回值覆盖（并清除标志）
+ */
+abi_long rr_fuzz_get_retval_override(void)
+{
+    abi_long ret = g_retval_override;
+    g_has_retval_override = false;  // 清除标志，避免影响后续syscalls
+    return ret;
+}
+
+/**
+ * ✅ 新增：清除返回值覆盖标志
+ */
+void rr_fuzz_clear_retval_override(void)
+{
+    g_has_retval_override = false;
+    g_retval_override = 0;
+}
+
+/**
+ * ✅ 2025-11-17: 泛化IO Syscall识别
+ *
+ * 识别input IO syscalls并返回buffer参数索引
+ *
+ * @param syscall_nr 系统调用号
+ * @return buffer参数索引，-1表示不是input IO syscall
+ */
+static int get_input_io_buffer_arg_index(int syscall_nr)
+{
+    /* 通用规则：对于input IO syscalls，buffer通常在arg1 */
+    switch (syscall_nr) {
+        case TARGET_NR_read:        /* read(fd, buf, count) */
+        case TARGET_NR_readv:       /* readv(fd, iov, iovcnt) */
+        case TARGET_NR_pread64:     /* pread(fd, buf, count, offset) */
+            return 1;  /* arg1 = buf */
+
+#ifdef TARGET_NR_recv
+        case TARGET_NR_recv:        /* recv(sockfd, buf, len, flags) */
+#endif
+#ifdef TARGET_NR_recvfrom
+        case TARGET_NR_recvfrom:    /* recvfrom(sockfd, buf, len, flags, src_addr, addrlen) */
+#endif
+#ifdef TARGET_NR_recvmsg
+        case TARGET_NR_recvmsg:     /* recvmsg(sockfd, msg, flags) */
+#endif
+            return 1;  /* arg1 = buf */
+
+        default:
+            return -1;  /* 不是input IO syscall */
+    }
+}
+
+/**
+ * ✅ 2025-11-17: 设置Buffer Fill参数
+ *
+ * 配合retval override，准备填充buffer内容
+ *
+ * @param buf_addr buffer地址
+ * @param size 填充大小
+ * @param pattern 填充模式数据
+ * @param pattern_len 填充模式长度
+ */
+void rr_fuzz_set_buffer_fill(target_ulong buf_addr, size_t size,
+                               const uint8_t *pattern, size_t pattern_len)
+{
+    if (size > sizeof(g_buffer_fill_pattern)) {
+        RR_WARN("Buffer fill size %zu exceeds max %zu, truncating",
+                size, sizeof(g_buffer_fill_pattern));
+        size = sizeof(g_buffer_fill_pattern);
+    }
+
+    g_buffer_fill_addr = buf_addr;
+    g_buffer_fill_size = size;
+    g_buffer_fill_pattern_len = pattern_len;
+
+    /* 复制填充模式并循环扩展到size大小 */
+    if (pattern && pattern_len > 0) {
+        for (size_t i = 0; i < size; i++) {
+            g_buffer_fill_pattern[i] = pattern[i % pattern_len];
+        }
+    } else {
+        /* 默认填充：递增模式 */
+        for (size_t i = 0; i < size; i++) {
+            g_buffer_fill_pattern[i] = (uint8_t)(i & 0xFF);
+        }
+    }
+
+    g_has_buffer_fill = true;
+
+    RR_INFO("🎨 Set buffer fill: addr=0x%lx, size=%zu, pattern_len=%zu",
+            buf_addr, size, pattern_len);
+}
+
+/**
+ * ✅ 2025-11-17: 检查是否需要填充buffer
+ */
+bool rr_fuzz_has_buffer_fill(void)
+{
+    return g_has_buffer_fill;
+}
+
+/**
+ * ✅ 2025-11-17: 获取Buffer Fill参数
+ *
+ * @param out_addr 输出buffer地址
+ * @param out_size 输出填充大小
+ * @param out_pattern 输出填充模式
+ * @return buffer fill大小，0表示无效
+ */
+size_t rr_fuzz_get_buffer_fill(target_ulong *out_addr, size_t *out_size,
+                                 const uint8_t **out_pattern)
+{
+    if (!g_has_buffer_fill) {
+        return 0;
+    }
+
+    if (out_addr) *out_addr = g_buffer_fill_addr;
+    if (out_size) *out_size = g_buffer_fill_size;
+    if (out_pattern) *out_pattern = g_buffer_fill_pattern;
+
+    /* 清除标志，避免影响后续syscalls */
+    g_has_buffer_fill = false;
+
+    return g_buffer_fill_size;
+}
+
+/**
+ * ✅ 2025-11-17: 清除buffer fill标志
+ */
+void rr_fuzz_clear_buffer_fill(void)
+{
+    g_has_buffer_fill = false;
+    g_buffer_fill_addr = 0;
+    g_buffer_fill_size = 0;
+    g_buffer_fill_pattern_len = 0;
 }
 
 /**

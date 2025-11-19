@@ -184,7 +184,17 @@ For more information, see DETAILED_ARCHITECTURE.md
     # Recipe support (only with smart mutation)
     parser.add_argument('--recipe', default=None,
                         help='Recipe file for guided mutation (requires --smart or --afl-enhanced)')
-    
+
+    # 🔥 新增：可视化和高级功能选项
+    advanced_group = parser.add_argument_group('Advanced Features',
+                                              'PathFinder, visualization, and other advanced options')
+    advanced_group.add_argument('--no-pathfinder', action='store_true',
+                               help='Disable PathFinder CFG-guided fuzzing (enabled by default)')
+    advanced_group.add_argument('--no-tree-viz', action='store_true',
+                               help='Disable realtime syscall tree visualization (enabled by default)')
+    advanced_group.add_argument('--tree-viz-interval', type=float, default=3.0,
+                               help='Tree visualizer update interval in seconds (default: 3.0)')
+
     args = parser.parse_args()
     
     # Validate arguments
@@ -269,7 +279,9 @@ For more information, see DETAILED_ARCHITECTURE.md
         target_binary=args.target,
         initial_trace=args.trace,
         output_dir=args.output,
-        mutator=mutator
+        mutator=mutator,
+        enable_pathfinder=not args.no_pathfinder,  # 🔥 默认启用PathFinder
+        enable_tree_viz=not args.no_tree_viz      # 🔥 默认启用可视化
     )
     _fuzzing_core = fuzzing_core
     

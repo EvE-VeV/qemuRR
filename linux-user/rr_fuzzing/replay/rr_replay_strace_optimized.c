@@ -665,10 +665,27 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     // 保存当前记录供POST-HOOK使用
     g_current_record_strace = record;
-    
+
     /* 🔥 修复：设置标记，告诉 post_hook 这条记录已经被处理 */
     g_syscall_already_consumed = true;
-    
+
+    /* ✅ 新增：检查是否有IO返回值覆盖 */
+    if (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
+        abi_long original_ret = record->ret_value;
+        abi_long mutated_ret = rr_fuzz_get_retval_override();  // 这会自动清除标志
+
+        RR_INFO("🎯 IO RETVAL OVERRIDE: %s: %ld → %ld (NOT executing real syscall)",
+                record->syscall_name, original_ret, mutated_ret);
+
+        fprintf(stderr, "[STRACE] 🎯 RETVAL OVERRIDE: %s %ld → %ld (pure replay with mutated retval)\n",
+                record->syscall_name, original_ret, mutated_ret);
+        fflush(stderr);
+
+        // ✅ 直接返回变异的返回值，不执行真实系统调用
+        // 这对read()等IO syscalls很重要 - 我们要控制它们的返回值来触发不同代码路径
+        return mutated_ret;
+    }
+
     STRACE_VERBOSE("Hybrid replay+fuzz mode: executing real syscall with modified args");
     return -1;  // 返回-1让QEMU执行真实系统调用
 }

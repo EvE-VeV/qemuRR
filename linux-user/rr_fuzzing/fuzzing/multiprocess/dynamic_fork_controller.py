@@ -45,6 +45,7 @@ class FuzzCheckpoint:
     parent_checkpoint_id: str  # 父checkpoint ID（用于追溯）
     checkpoint_id: str  # 唯一标识
     discovery_iteration: int  # 发现此checkpoint的迭代次数
+    mutation_node_ids: List[str] = None  # ✅ Task #6补充: Mutation node IDs for tracking
 
     def __str__(self):
         return f"Checkpoint[{self.checkpoint_id}] @syscall[{self.syscall_index}] depth={self.depth} mutations={len(self.unexplored_mutations)}"
@@ -72,21 +73,27 @@ class DynamicForkController:
                  path_finder: Optional[PathFinder],
                  mutator: SmartMutator,
                  recipe_pool: Optional[RecipePool],
-                 coverage_tracker: CoverageTracker):
+                 coverage_tracker: CoverageTracker,
+                 fuzzing_stats=None,
+                 mutation_graph=None):
         """Initialize dynamic fork controller
-        
+
         Args:
             executor: QEMU executor
             path_finder: PathFinder instance (optional, None uses simple strategy)
             mutator: SmartMutator instance
             recipe_pool: RecipePool instance (optional)
             coverage_tracker: CoverageTracker instance
+            fuzzing_stats: FuzzingStatistics instance (for unified tracking)
+            mutation_graph: MutationDependencyGraph instance (for mutation tracking)
         """
         self.executor = executor
         self.path_finder = path_finder
         self.mutator = mutator
         self.recipe_pool = recipe_pool
         self.coverage_tracker = coverage_tracker
+        self.fuzzing_stats = fuzzing_stats  # ✅ Single source of truth
+        self.mutation_graph = mutation_graph  # ✅ Task #6补充: Mutation tracking
 
         # 🔥 新增：深度优先checkpoint/snapshot模式配置
         self.depth_first_mode = True  # 启用深度优先探索
@@ -98,6 +105,9 @@ class DynamicForkController:
         self.max_variants_per_fork = 2  # 降低并发数，支持深度探索
         self.fork_budget_per_1000 = 200  # 增加预算，支持深度探索
         self.trigger_probability = 1.0
+
+        # 🔥 新增：当前trace对象（用于IO mutation）
+        self.current_trace = None
 
         # 统计（增加深度相关统计）
         self.stats = {
@@ -157,22 +167,17 @@ class DynamicForkController:
         Returns:
             True if discovered new paths
         """
+        # 🔥 保存当前trace供mutation使用
+        self.current_trace = trace
         if not self.depth_first_mode:
             # 兼容性：如果未启用深度模式，使用传统模式
             return self._explore_breadth_first(trace, iteration_id)
 
-        print(f"\n[DynamicForkController] 🌊 Iteration {iteration_id}: Deep-First checkpoint/snapshot exploration on {trace.id}")
+        print(f"\n[DynamicForkController] 🌊 Iteration {iteration_id}: Dynamic Multi-Fork on {trace.id}")
 
-        # 第一步：检查是否有待探索的checkpoints
-        if not self.checkpoint_queue:
-            # 没有checkpoint，从根trace开始探索
-            print(f"[DynamicForkController] 🌱 Starting fresh exploration from root trace")
-            return self._start_depth_exploration(trace, iteration_id)
-        else:
-            # 有待探索的checkpoint，继续深度探索
-            current_checkpoint = self.checkpoint_queue.pop()  # 深度优先：从栈顶取checkpoint
-            print(f"[DynamicForkController] 📂 Resuming exploration from {current_checkpoint}")
-            return self._resume_checkpoint_exploration(current_checkpoint, iteration_id)
+        # 🔥 修复：每次都从根trace开始，一次性测试多个mutations
+        print(f"[DynamicForkController] 🌱 Starting multi-fork from root trace")
+        return self._start_depth_exploration(trace, iteration_id)
 
     def _start_depth_exploration(self, trace: Trace, iteration_id: int) -> bool:
         """
@@ -186,6 +191,10 @@ class DynamicForkController:
                 trace_file=trace.file_path,
                 iteration_id=iteration_id
             )
+            # ✅ Update unified stats counter
+            if self.fuzzing_stats:
+                self.fuzzing_stats.total_execs += 1
+
             if baseline_result.normal_exit:
                 print(f"[DynamicForkController] Baseline execution completed")
             else:
@@ -193,12 +202,16 @@ class DynamicForkController:
         except Exception as e:
             print(f"[DynamicForkController] Warning: Baseline exception: {e}")
 
-        io_syscalls = self._find_io_syscalls(trace)
+        # ✅ 2025-11-18: 智能IO syscall选择（限制fork点数量）
+        io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
         if not io_syscalls:
             print(f"[DynamicForkController] No IO syscalls found")
             return False
 
         print(f"[DynamicForkController] Found {len(io_syscalls)} IO syscalls: {io_syscalls}")
+
+        # ✅ 存储为实例变量，供nested fork使用
+        self.current_io_syscalls = io_syscalls
 
         # 从第一个IO syscall开始深度探索
         first_io_syscall = io_syscalls[0]
@@ -219,89 +232,135 @@ class DynamicForkController:
 
         # 生成mutations for this checkpoint
         mutations = []
+        mutation_node_ids = []  # ✅ Task #6补充: Track mutation node IDs
         for i in range(self.max_variants_per_checkpoint):
-            # 这里需要根据syscall_index生成mutation
-            mutation = self.mutator.mutate(None, fork_point=syscall_index)
+            # 🔥 传递当前trace对象供IO mutation使用
+            mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index)
             mutations.append(mutation)
+
+            # ✅ Task #6补充: Track mutation in graph
+            # ✅ 2025-11-18: 从FuzzInstruction中读取mutation_type
+            if isinstance(mutation, list) and len(mutation) > 0:
+                mut_type = getattr(mutation[0], 'mutation_type', 'unknown')
+            else:
+                mut_type = 'unknown'
+
+            if self.mutation_graph:
+                node_id = self.mutation_graph.add_mutation(
+                    iteration=iteration_id,
+                    mutation_index=i,
+                    mutation_type=mut_type,
+                    parent_trace_id=f"checkpoint_{checkpoint_id}",
+                    syscall_index=syscall_index,
+                    field_name="dynamic_fork"
+                )
+                mutation_node_ids.append(node_id)
 
         print(f"[DynamicForkController] Generated {len(mutations)} mutations for checkpoint")
 
         # 保存当前覆盖率状态作为checkpoint
         coverage_snapshot = self._save_coverage_state()
 
-        # 创建checkpoint对象
+        # 🔥 修复：不需要checkpoint队列，直接执行所有mutations
+        # 创建checkpoint对象（用于记录，但不队列）
         checkpoint = FuzzCheckpoint(
             trace_file=trace_file,
             syscall_index=syscall_index,
             depth=depth,
             coverage_state=coverage_snapshot,
-            unexplored_mutations=mutations[1:],  # 保留除第一个外的所有mutations
+            unexplored_mutations=[],  # 所有mutations都会被执行
             parent_checkpoint_id=parent_id,
             checkpoint_id=checkpoint_id,
-            discovery_iteration=iteration_id
+            discovery_iteration=iteration_id,
+            mutation_node_ids=mutation_node_ids if mutation_node_ids else []
         )
 
-        # 如果有未探索的mutations，添加到队列
-        if checkpoint.unexplored_mutations:
-            self.checkpoint_queue.append(checkpoint)
-            print(f"[DynamicForkController] 📚 Queued checkpoint with {len(checkpoint.unexplored_mutations)} unexplored mutations")
-
-        # 执行第一个mutation（深度优先）
+        # 🔥 修复：一次性执行所有mutations（真正的dynamic fork）
         if mutations:
-            first_mutation = mutations[0]
-            print(f"[DynamicForkController] 🚀 Executing first mutation for deep exploration...")
+            print(f"[DynamicForkController] 🚀 Executing {len(mutations)} mutations in parallel (dynamic multi-fork)...")
 
             try:
                 results = self.executor.execute_fork(
                     trace_file=trace_file,
                     fork_point=syscall_index,
-                    mutation_variants=[first_mutation],
+                    mutation_variants=mutations,  # 传递所有mutations
                     depth=depth,
                     iteration_id=iteration_id
                 )
+
+                # ✅ Update unified stats counter (1 execution per variant)
+                if self.fuzzing_stats and results:
+                    self.fuzzing_stats.total_execs += len(results)
 
                 if results and len(results) > 0:
                     result = results[0]
                     has_new_coverage = self.coverage_tracker.has_new_coverage(result.coverage_bitmap)
 
-                    # 🔥 修复：深度优先探索的正确终止条件
+                    # ✅ Task #6补充: Update mutation result in graph
+                    if self.mutation_graph and mutation_node_ids:
+                        coverage_stats = self.coverage_tracker.get_stats()
+                        self.mutation_graph.update_mutation_result(
+                            node_id=mutation_node_ids[0],  # First mutation
+                            has_new_coverage=has_new_coverage,
+                            new_edges=coverage_stats.get('new_edges_this_run', 0),
+                            total_edges=coverage_stats.get('total_edges', 0),
+                            crashed=result.crashed,
+                            timed_out=False,
+                            exec_time=getattr(result, 'exec_time', 0.0)
+                        )
+
+                    # 🔥 修复：让程序运行到结束（正常退出或崩溃）再回退到checkpoint
                     if result.crashed:
-                        print(f"[DynamicForkController] 💥 CRASH detected at depth={depth}! This is a successful exploration endpoint.")
+                        print(f"[DynamicForkController] 💥 CRASH detected at depth={depth}!")
                         print(f"[DynamicForkController] 🎯 Crash info: {result.crash_info if hasattr(result, 'crash_info') else 'Unknown crash'}")
                         self.stats['new_paths_discovered'] += 1
-
-                        # Crash就是探索的成功终点，回退到checkpoint
-                        print(f"[DynamicForkController] ⬅️  Backtracking to checkpoint after crash discovery...")
+                        print(f"[DynamicForkController] ⬅️  Program finished (crashed), backtracking to checkpoint...")
                         return True  # crash是成功的探索结果
 
                     elif has_new_coverage:
-                        print(f"[DynamicForkController] 🎉 New coverage discovered! Continuing deep exploration...")
+                        print(f"[DynamicForkController] 🎉 New coverage discovered at depth={depth}!")
                         self.stats['new_paths_discovered'] += 1
 
-                        # 找到下一个IO syscall继续深度探索
-                        next_io_syscalls = self._find_next_io_syscalls(trace_file, syscall_index)
-                        if next_io_syscalls:
-                            next_syscall = next_io_syscalls[0]
-                            print(f"[DynamicForkController] 🔄 Continuing to next IO syscall[{next_syscall}] at depth={depth+1}")
+                        # ✅ 2025-11-18: Nested Fork - 继续探索更深层次（使用预选IO syscalls）
+                        if depth < self.max_depth:
+                            # ✅ 2025-11-18: 智能选择 - 使用预选的IO syscall列表，避免过多fork点
+                            next_syscall = None
+                            if hasattr(self, 'current_io_syscalls') and self.current_io_syscalls:
+                                # 找到当前syscall之后的下一个预选IO syscall
+                                next_io_syscalls = [io for io in self.current_io_syscalls if io > syscall_index]
+                                if next_io_syscalls:
+                                    next_syscall = next_io_syscalls[0]
+                                    print(f"[DynamicForkController] ⬇️  Going deeper: depth {depth} → {depth+1}, next IO fork @syscall[{next_syscall}]")
+                                else:
+                                    print(f"[DynamicForkController] 🔚 No more preselected IO syscalls available for deeper exploration at depth={depth}")
+                            else:
+                                # 回退到原有逻辑（如果没有预选IO syscalls）
+                                next_syscall = syscall_index + 10
+                                print(f"[DynamicForkController] ⬇️  Going deeper: depth {depth} → {depth+1}, next fork @syscall[{next_syscall}] (fallback)")
 
-                            # 递归探索下一层
-                            return self._explore_at_checkpoint(trace_file, next_syscall, depth + 1, iteration_id, checkpoint_id)
-                        else:
-                            print(f"[DynamicForkController] 🏁 No more IO syscalls, path exploration completed")
-                            return True
+                            # ✅ 只在找到有效的下一个syscall时才递归探索
+                            if next_syscall is not None:
+                                deeper_success = self._explore_at_checkpoint(
+                                    trace_file=trace_file,
+                                    syscall_index=next_syscall,
+                                    depth=depth + 1,
+                                    iteration_id=iteration_id,
+                                    parent_id=checkpoint_id
+                                )
+
+                                if deeper_success:
+                                    print(f"[DynamicForkController] ⬆️  Coming back from depth {depth+1} (found interesting path)")
+                                    self.stats['max_depth_reached'] = max(self.stats.get('max_depth_reached', 0), depth + 1)
+                                else:
+                                    print(f"[DynamicForkController] ⬆️  Coming back from depth {depth+1} (no new findings)")
+
+                        print(f"[DynamicForkController] ⬅️  Program finished (normal exit with new coverage), backtracking to checkpoint...")
+                        return True  # 有新coverage，这是成功的探索
 
                     else:
-                        print(f"[DynamicForkController] 📊 No new coverage and no crash, continuing exploration...")
-
-                        # 即使没有新覆盖率，也继续探索到下一个IO syscall（更aggressive的探索）
-                        next_io_syscalls = self._find_next_io_syscalls(trace_file, syscall_index)
-                        if next_io_syscalls and depth < self.max_depth - 1:
-                            next_syscall = next_io_syscalls[0]
-                            print(f"[DynamicForkController] 🔄 Aggressive exploration: continuing to syscall[{next_syscall}] at depth={depth+1}")
-                            return self._explore_at_checkpoint(trace_file, next_syscall, depth + 1, iteration_id, checkpoint_id)
-                        else:
-                            print(f"[DynamicForkController] 🔚 Reached exploration limit, backtracking...")
-                            return False
+                        print(f"[DynamicForkController] 📊 No new coverage at depth={depth}")
+                        print(f"[DynamicForkController] ⬅️  Program finished (normal exit, no new coverage), backtracking to checkpoint...")
+                        return False  # 无新发现，回退
                 else:
                     print(f"[DynamicForkController] ❌ Fork execution failed")
                     return False
@@ -329,6 +388,11 @@ class DynamicForkController:
 
         next_mutation = checkpoint.unexplored_mutations.pop(0)
 
+        # ✅ Task #6补充: Get corresponding mutation node ID
+        next_mutation_node_id = None
+        if checkpoint.mutation_node_ids:
+            next_mutation_node_id = checkpoint.mutation_node_ids.pop(0)
+
         # 如果还有更多mutations，重新加入队列
         if checkpoint.unexplored_mutations:
             self.checkpoint_queue.append(checkpoint)
@@ -345,9 +409,26 @@ class DynamicForkController:
                 iteration_id=iteration_id
             )
 
+            # ✅ Update unified stats counter (1 execution per variant)
+            if self.fuzzing_stats and results:
+                self.fuzzing_stats.total_execs += len(results)
+
             if results and len(results) > 0:
                 result = results[0]
                 has_new_coverage = self.coverage_tracker.has_new_coverage(result.coverage_bitmap)
+
+                # ✅ Task #6补充: Update mutation result in graph
+                if self.mutation_graph and next_mutation_node_id:
+                    coverage_stats = self.coverage_tracker.get_stats()
+                    self.mutation_graph.update_mutation_result(
+                        node_id=next_mutation_node_id,
+                        has_new_coverage=has_new_coverage,
+                        new_edges=coverage_stats.get('new_edges_this_run', 0),
+                        total_edges=coverage_stats.get('total_edges', 0),
+                        crashed=result.crashed,
+                        timed_out=False,
+                        exec_time=getattr(result, 'exec_time', 0.0)
+                    )
 
                 # 🔥 修复：checkpoint恢复后的正确处理
                 if result.crashed:
@@ -359,30 +440,13 @@ class DynamicForkController:
                 elif has_new_coverage:
                     print(f"[DynamicForkController] 🎉 New coverage from checkpoint restoration!")
                     self.stats['new_paths_discovered'] += 1
-
-                    # 继续深度探索
-                    next_io_syscalls = self._find_next_io_syscalls(checkpoint.trace_file, checkpoint.syscall_index)
-                    if next_io_syscalls and checkpoint.depth < self.max_depth:
-                        next_syscall = next_io_syscalls[0]
-                        return self._explore_at_checkpoint(checkpoint.trace_file, next_syscall,
-                                                         checkpoint.depth + 1, iteration_id, checkpoint.checkpoint_id)
-                    else:
-                        print(f"[DynamicForkController] 🏁 Reached exploration boundary")
-                        return True
+                    print(f"[DynamicForkController] ⬅️  Program finished (normal exit with new coverage), backtracking...")
+                    return True  # 有新coverage，成功的探索
 
                 else:
                     print(f"[DynamicForkController] 📊 No new coverage from restored checkpoint")
-
-                    # 即使没有新覆盖率，也尝试继续探索（更aggressive）
-                    next_io_syscalls = self._find_next_io_syscalls(checkpoint.trace_file, checkpoint.syscall_index)
-                    if next_io_syscalls and checkpoint.depth < self.max_depth - 1:
-                        next_syscall = next_io_syscalls[0]
-                        print(f"[DynamicForkController] 🔄 Aggressive: continuing from checkpoint to syscall[{next_syscall}]")
-                        return self._explore_at_checkpoint(checkpoint.trace_file, next_syscall,
-                                                         checkpoint.depth + 1, iteration_id, checkpoint.checkpoint_id)
-                    else:
-                        print(f"[DynamicForkController] 🔚 Checkpoint exploration exhausted")
-                        return False
+                    print(f"[DynamicForkController] ⬅️  Program finished (normal exit, no new coverage), backtracking...")
+                    return False  # 无新发现，回退
 
         except Exception as e:
             print(f"[DynamicForkController] Error during checkpoint restoration: {e}")
@@ -527,31 +591,87 @@ class DynamicForkController:
         
         return None
     
-    def _find_io_syscalls(self, trace: Trace) -> list:
+    def _find_io_syscalls(self, trace: Trace, max_fork_points: int = 2) -> list:
         """
-        简化版：找到所有IO syscalls
-        
+        智能选择IO syscalls作为fork点
+
+        ✅ 2025-11-18: 优化 - 限制fork点数量，避免过多执行
+
+        策略:
+        1. 优先级排序: read > write > getrandom
+        2. 返回值大小: 大返回值更可能影响程序行为
+        3. 限制数量: 只选择top N个最重要的IO syscalls
+
+        Args:
+            trace: Trace对象
+            max_fork_points: 最大fork点数量（默认2）
+
         Returns:
-            IO syscall索引列表
+            IO syscall索引列表（已排序，最多max_fork_points个）
         """
         # 导入TraceAnalyzer
         import sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'analysis'))
         from trace_analyzer import TraceAnalyzer
-        
+
         analyzer = TraceAnalyzer(trace.file_path)
-        io_syscalls = []
-        
+
+        # ✅ 收集IO syscalls及其元信息
+        io_candidates = []
+
         for sc in analyzer.syscalls:
             # 只考虑IO syscalls
             if sc.name in ['read', 'recv', 'recvfrom', 'getrandom', 'write', 'send']:
                 # 跳过前10%的syscalls（初始化阶段）
                 if sc.index < len(analyzer.syscalls) * 0.1:
                     continue
-                io_syscalls.append(sc.index)
-        
-        return io_syscalls
+
+                # ✅ 计算优先级分数
+                priority_score = 0
+
+                # 1. Syscall类型优先级
+                if sc.name in ['read', 'recv', 'recvfrom']:
+                    priority_score += 100  # 最高优先级
+                elif sc.name in ['getrandom']:
+                    priority_score += 50   # 中等优先级
+                elif sc.name in ['write', 'send']:
+                    priority_score += 30   # 较低优先级
+
+                # 2. 返回值大小（表示数据量）
+                try:
+                    retval = int(sc.retval) if hasattr(sc, 'retval') else 0
+                    if retval > 0:
+                        priority_score += min(retval, 100)  # 最多加100分
+                except:
+                    pass
+
+                # 3. 位置加成（中间位置的syscalls更重要）
+                total_syscalls = len(analyzer.syscalls)
+                position_ratio = sc.index / total_syscalls
+                if 0.2 < position_ratio < 0.8:  # 中间60%
+                    priority_score += 20
+
+                io_candidates.append({
+                    'index': sc.index,
+                    'name': sc.name,
+                    'retval': int(sc.retval) if hasattr(sc, 'retval') else 0,
+                    'priority': priority_score
+                })
+
+        # ✅ 按优先级排序并限制数量
+        io_candidates.sort(key=lambda x: x['priority'], reverse=True)
+        selected = io_candidates[:max_fork_points]
+
+        # 返回索引列表
+        result = [item['index'] for item in selected]
+
+        if result:
+            print(f"[DynamicForkController] ✅ Selected {len(result)}/{len(io_candidates)} IO syscalls as fork points:")
+            for item in selected:
+                print(f"  - syscall[{item['index']}] {item['name']}: retval={item['retval']}, priority={item['priority']:.0f}")
+
+        return result
 
     def _select_diverse_fork_point(self, io_syscalls: list, iteration_id: int) -> int:
         """

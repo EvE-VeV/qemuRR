@@ -63,30 +63,22 @@ class SyscallInfo:
 
 @dataclass
 class TreeNode:
-    """Tree node supporting multiple node types"""
+    """Tree node representing a syscall execution or fork point"""
     node_id: int
-    node_type: str = "syscall"
-    
+    node_type: str = "syscall"  # "syscall" or "fork"
     syscall_index: int = -1
     syscall_name: str = ""
     retval: str = "?"
     pid: int = 0
     was_fuzzed: bool = False
-    
-    fork_index: int = -1
-    fork_depth: int = 0
-    
-    variant_id: str = ""
-    syscall_range: tuple = None
-    
-    iteration_id: int = -1
-    
+
     children: List['TreeNode'] = field(default_factory=list)
     parent: Optional['TreeNode'] = None
-    
+
     @property
-    def is_iteration(self) -> bool:
-        return self.node_type == "iteration"
+    def is_fork_node(self) -> bool:
+        """Check if this is a fork node"""
+        return self.node_type == "fork"
 
 class RealtimeTreeBuilder:
     """Realtime tree builder"""
@@ -96,29 +88,24 @@ class RealtimeTreeBuilder:
         self.pipe_fd = None
         self._output_file = output_html
 
+        # Tree structure
         self.root: Optional[TreeNode] = None
         self.all_nodes: Dict[int, TreeNode] = {}
         self.node_counter = 0
 
-        self.current_node: Optional[TreeNode] = None
-        self.pid_to_node: Dict[int, TreeNode] = {}
-        self.pid_to_variant: Dict[int, TreeNode] = {}
-
-        # 添加简化的fork跟踪机制
+        # Fork tracking
         self.fork_child_to_parent: Dict[int, int] = {}  # child_pid -> parent_pid
         self.fork_child_to_fork_index: Dict[int, int] = {}  # child_pid -> fork_index
         self.pid_to_last_syscall: Dict[int, TreeNode] = {}  # pid -> last_syscall_node
+        self.fork_nodes: Dict[tuple, TreeNode] = {}  # (parent_pid, fork_index) -> fork_node
+        self.fork_child_to_fork_node: Dict[int, TreeNode] = {}  # child_pid -> fork_node
 
-        self.fork_points: Dict[int, TreeNode] = {}
-        self.fork_nodes: Dict[tuple, TreeNode] = {}
-        self.pending_forks: Dict[int, TreeNode] = {}
-        self.current_iteration_id: int = -1
-        self.current_iteration_node: Optional[TreeNode] = None
-
-        self.total_syscalls = 0
+        # Statistics
         self.total_forks = 0
-        self.tree_finalized = False
+        self.total_executions = 0
+        self.current_iteration_id: int = -1  # For logging only
 
+        # Threading
         self.running = False
         self.receiver_thread = None
 
@@ -218,10 +205,6 @@ class RealtimeTreeBuilder:
                     else:
                         self._handle_syscall_exit(syscall_info)
 
-                # 定期打印进度
-                if self.total_syscalls % 100 == 0 and self.total_syscalls > 0:
-                    print(f"[Visualizer] Progress: {self.total_syscalls} syscalls received", flush=True)
-
                 else:
                     print(f"[Visualizer] Warning: unknown message type {msg_type}", flush=True)
 
@@ -232,7 +215,7 @@ class RealtimeTreeBuilder:
 
         finally:
             # 关键修复：确保在receiver线程结束时生成HTML
-            print(f"[Visualizer] Receiver thread ended with {self.total_syscalls} syscalls")
+            print(f"[Visualizer] Receiver thread ended, generating final tree visualization...")
             print(f"[Visualizer] Generating HTML from receiver thread...")
             try:
                 self.generate_html(getattr(self, '_output_file', '/tmp/fuzzing_tree.html'), verbose=True)
@@ -271,159 +254,65 @@ class RealtimeTreeBuilder:
         self.current_iteration_id = iteration_id
         
     def _handle_fork(self, parent_pid: int, child_pid: int, fork_index: int):
-        """Record fork relationship (简化版 - 采用simple_tree_visualizer方法)"""
+        """Record fork relationship and create fork node for branching"""
+        print(f"[Visualizer] 🍴 RECEIVED FORK message: parent={parent_pid} -> child={child_pid} @ syscall[{fork_index}]", flush=True)
+        print(f"[Visualizer] DEBUG: _handle_fork started", flush=True)
+
         self.fork_child_to_parent[child_pid] = parent_pid
         self.fork_child_to_fork_index[child_pid] = fork_index
         self.total_forks += 1
-        print(f"[Visualizer] Fork: parent {parent_pid} -> child {child_pid} @ [{fork_index}]", flush=True)
-    
-    def _find_node_at_index(self, start_node: TreeNode, target_index: int) -> TreeNode:
-        """DFS to find node with matching syscall_index"""
-        if start_node.syscall_index == target_index:
-            return start_node
-        
-        for child in start_node.children:
-            result = self._find_node_at_index(child, target_index)
-            if result:
-                return result
-        
-        return None
-    
-    def _find_parent_variant(self, node: TreeNode) -> Optional[TreeNode]:
-        """Find nearest variant node by traversing up"""
-        current = node.parent
-        while current:
-            if current.node_type == "variant":
-                return current
-            current = current.parent
-        return None
+        print(f"[Visualizer] DEBUG: Updated fork tracking, total_forks={self.total_forks}", flush=True)
 
-    def _recalculate_variant_range(self, variant_node: TreeNode):
-        if not variant_node.children:
-            variant_node.syscall_range = None
-            return
-        indexes = [child.syscall_index for child in variant_node.children if child.syscall_index >= 0]
-        if indexes:
-            variant_node.syscall_range = (min(indexes), max(indexes))
-        else:
-            variant_node.syscall_range = None
+        # Find or create fork node at this (parent_pid, fork_index)
+        fork_key = (parent_pid, fork_index)
+        print(f"[Visualizer] DEBUG: Checking fork_key={fork_key}, already exists={fork_key in self.fork_nodes}", flush=True)
+        if fork_key not in self.fork_nodes:
+            # Find the syscall node at fork_index for parent_pid
+            print(f"[Visualizer] DEBUG: Searching for syscall node, all_nodes count={len(self.all_nodes)}", flush=True)
+            fork_syscall_node = None
+            checked_count = 0
+            for node in self.all_nodes.values():
+                checked_count += 1
+                if node.syscall_index == fork_index and node.pid == parent_pid and not node.is_fork_node:
+                    fork_syscall_node = node
+                    print(f"[Visualizer] DEBUG: Found matching node after checking {checked_count} nodes", flush=True)
+                    break
+            print(f"[Visualizer] DEBUG: Search complete, checked {checked_count} nodes, found={fork_syscall_node is not None}", flush=True)
 
-    def _extract_baseline_from_fork(self, iteration_node: TreeNode, fork_node: TreeNode):
-        """Extract baseline syscalls that appear before the fork point.
-        
-        Baseline syscalls are those that were added directly to the iteration node
-        (from baseline execution) before the fork happened. We extract these and
-        put them in a Baseline node.
-        
-        Args:
-            iteration_node: The iteration node containing baseline syscalls
-            fork_node: The fork node where variants diverge
-        """
-        if iteration_node.node_type != "iteration":
-            return
-        
-        # 递归收集所有baseline syscalls（现在是链式结构）
-        def collect_baseline_chain(node, fork_index):
-            """递归收集index < fork_index的所有syscall nodes（链式）"""
-            baseline = []
-            for child in list(node.children):
-                if child.node_type == "syscall":
-                    if fork_index > 0 and child.syscall_index < fork_index:
-                        baseline.append(child)
-                        # 递归收集这个syscall的children（链式）
-                        baseline.extend(collect_baseline_chain(child, fork_index))
-                    # 如果syscall_index >= fork_index，停止
-            return baseline
-        
-        baseline_syscalls = collect_baseline_chain(iteration_node, fork_node.fork_index)
-        
-        # 收集非syscall children（Fork nodes等）
-        remaining_children = [c for c in iteration_node.children if c.node_type != "syscall"]
-        
-        if not baseline_syscalls:
-            return
-        
-        indexes = [s.syscall_index for s in baseline_syscalls if s.syscall_index >= 0]
-        if indexes:
-            start_index = min(indexes)
-            end_index = max(indexes)
-            baseline_label = f"Baseline [{start_index}-{end_index}]"
-        else:
-            start_index = -1
-            end_index = -1
-            baseline_label = "Baseline"
-        
-        baseline_node = TreeNode(
-            node_id=self.node_counter,
-            node_type="baseline",
-            syscall_name=baseline_label,
-            syscall_range=(start_index, end_index) if start_index >= 0 else None
-        )
-        self.node_counter += 1
-        self.all_nodes[baseline_node.node_id] = baseline_node
-        
-        # 将第一个baseline syscall作为baseline_node的唯一child（保持链式结构）
-        if baseline_syscalls:
-            first_baseline = baseline_syscalls[0]
-            # 从原parent移除
-            if first_baseline.parent and first_baseline in first_baseline.parent.children:
-                first_baseline.parent.children.remove(first_baseline)
-            # 添加到baseline_node
-            baseline_node.children.append(first_baseline)
-            first_baseline.parent = baseline_node
-        
-        try:
-            fork_index = remaining_children.index(fork_node)
-        except ValueError:
-            fork_index = len(remaining_children)
-        
-        remaining_children.insert(fork_index, baseline_node)
-        baseline_node.parent = iteration_node
-        
-        iteration_node.children = remaining_children
+            if fork_syscall_node:
+                # Create fork node as a child of the fork_syscall_node
+                fork_node = TreeNode(
+                    node_id=self.node_counter,
+                    node_type="fork",
+                    syscall_index=fork_index,
+                    syscall_name=f"Fork@{fork_index}",
+                    pid=parent_pid
+                )
+                self.node_counter += 1
+                self.all_nodes[fork_node.node_id] = fork_node
 
-    def _finalize_tree(self):
-        if self.tree_finalized or not self.root:
-            return
-        self._finalize_node(self.root)
-        self.tree_finalized = True
+                # Insert fork node between fork_syscall_node and its children
+                fork_node.parent = fork_syscall_node
+                fork_syscall_node.children.append(fork_node)
 
-    def _finalize_node(self, node: TreeNode):
-        for child in list(node.children):
-            self._finalize_node(child)
-        if node.node_type == "fork" and node.parent is not None:
-            self._extract_baseline_from_fork(node.parent, node)
-    
-    def _generate_variant_id(self, fork_node: TreeNode) -> str:
-        """Generate variant ID like '0A', '0B', '0A-1', '0A-2'"""
-        variant_count = len([c for c in fork_node.children if c.node_type == "variant"])
-        
-        parent_variant = self._find_parent_variant(fork_node)
-        
-        if parent_variant:
-            return f"{parent_variant.variant_id}-{variant_count + 1}"
-        else:
-            letter = chr(ord('A') + variant_count)
-            return f"0{letter}"
-    
-    def _update_variant_range(self, pid: int, syscall_index: int):
-        """Update variant's syscall range"""
-        if pid in self.pid_to_variant:
-            variant_node = self.pid_to_variant[pid]
-            if variant_node.syscall_range is None:
-                variant_node.syscall_range = (syscall_index, syscall_index)
+                self.fork_nodes[fork_key] = fork_node
+                print(f"[Visualizer] Created fork node[{fork_node.node_id}] @ [{fork_index}] for parent {parent_pid}", flush=True)
             else:
-                start, _ = variant_node.syscall_range
-                variant_node.syscall_range = (start, syscall_index)
+                print(f"[Visualizer] Warning: Could not find syscall node at [{fork_index}] for parent {parent_pid}", flush=True)
+
+        # Record that this child should connect to the fork node
+        fork_node = self.fork_nodes.get(fork_key)
+        if fork_node:
+            self.fork_child_to_fork_node[child_pid] = fork_node
+            print(f"[Visualizer] Fork: parent {parent_pid} -> child {child_pid} @ [{fork_index}] (via fork_node)", flush=True)
+        else:
+            print(f"[Visualizer] Fork: parent {parent_pid} -> child {child_pid} @ [{fork_index}] (no fork_node)", flush=True)
     
     def _handle_syscall_enter(self, info: SyscallInfo):
-        """Handle syscall enter (简化版 - 采用simple_tree_visualizer方法)"""
-        self.total_syscalls += 1
-
+        """Handle syscall enter - creates a tree node for this syscall execution"""
         # Create syscall node
         node = TreeNode(
             node_id=self.node_counter,
-            node_type="syscall",
             syscall_index=info.index,
             syscall_name=info.name,
             pid=info.pid,
@@ -435,23 +324,33 @@ class RealtimeTreeBuilder:
         # Determine parent
         parent_node = None
 
-        if info.pid in self.pid_to_last_syscall:
-            # Chain to previous syscall of same PID
-            parent_node = self.pid_to_last_syscall[info.pid]
-        elif info.pid in self.fork_child_to_parent:
-            # This is first syscall of forked child
-            # Find the fork point syscall as parent
-            fork_index = self.fork_child_to_fork_index.get(info.pid, -1)
+        # Priority 1: Check if this is first syscall of forked child → connect to fork node
+        if info.pid in self.fork_child_to_fork_node:
+            fork_node = self.fork_child_to_fork_node[info.pid]
+            parent_node = fork_node
+            print(f"[Visualizer] Connecting child {info.pid} syscall[{info.index}] to fork_node[{fork_node.node_id}]", flush=True)
+            # Remove from dict after first syscall (subsequent syscalls chain normally)
+            del self.fork_child_to_fork_node[info.pid]
 
-            # Search for syscall with index == fork_index in all nodes
+        # Priority 2: Chain to previous syscall of same PID
+        elif info.pid in self.pid_to_last_syscall:
+            parent_node = self.pid_to_last_syscall[info.pid]
+
+        # Priority 3: Legacy fallback for fork children without fork_node
+        elif info.pid in self.fork_child_to_parent:
+            fork_index = self.fork_child_to_fork_index.get(info.pid, -1)
+            parent_pid = self.fork_child_to_parent[info.pid]
+
+            # Search for parent's syscall at fork_index
             for candidate in self.all_nodes.values():
-                if candidate.syscall_index == fork_index:
+                if (candidate.syscall_index == fork_index and
+                    candidate.pid == parent_pid and
+                    not candidate.is_fork_node):
                     parent_node = candidate
                     break
 
             if not parent_node:
                 # Fallback: chain to parent's last syscall
-                parent_pid = self.fork_child_to_parent[info.pid]
                 if parent_pid in self.pid_to_last_syscall:
                     parent_node = self.pid_to_last_syscall[parent_pid]
 
@@ -464,7 +363,6 @@ class RealtimeTreeBuilder:
                 # First syscall ever - create virtual root
                 self.root = TreeNode(
                     node_id=-1,
-                    node_type="syscall",
                     syscall_index=-1,
                     syscall_name="Root",
                     pid=0
@@ -612,11 +510,32 @@ class RealtimeTreeBuilder:
         # 简化：跳过复杂的tree finalization
         tree_json = self._node_to_json(self.root)
 
-        # 使用简化的统计
+        # 🔥 修复: 统计实际在树中的节点，而非all_nodes
+        def count_nodes_in_tree(node):
+            """递归统计树中实际节点数"""
+            count = 1
+            for child in node.children:
+                count += count_nodes_in_tree(child)
+            return count
+
+        def collect_tree_nodes(node, result=None):
+            """递归收集树中所有节点"""
+            if result is None:
+                result = []
+            result.append(node)
+            for child in node.children:
+                collect_tree_nodes(child, result)
+            return result
+
+        nodes_in_tree = count_nodes_in_tree(self.root) if self.root else 0
+        tree_nodes = collect_tree_nodes(self.root) if self.root else []
+        fuzzed_in_tree = sum(1 for n in tree_nodes if n.was_fuzzed)
+
+        # 🔥 修复: 使用树中实际节点的统计
         stats = {
-            'total_syscalls': self.total_syscalls,
+            'total_nodes': nodes_in_tree,  # 树中实际节点数（真实的syscall执行）
             'total_forks': self.total_forks,
-            'mutations': sum(1 for n in self.all_nodes.values() if n.was_fuzzed)
+            'mutations': fuzzed_in_tree  # 树中被fuzz的节点数
         }
         # 采用simple_tree_visualizer的简化HTML模板
         import json
@@ -689,7 +608,7 @@ class RealtimeTreeBuilder:
     <div id="header">
         <h1>Syscall Execution Tree (Realtime)</h1>
         <div id="stats">
-            Total syscalls: <span class="stat-value">{stats['total_syscalls']}</span> |
+            Total Syscalls: <span class="stat-value">{stats['total_nodes']}</span> |
             Forks: <span class="stat-value">{stats['total_forks']}</span> |
             Mutations: <span class="stat-value">{stats['mutations']}</span>
         </div>
@@ -728,17 +647,37 @@ class RealtimeTreeBuilder:
         const nodes = g.selectAll(".node")
             .data(treeLayout.descendants())
             .join("g")
-            .attr("class", d => "node" + (d.data.was_fuzzed ? " fuzzed" : ""))
+            .attr("class", d => "node" +
+                (d.data.is_fork ? " fork" : "") +
+                (d.data.was_fuzzed ? " fuzzed" : ""))
             .attr("transform", d => "translate(" + d.y + "," + d.x + ")");
 
-        nodes.append("circle")
+        // Fork nodes: draw diamond shape
+        nodes.filter(d => d.data.is_fork)
+            .append("rect")
+            .attr("x", -6)
+            .attr("y", -6)
+            .attr("width", 12)
+            .attr("height", 12)
+            .attr("transform", "rotate(45)")
+            .attr("fill", "#ff9f43")
+            .attr("stroke", "#f39c12")
+            .attr("stroke-width", 2);
+
+        // Syscall nodes: draw circle
+        nodes.filter(d => !d.data.is_fork)
+            .append("circle")
             .attr("r", 5)
-            .attr("fill", d => d.data.was_fuzzed ? "#ff4757" : "#48c774");
+            .attr("fill", d => d.data.was_fuzzed ? "#ff4757" : "#48c774")
+            .attr("stroke", d => d.data.was_fuzzed ? "#ee5a6f" : "#5ad178")
+            .attr("stroke-width", 2);
 
         nodes.append("text")
             .attr("x", 10)
             .attr("y", 4)
-            .text(d => "[" + d.data.syscall_index + "] " + d.data.syscall_name + " = " + d.data.retval);
+            .text(d => d.data.is_fork ?
+                d.data.syscall_name :
+                "[" + d.data.syscall_index + "] " + d.data.syscall_name + " = " + d.data.retval);
 
         // Zoom
         svg.call(d3.zoom()
@@ -753,19 +692,21 @@ class RealtimeTreeBuilder:
 
         if verbose:
             print(f"[Visualizer] Generated {output_file}")
-            print(f"  Total syscalls: {stats['total_syscalls']}")
+            print(f"  Total syscalls (in tree): {stats['total_nodes']}")
             print(f"  Total forks: {stats['total_forks']}")
             print(f"  Mutations: {stats['mutations']}")
     
     def _node_to_json(self, node: TreeNode) -> dict:
-        """Convert tree node to JSON (简化版 - 采用simple_tree_visualizer方法)"""
+        """Convert tree node to JSON"""
         return {
             "node_id": node.node_id,
+            "node_type": node.node_type,
             "syscall_index": node.syscall_index,
             "syscall_name": node.syscall_name,
             "pid": node.pid,
             "retval": node.retval,
             "was_fuzzed": node.was_fuzzed,
+            "is_fork": node.is_fork_node,
             "children": [self._node_to_json(child) for child in node.children]
         }
 
@@ -812,12 +753,12 @@ def main():
             time.sleep(0.5)
             
             if time.time() - last_update >= args.update_interval:
-                if builder.total_syscalls > 0:
+                if builder.total_executions > 0:
                     # 只在有新数据时更新
-                    current_count = builder.total_syscalls
+                    current_count = builder.total_executions
                     if not hasattr(builder, '_last_count') or current_count > builder._last_count:
                         builder.generate_html(args.output)
-                        print(f"[Visualizer] Updated ({builder.total_syscalls} syscalls, {builder.total_forks} forks)", flush=True)
+                        print(f"[Visualizer] Updated ({builder.total_executions} total execs, {builder.total_forks} forks)", flush=True)
                         builder._last_count = current_count
                 last_update = time.time()
     
@@ -832,7 +773,7 @@ def main():
         
         print(f"\n{'='*70}")
         print(f"  Final tree saved to: {args.output}")
-        print(f"  Total syscalls: {builder.total_syscalls}")
+        print(f"  Total executions processed: {builder.total_executions}")
         print(f"  Total forks: {builder.total_forks}")
         print(f"{'='*70}\n")
 

@@ -25,8 +25,12 @@ FUZZ_CMD_OVERWRITE_AT_OFFSET = 11    # 偏移覆写
 # ===== 共享内存常量 (必须与rr_constants.h匹配) =====
 FUZZ_MAGIC = 0x46555A5A             # "FUZZ" - 共享内存魔数
 FUZZ_MAX_INSTRUCTIONS = 32          # 最大指令队列长度
+FUZZ_MAX_VARIANTS = 10              # 最大变体数量 (对应FuzzSharedMemory.variants[10])
 FUZZ_INSTRUCTION_DATA = 256         # 每条指令的数据负载大小
-FUZZ_SHM_SIZE = 64 * 1024           # 共享内存大小: 64KB (必须与rr_constants.h匹配)
+# ✅ 修复: 增加共享内存大小以容纳完整结构
+# Header(36B) + instructions[32](8960B) + variants[10](89640B) = 98636B
+# 向上取整到128KB以提供缓冲空间
+FUZZ_SHM_SIZE = 128 * 1024          # 共享内存大小: 128KB (必须与rr_constants.h匹配)
 
 # ===== 第3阶段: 覆盖率常量 =====
 COVERAGE_MAP_SIZE = 64 * 1024       # 覆盖率位图大小: 64KB

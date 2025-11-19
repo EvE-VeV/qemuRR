@@ -173,28 +173,34 @@
  * 来源：计算得出
  * - 必须容纳：header + (instructions × instruction_size)
  * - 必须与 Python 端一致！
- * 
+ *
  * ⚠️ 修改此值时必须同步更新：
- * - fuzzing/fuzz_conductor.py 中的 size 参数
+ * - fuzzing/conductor/constants.py 中的 FUZZ_SHM_SIZE
  * - config/template/rr_config.fuzzing.template
+ *
+ * ✅ 修复: 增加到128KB以容纳完整FuzzSharedMemory结构
+ * - Header: 36B + instructions[32]: 8960B + variants[10]: 89640B = 98636B
+ * - 128KB提供足够缓冲空间
  */
-#define RR_FUZZ_SHM_SIZE        (64 * 1024)
+#define RR_FUZZ_SHM_SIZE        (128 * 1024)
 
 /**
  * 初始化阶段 Syscall 数量阈值
- * 
+ *
  * 来源：经验值（启发式）
- * - 大多数程序的前 10-15 个 syscall 是初始化
- * - 包括：mmap、brk、set_tid_address、arch_prctl 等
- * 
+ * - 大多数程序的前 25 个 syscall 包含初始化
+ * - 包括：mmap、brk、set_tid_address、arch_prctl、动态链接等
+ *
  * ⚠️ 这是临时方案！
  * TODO: 实现自适应检测（基于符号、时间或状态机）
- * 
+ *
  * 使用建议：
  * - 可通过配置文件覆盖
  * - 未来应该改为动态检测
+ *
+ * ✅ 与Python端同步 (conductor/constants.py: INIT_PHASE_THRESHOLD = 25)
  */
-#define RR_INIT_PHASE_THRESHOLD     10
+#define RR_INIT_PHASE_THRESHOLD     25
 
 /* ========== 映射管理 ========== */
 

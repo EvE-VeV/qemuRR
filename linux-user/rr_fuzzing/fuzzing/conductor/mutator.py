@@ -12,6 +12,7 @@ import json
 import struct
 import random
 import sys
+import time  # 🔥 修复: 用于生成recipe id
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,6 +28,7 @@ from .constants import (
     PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS
 )
 from .instruction import FuzzInstruction
+from .io_mutator import IOReturnValueMutator
 
 
 class BaseMutator:
@@ -39,24 +41,43 @@ class BaseMutator:
     架构: DETAILED_ARCHITECTURE.md 第87-106行
     """
     
-    def __init__(self):
-        """初始化BaseMutator"""
+    def __init__(self, use_io_mutation: bool = True):
+        """初始化BaseMutator
+
+        参数:
+            use_io_mutation: 是否启用IO返回值变异 (默认True)
+        """
         self.iteration_count = 0
-        print("[BaseMutator] 已初始化 (随机变异模式)")
+        self.use_io_mutation = use_io_mutation
+        self.io_mutator = IOReturnValueMutator() if use_io_mutation else None
+        # ✅ 2025-11-17: 初始化 mutation type 跟踪
+        self.last_mutation_type = 'unknown'
+
+        mode_str = "随机变异 + IO返回值变异" if use_io_mutation else "随机变异模式"
+        print(f"[BaseMutator] 已初始化 ({mode_str})")
     
     def mutate(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
         """
         生成随机变异
-        
+
         参数:
             trace: Trace对象 (对于BaseMutator可能为None)
             fork_point: Syscall index of fork point (for compatibility with SmartMutator)
-        
+
         返回:
             FuzzInstruction列表
         """
         self.iteration_count += 1
-        
+
+        # 🔥 新特性：70%概率使用IO返回值变异（如果可用且有trace）
+        if self.use_io_mutation and self.io_mutator and trace and random.random() < 0.7:
+            # ✅ 2025-11-17: 设置 mutation type 用于跟踪
+            self.last_mutation_type = 'io_mutation'
+            return self._generate_io_mutations(trace, fork_point)
+
+        # 否则使用传统随机变异
+        # ✅ 2025-11-17: 设置 mutation type 用于跟踪
+        self.last_mutation_type = 'random'
         # 生成1-3个随机变异
         num_mutations = random.randint(1, 3)
         instructions = []
@@ -74,40 +95,241 @@ class BaseMutator:
                     syscall_index = random.randint(0, 99)
                 print(f"[BaseMutator] Mutation {i+1} targeting random syscall_index={syscall_index}")
             
-            # 随机变异类型
+            # 随机变异类型 - ✅ 新增 Aux Data 变异命令
             mutation_types = [
                 FUZZ_CMD_FLIP_BITS,
                 FUZZ_CMD_INTERESTING_VALUES,
                 FUZZ_CMD_BOUNDARY_VALUE,
                 FUZZ_CMD_REPLACE_BUFFER,
-                FUZZ_CMD_MUTATE_FLAGS
+                FUZZ_CMD_MUTATE_FLAGS,
+                # ⭐ 新增: Aux Data Mutation Engine (460 lines C code)
+                FUZZ_CMD_MUTATE_AUX_BUFFER,  # 核心功能：变异 aux_data 缓冲区
+                FUZZ_CMD_TRUNCATE,            # 截断攻击
+                FUZZ_CMD_EXTEND,              # 溢出攻击
+                FUZZ_CMD_LIGHT_MUTATION       # 轻量级变异
             ]
             cmd = random.choice(mutation_types)
-            
-            # 生成随机数据
+
+            # 生成随机数据 + ✅ 设置mutation_type
             if cmd == FUZZ_CMD_FLIP_BITS:
                 data = struct.pack('I', random.randint(1, 8))
+                mut_type = 'bitflip'
             elif cmd == FUZZ_CMD_INTERESTING_VALUES:
                 value = random.choice([0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF])
                 data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
+                mut_type = 'interesting_value'
             elif cmd == FUZZ_CMD_BOUNDARY_VALUE:
                 value = random.choice([0, -1, 0x7FFFFFFF, 0xFFFFFFFF])
                 data = struct.pack('q', value)
+                mut_type = 'boundary_value'
             elif cmd == FUZZ_CMD_REPLACE_BUFFER:
                 size = random.choice([4, 8, 16, 32])
                 data = bytes([random.randint(0, 255) for _ in range(size)])
+                mut_type = 'replace_buffer'
+            elif cmd == FUZZ_CMD_MUTATE_AUX_BUFFER:
+                # ⭐ Aux Data 变异：生成攻击模式数据
+                attack_patterns = [
+                    b'%s%s%s%s',           # 格式化字符串攻击
+                    b'A' * 64,             # 缓冲区溢出
+                    b'../../../etc/passwd', # 路径遍历
+                    b'; cat /etc/passwd',  # 命令注入
+                    b'\x00' * 8,           # NULL注入
+                ]
+                data = random.choice(attack_patterns)
+                mut_type = 'aux_buffer'
+            elif cmd == FUZZ_CMD_TRUNCATE:
+                # 截断攻击：减少数据大小
+                truncate_size = random.choice([0, 1, 2, 4, 8])
+                data = struct.pack('I', truncate_size)
+                mut_type = 'truncate'
+            elif cmd == FUZZ_CMD_EXTEND:
+                # 扩展攻击：增加数据大小触发溢出
+                extend_size = random.choice([64, 128, 256, 512, 1024])
+                data = struct.pack('I', extend_size)
+                mut_type = 'extend'
+            elif cmd == FUZZ_CMD_LIGHT_MUTATION:
+                # 轻量级变异：只翻转1-2位
+                data = struct.pack('I', random.randint(1, 2))
+                mut_type = 'light_mutation'
             else:  # MUTATE_FLAGS
                 data = struct.pack('q', random.randint(0, 0xFFFFFFFF))
-            
+                mut_type = 'flags'
+
             instruction = FuzzInstruction(
                 syscall_index=syscall_index,
                 cmd=cmd,
                 arg_index=1,
-                data=data
+                data=data,
+                mutation_type=mut_type  # ✅ 2025-11-18: 设置mutation type
             )
             instructions.append(instruction)
-        
+
         return instructions  # 这个是给Qemu读取的内容，以FuzzInstruction包装这样的一个Fuzz指令
+
+    def _generate_io_mutations(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
+        """生成IO返回值变异指令
+
+        参数:
+            trace: Trace对象
+            fork_point: Fork点syscall索引 (可选)
+
+        返回:
+            FuzzInstruction列表
+        """
+        print(f"[BaseMutator] 🔥 Attempting IO mutation, trace={trace}, fork_point={fork_point}")
+
+        # 识别IO syscalls
+        io_syscalls = self.io_mutator.identify_io_syscalls(trace)
+        print(f"[BaseMutator] 🔍 Found {len(io_syscalls)} IO syscalls: {io_syscalls}")
+
+        if not io_syscalls:
+            # 没有IO syscalls，返回普通随机变异
+            print("[BaseMutator] 🚨 No IO syscalls found, falling back to random mutation")
+            return self._generate_random_mutations(trace, fork_point)
+
+        # 优先选择fork_point的IO syscall（如果指定）
+        target_io = None
+        if fork_point is not None:
+            for io in io_syscalls:
+                if io['index'] == fork_point:
+                    target_io = io
+                    break
+
+        # 如果没有在fork_point找到IO syscall，随机选一个
+        if target_io is None:
+            target_io = random.choice(io_syscalls)
+
+        # 为这个IO syscall生成变异
+        mutations = self.io_mutator.generate_mutations_for_io(
+            target_io,
+            strategy='buffer_overflow' if target_io['is_input'] else 'boundary'
+        )
+
+        # 优先级排序
+        mutations = self.io_mutator.prioritize_mutations(mutations)
+
+        # ✅ 修复 2025-11-18: 增加mutation数量，确保测试各种大小的值
+        # 取前3-6个高优先级变异（原来是1-2个，导致值分布单一）
+        num_mutations = random.randint(3, 6)
+        selected_mutations = mutations[:num_mutations]
+
+        # 转换为FuzzInstruction
+        instructions = []
+        for m in selected_mutations:
+            # 1️⃣ 返回值变异
+            data = struct.pack('Q', m.new_return_value)  # 新返回值
+
+            instruction = FuzzInstruction(
+                syscall_index=m.syscall_index,
+                cmd=FUZZ_CMD_MUTATE_ARG,  # 临时使用，后续可以定义专门的IO_RETURN命令
+                arg_index=0xFF,  # 特殊标记：0xFF表示改变返回值
+                data=data,
+                mutation_type='io_return_value'  # ✅ 2025-11-18: 设置mutation type
+            )
+            instructions.append(instruction)
+
+            print(f"[BaseMutator] 🎯 IO Mutation (retval): {m.description}")
+
+            # 2️⃣ 如果有buffer_content，也生成REPLACE_BUFFER指令
+            if m.buffer_content:
+                # 获取buffer参数索引（read的第二个参数是buffer指针）
+                # read(fd, buf, count) -> buf是args[1]
+                buf_arg_index = 1
+
+                buffer_instruction = FuzzInstruction(
+                    syscall_index=m.syscall_index,
+                    cmd=FUZZ_CMD_REPLACE_BUFFER,
+                    arg_index=buf_arg_index,
+                    data=m.buffer_content[:min(len(m.buffer_content), 256)]  # 限制256字节
+                )
+                instructions.append(buffer_instruction)
+
+                print(f"[BaseMutator] 🎯 IO Mutation (buffer): Fill {len(m.buffer_content)} bytes")
+
+        return instructions
+
+    def _generate_random_mutations(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
+        """生成传统随机变异（辅助方法）"""
+        # 这是原来mutate方法的实现，提取为独立方法
+        num_mutations = random.randint(1, 3)
+        instructions = []
+
+        for i in range(num_mutations):
+            if i == 0 and fork_point is not None:
+                syscall_index = fork_point
+            else:
+                if fork_point is not None:
+                    syscall_index = random.randint(fork_point, max(fork_point + 20, 99))
+                else:
+                    syscall_index = random.randint(0, 99)
+
+            # ✅ 新增 Aux Data 变异命令（与mutate方法保持一致）
+            mutation_types = [
+                FUZZ_CMD_FLIP_BITS,
+                FUZZ_CMD_INTERESTING_VALUES,
+                FUZZ_CMD_BOUNDARY_VALUE,
+                FUZZ_CMD_REPLACE_BUFFER,
+                FUZZ_CMD_MUTATE_FLAGS,
+                # ⭐ Aux Data Mutation Engine
+                FUZZ_CMD_MUTATE_AUX_BUFFER,
+                FUZZ_CMD_TRUNCATE,
+                FUZZ_CMD_EXTEND,
+                FUZZ_CMD_LIGHT_MUTATION
+            ]
+            cmd = random.choice(mutation_types)
+
+            # ✅ 2025-11-18: 设置mutation_type（修复94% unknown问题）
+            if cmd == FUZZ_CMD_FLIP_BITS:
+                data = struct.pack('I', random.randint(1, 8))
+                mut_type = 'bitflip'
+            elif cmd == FUZZ_CMD_INTERESTING_VALUES:
+                value = random.choice([0, 1, -1, 0xFF, 0xFFFF, 0xFFFFFFFF])
+                data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
+                mut_type = 'interesting_value'
+            elif cmd == FUZZ_CMD_BOUNDARY_VALUE:
+                value = random.choice([0, -1, 0x7FFFFFFF, 0xFFFFFFFF])
+                data = struct.pack('q', value)
+                mut_type = 'boundary_value'
+            elif cmd == FUZZ_CMD_REPLACE_BUFFER:
+                size = random.choice([4, 8, 16, 32])
+                data = bytes([random.randint(0, 255) for _ in range(size)])
+                mut_type = 'replace_buffer'
+            elif cmd == FUZZ_CMD_MUTATE_AUX_BUFFER:
+                # ⭐ Aux Data 变异：生成攻击模式数据
+                attack_patterns = [
+                    b'%s%s%s%s',           # 格式化字符串攻击
+                    b'A' * 64,             # 缓冲区溢出
+                    b'../../../etc/passwd', # 路径遍历
+                    b'; cat /etc/passwd',  # 命令注入
+                    b'\x00' * 8,           # NULL注入
+                ]
+                data = random.choice(attack_patterns)
+                mut_type = 'aux_buffer'
+            elif cmd == FUZZ_CMD_TRUNCATE:
+                truncate_size = random.choice([0, 1, 2, 4, 8])
+                data = struct.pack('I', truncate_size)
+                mut_type = 'truncate'
+            elif cmd == FUZZ_CMD_EXTEND:
+                extend_size = random.choice([64, 128, 256, 512, 1024])
+                data = struct.pack('I', extend_size)
+                mut_type = 'extend'
+            elif cmd == FUZZ_CMD_LIGHT_MUTATION:
+                data = struct.pack('I', random.randint(1, 2))
+                mut_type = 'light_mutation'
+            else:  # MUTATE_FLAGS
+                data = struct.pack('q', random.randint(0, 0xFFFFFFFF))
+                mut_type = 'flags'
+
+            instruction = FuzzInstruction(
+                syscall_index=syscall_index,
+                cmd=cmd,
+                arg_index=1,
+                data=data,
+                mutation_type=mut_type  # ✅ 2025-11-18: 添加mutation_type参数
+            )
+            instructions.append(instruction)
+
+        return instructions
 
 
 class SmartMutator:
@@ -216,6 +438,8 @@ class SmartMutator:
         self.stagnation_threshold = 1000  # 🔥 提高阈值: 1000次迭代无新coverage = 停滞
         self.is_stagnant = False  # 当前是否停滞
         self.total_iterations = 0  # 总迭代次数
+        # ✅ 2025-11-17: 初始化 mutation type 跟踪
+        self.last_mutation_type = 'unknown'
         print(f"[Mutator] 🔍 停滞检测已启用 (阈值={self.stagnation_threshold} 次迭代)")
     
     def _should_skip_mutation(self, syscall_info, index):
@@ -376,20 +600,20 @@ class SmartMutator:
             # 生成recipes
             raw_recipes = self.path_finder.generate_recipes(uncovered_branches, max_recipes=10)
 
-            # 转换为我们的格式
+            # 🔥 修复: PathFinder返回MutationRecipe对象，需要转换为字典
             auto_recipes = []
-            for recipe in raw_recipes:
-                recipe_dict = {
-                    'source_branch': recipe.source_branch,
-                    'target_branch': recipe.target_branch,
-                    'mutation_type': recipe.mutation_type,
-                    'syscall_index': recipe.syscall_index,
-                    'syscall_name': recipe.syscall_name,
-                    'arg_index': recipe.arg_index,
-                    'suggested_values': recipe.suggested_values,
-                    'priority': recipe.priority,
-                    'reason': f"PathFinder自动生成: {recipe.reason}"
-                }
+            for i, recipe in enumerate(raw_recipes):
+                # PathFinder返回的是MutationRecipe对象，转换为字典
+                recipe_dict = recipe.to_dict() if hasattr(recipe, 'to_dict') else recipe
+
+                # 🔥 修复: 确保有id字段（recipe_pool要求）
+                if 'id' not in recipe_dict or not recipe_dict['id']:
+                    recipe_dict['id'] = f"pathfinder_auto_{i}_{int(time.time())}"
+
+                # 转换为字符串id以确保兼容性
+                if isinstance(recipe_dict['id'], int):
+                    recipe_dict['id'] = f"pathfinder_{recipe_dict['id']}"
+
                 auto_recipes.append(recipe_dict)
 
             return auto_recipes
@@ -853,12 +1077,17 @@ class SmartMutator:
             list: FuzzInstruction列表
         """
         instrs = []
-        
+
         # ━━━━ 第2阶段: Recipe驱动模式 ━━━━
         if self.recipe_mode and self.recipes:
+            # ✅ 2025-11-17: 设置 mutation type 用于跟踪
+            self.last_mutation_type = 'recipe'
             return self._build_from_recipes(iteration)
-        
+
         # ━━━━ 增强: 随机变异模式 ━━━━
+        # ✅ 2025-11-17: 设置 mutation type 用于跟踪
+        self.last_mutation_type = 'smart_random'
+
         if not self.mutable_candidates:
             print("[Mutator] ⚠️  未发现可变异候选!")
             return instrs

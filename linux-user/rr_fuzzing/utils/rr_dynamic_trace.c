@@ -278,18 +278,24 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
 }
 
 void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t fork_syscall_index) {
-    if (!g_dynamic_trace_enabled) return;
-    
+    if (!g_dynamic_trace_enabled) {
+        fprintf(stderr, "[RR-DYNAMIC-TRACE] ⚠️  FORK message NOT sent: dynamic trace disabled\n");
+        return;
+    }
+
     rr_dynamic_trace_msg_t msg = {
         .type = RR_DYN_MSG_FORK,
         .pid = child_pid,
         .parent_pid = parent_pid
     };
-    
+
     msg.syscall_info.index = fork_syscall_index;
-    
+
     send_trace_msg(&msg);
-    
+
+    // Enhanced debug output
+    fprintf(stderr, "[RR-DYNAMIC-TRACE] 🍴 FORK message sent: parent=%u -> child=%u @ syscall[%u]\n",
+            parent_pid, child_pid, fork_syscall_index);
     RR_VERBOSE("Dynamic trace: fork %u -> %u @ syscall[%u]", parent_pid, child_pid, fork_syscall_index);
 }
 

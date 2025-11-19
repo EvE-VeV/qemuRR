@@ -13,6 +13,7 @@
 #include "../record/rr_aux_data.h"
 #include "../utils/rr_dynamic_trace.h"
 #include "../fuzzing/qemu_integration/rr_coverage.h"
+#include "../utils/rr_syscall_tree.h"  // ✅ C-Tree-P2: syscall tree tracking
 #include "rr_constants.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
@@ -314,6 +315,10 @@ int rr_framework_init(void)
     } else {
         RR_INFO("Coverage tracking initialized successfully");
     }
+
+    /* ✅ C-Tree-P2: 初始化Syscall Tree Builder */
+    rr_tree_init();
+    RR_INFO("Syscall tree builder initialized");
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     /* 初始化动态跟踪管道（用于树可视化） */
@@ -460,11 +465,22 @@ void rr_framework_cleanup(void)
 
     /* 清理子系统 */
     RR_VERBOSE("Cleaning up subsystems");
-    
+
+    /* ✅ C-Tree-P2: 导出Syscall Tree为JSON */
+    const char *tree_output = getenv("RR_TREE_OUTPUT");
+    if (tree_output) {
+        rr_tree_export_json(tree_output);
+    } else {
+        /* 默认输出到 /tmp/syscall_tree.json */
+        rr_tree_export_json("/tmp/syscall_tree.json");
+    }
+    rr_tree_cleanup();
+    RR_VERBOSE("Syscall tree exported and cleaned up");
+
     /* 清理Coverage模块 */
     rr_coverage_cleanup();
     RR_VERBOSE("Coverage tracking cleaned up");
-    
+
     rr_ipc_cleanup();
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE
@@ -659,11 +675,14 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
     /* 将可能修改过的参数写回到指针中 */
     *arg1 = args[0]; *arg2 = args[1]; *arg3 = args[2]; *arg4 = args[3];
     *arg5 = args[4]; *arg6 = args[5]; *arg7 = args[6]; *arg8 = args[7];
-    
+
+    /* ✅ 2025-11-17: IO Mutation 返回值覆盖已在 rr_replay_syscall() 中处理 */
+    /* 注意: ret 已经是覆盖后的值，由 rr_replay.c:655-664 处理 */
+
     /* 添加醒目的系统调用退出提示 - 调试阶段使用 */
     RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %d ===",
             syscall_name, num, (int)ret);
-    RR_INFO("===============================================================");    
+    RR_INFO("===============================================================");
     return ret;
 }
 
@@ -703,6 +722,30 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
     if (!rr_framework_enabled()) {
         RR_VERBOSE("POST_HOOK: Skipping syscall %d - framework not enabled", num);
         return;
+    }
+
+    /* ✅ C-Tree-P2: 记录syscall节点到树结构 */
+    if (g_rr_framework) {
+        uint64_t args_arr[6] = {
+            (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
+            (uint64_t)arg4, (uint64_t)arg5, (uint64_t)arg6
+        };
+        uint32_t node_id = rr_tree_add_syscall_node(
+            getpid(),                               // PID
+            g_rr_framework->replay_index,           // syscall_index
+            num,                                     // syscall_nr
+            get_syscall_name(num),                  // syscall_name
+            args_arr,                                // args
+            ret,                                     // retval
+            0,                                       // timestamp_enter (auto)
+            0                                        // timestamp_exit (auto)
+        );
+
+        /* ✅ C-Tree-P2: 检测fork系统调用并记录fork关系 */
+        if ((num == 56 || num == 57 || num == 58) && ret > 0) {  // clone/fork/vfork
+            rr_tree_add_fork_relation(node_id, (uint32_t)ret);
+            RR_VERBOSE("Recorded fork relation: parent_node=%u, child_pid=%u", node_id, (uint32_t)ret);
+        }
     }
 
     if (g_rr_framework->mode == RR_MODE_RECORD) {
@@ -885,12 +928,13 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             g_pending_mmap_length = 0;
         }
 
-        /* ✅ 修复：真实执行的syscall也要发送dynamic trace exit */
-        if (!g_rr_framework->silent_replay_mode) {
-            abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
-            rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
-                                           g_rr_framework->replay_index - 1, false);  // -1因为已递增
-        }
+        /* 🔥 修复：始终发送EXIT消息以保证tree visualization完整性
+         * Silent mode的目的是性能优化，不应该影响消息完整性
+         * 即使在silent replay期间，tree visualizer也需要接收完整的syscall消息
+         */
+        abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+        rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
+                                       g_rr_framework->replay_index - 1, false);  // -1因为已递增
         
         RR_VERBOSE("POST_HOOK: Replay mode, syscall=%d, ret=%d", num, (int)ret);
         return;

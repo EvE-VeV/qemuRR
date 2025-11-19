@@ -618,6 +618,40 @@ try_hybrid:
         goto replay_success;
     }
 
+    /* ✅ 2025-11-17: IO Return Value Mutation - Hybrid模式下的返回值覆盖 */
+    /* 关键修复: 在执行真实syscall之前检查是否需要覆盖返回值 */
+    /* 如果有覆盖，跳过真实syscall，直接返回覆盖的值 */
+    if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
+        abi_long original_ret = ret;
+        ret = rr_fuzz_get_retval_override();  /* 获取覆盖值并清除标志 */
+
+        RR_INFO("🎯 IO RETVAL OVERRIDE (Hybrid): syscall %d (%s): %ld → %ld",
+                num, rr_get_syscall_name_fast(num), original_ret, ret);
+
+        fprintf(stderr, "[REPLAY-HYBRID] 🎯 RETVAL OVERRIDE: %ld → %ld\n", original_ret, ret);
+        fflush(stderr);
+
+        /* ✅ 2025-11-17: Hybrid路径的Buffer Fill */
+        if (rr_fuzz_has_buffer_fill()) {
+            target_ulong buf_addr = 0;
+            size_t buf_size = 0;
+            const uint8_t *pattern = NULL;
+
+            size_t fill_size = rr_fuzz_get_buffer_fill(&buf_addr, &buf_size, &pattern);
+
+            if (fill_size > 0 && buf_addr != 0 && pattern != NULL) {
+                if (cpu_memory_rw_debug(env_cpu(env), buf_addr, (uint8_t *)pattern, fill_size, 1) == 0) {
+                    fprintf(stderr, "[REPLAY-HYBRID] 🎨 BUFFER FILLED: addr=0x%lx, size=%zu\n",
+                            buf_addr, fill_size);
+                    fflush(stderr);
+                }
+            }
+        }
+
+        /* 跳过真实syscall执行，直接返回覆盖的值 */
+        goto replay_success;
+    }
+
     /* 应用FD映射 */
     apply_fd_mapping(args, num);
 
@@ -643,13 +677,55 @@ try_hybrid:
 
 replay_success:
     /* Pure Replay 成功路径：已经返回确定性结果，清理记录 */
+
+    /* ✅ 2025-11-17: 在清理record之前，先保存recorded_ret用于调试 */
+    abi_long recorded_ret_for_debug = g_current_record ? g_current_record->retval : -999;
+
     g_pending_post_record = g_current_record;
     g_current_record = NULL;
 
     g_rr_framework->replay_index++;
-    
+
     /* 设置标记，告诉 post_hook 不要重复处理 */
     g_syscall_already_consumed = true;
+
+    /* ✅ 新增：应用返回值覆盖（IO返回值变异） */
+    if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
+        abi_long original_ret = ret;
+        ret = rr_fuzz_get_retval_override();  // 这会自动清除标志
+
+        RR_INFO("🎯 IO RETVAL OVERRIDE: syscall %d (%s): recorded=%ld, ret_before=%ld → ret_after=%ld",
+                num, rr_get_syscall_name_fast(num), recorded_ret_for_debug, original_ret, ret);
+
+        fprintf(stderr, "[REPLAY] 🎯 RETVAL OVERRIDE: recorded=%ld, before=%ld → after=%ld\n",
+                recorded_ret_for_debug, original_ret, ret);
+        fflush(stderr);
+    }
+
+    /* ✅ 2025-11-17: 泛化Buffer Fill - 填充IO buffer内容 */
+    if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_buffer_fill()) {
+        target_ulong buf_addr = 0;
+        size_t buf_size = 0;
+        const uint8_t *pattern = NULL;
+
+        size_t fill_size = rr_fuzz_get_buffer_fill(&buf_addr, &buf_size, &pattern);
+
+        if (fill_size > 0 && buf_addr != 0 && pattern != NULL) {
+            /* 填充guest buffer */
+            if (cpu_memory_rw_debug(env_cpu(env), buf_addr, (uint8_t *)pattern, fill_size, 1) == 0) {
+                RR_INFO("🎨 BUFFER FILLED: syscall %d (%s): addr=0x%lx, size=%zu",
+                        num, rr_get_syscall_name_fast(num), buf_addr, fill_size);
+
+                fprintf(stderr, "[REPLAY] 🎨 BUFFER FILLED: addr=0x%lx, size=%zu (first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+                        buf_addr, fill_size,
+                        pattern[0], pattern[1], pattern[2], pattern[3],
+                        pattern[4], pattern[5], pattern[6], pattern[7]);
+                fflush(stderr);
+            } else {
+                RR_WARN("Failed to fill buffer at addr=0x%lx, size=%zu", buf_addr, fill_size);
+            }
+        }
+    }
 
     /* 动态跟踪：系统调用退出（二进制重放路径） */
 #ifdef RR_ENABLE_DYNAMIC_TRACE

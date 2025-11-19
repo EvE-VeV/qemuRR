@@ -16,6 +16,7 @@ from .constants import COVERAGE_MAP_SIZE
 from collections import defaultdict
 import time
 import os
+import threading  # ✅ Task #10: Thread-safe coverage tracking
 
 
 class CoverageTracker:
@@ -39,7 +40,11 @@ class CoverageTracker:
         # 注意：这是 QEMU 子进程的 PID，需要动态获取
         self.shm_path = None  # 将在首次读取时设置
         self.shm_base_name = "rr_coverage"
-        
+
+        # ✅ Task #10: Thread-safe lock for concurrent access
+        # 保护global_bitmap和统计数据的并发访问
+        self._lock = threading.Lock()
+
         # Coverage bitmaps
         self.global_bitmap = bytearray(COVERAGE_MAP_SIZE)
         self.virgin_bits = bytearray([255] * COVERAGE_MAP_SIZE)  # AFL-style virgin map
@@ -48,7 +53,8 @@ class CoverageTracker:
         self.new_edges_found = 0
         self.total_executions = 0
         self.edges_per_execution = []
-        
+        self.total_edges_cached = 0  # 🔥 优化: 缓存total_edges避免重复计算
+
         # Hit count tracking
         self.edge_hit_counts = defaultdict(int)  # edge_id -> total hits
         self.edge_first_seen = {}  # edge_id -> timestamp
@@ -89,64 +95,83 @@ class CoverageTracker:
     def has_new_coverage(self, current_map):
         """
         Check if there is new coverage.
-        
+
         Returns True if:
         1. New edges are discovered (0 -> non-zero)
         2. Existing edges have new hit count buckets
+
+        🔥 Phase 1优化: 减少bitmap遍历，使用缓存计数器
+        ✅ Task #10: Thread-safe with locking protection
         """
         if not current_map or len(current_map) != COVERAGE_MAP_SIZE:
             return False
-        
-        self.total_executions += 1
-        new_coverage = False
-        new_edges = 0
-        current_edge_count = 0
-        current_timestamp = time.time()
-        
-        for i in range(COVERAGE_MAP_SIZE):
-            current_val = current_map[i]
-            
-            if current_val > 0:
-                current_edge_count += 1
-                
-                # New edge discovered
-                if self.global_bitmap[i] == 0:
-                    new_edges += 1
-                    new_coverage = True
-                    self.global_bitmap[i] = current_val
-                    self.edge_first_seen[i] = current_timestamp
-                    self.last_new_coverage = current_timestamp
-                
-                # Check for new hit count bucket
-                old_bucket = self._classify_hit_count(self.global_bitmap[i])
-                new_bucket = self._classify_hit_count(current_val)
-                
-                if new_bucket > old_bucket:
-                    new_coverage = True
-                    self.global_bitmap[i] = current_val
-                    
-                    # Update virgin bits (AFL-style)
-                    if self.virgin_bits[i] > 0:
-                        self.virgin_bits[i] = 0
-                
-                # Update hit count statistics
-                self.edge_hit_counts[i] += current_val
-        
-        # Record coverage history
-        if new_coverage:
-            self.new_edges_found += new_edges
-            total_edges = sum(1 for b in self.global_bitmap if b > 0)
-            self.coverage_history.append((current_timestamp, total_edges))
-        
-        # Track edges per execution
-        self.edges_per_execution.append(current_edge_count)
-        
-        # Update hotspots and rare edges (every 100 executions)
-        if self.total_executions % 100 == 0:
-            self._update_hotspots()
-            self._update_stability()
-        
-        return new_coverage
+
+        # ✅ Task #10: Acquire lock for thread-safe bitmap updates
+        with self._lock:
+            self.total_executions += 1
+            new_coverage = False
+            new_edges = 0
+            current_edge_count = 0
+            current_timestamp = time.time()
+
+            # 🔥 优化: 只遍历一次bitmap
+            for i in range(COVERAGE_MAP_SIZE):
+                current_val = current_map[i]
+
+                if current_val > 0:
+                    current_edge_count += 1
+                    old_val = self.global_bitmap[i]
+
+                    # New edge discovered
+                    if old_val == 0:
+                        new_edges += 1
+                        new_coverage = True
+                        self.total_edges_cached += 1  # 🔥 增量更新缓存
+                        # ✅ Task #10: Atomic update with lock protection
+                        self.global_bitmap[i] = current_val
+                        self.edge_first_seen[i] = current_timestamp
+                        self.last_new_coverage = current_timestamp
+
+                        # Update virgin bits (AFL-style) for new edge
+                        if self.virgin_bits[i] > 0:
+                            self.virgin_bits[i] = 0
+
+                    # 🔥 优化: 只有当值变化时才检查hit count bucket
+                    # 这避免了对每个edge的重复bucket计算
+                    elif current_val > old_val:
+                        # Check for new hit count bucket
+                        old_bucket = self._classify_hit_count(old_val)
+                        new_bucket = self._classify_hit_count(current_val)
+
+                        if new_bucket > old_bucket:
+                            new_coverage = True
+                            # ✅ Task #10: Atomic update with lock protection
+                            self.global_bitmap[i] = current_val
+
+                            # Update virgin bits (AFL-style)
+                            if self.virgin_bits[i] > 0:
+                                self.virgin_bits[i] = 0
+
+                    # 🔥 优化: 减少hit count更新频率（仅在新coverage时）
+                    if new_coverage and i not in self.edge_hit_counts:
+                        self.edge_hit_counts[i] = current_val
+                    elif new_coverage:
+                        self.edge_hit_counts[i] += current_val
+
+            # Record coverage history (使用缓存的total_edges)
+            if new_coverage:
+                self.new_edges_found += new_edges
+                self.coverage_history.append((current_timestamp, self.total_edges_cached))
+
+            # Track edges per execution
+            self.edges_per_execution.append(current_edge_count)
+
+            # 🔥 优化: 降低统计更新频率 (100 -> 500)
+            if self.total_executions % 500 == 0:
+                self._update_hotspots()
+                self._update_stability()
+
+        return new_coverage  # ✅ Task #10: Return outside lock
     
     def _update_hotspots(self):
         """Identify hotspots (frequently hit edges) and rare edges"""
@@ -253,26 +278,33 @@ class CoverageTracker:
         }
     
     def get_stats(self):
-        """Get comprehensive coverage statistics"""
-        total_edges = sum(1 for b in self.global_bitmap if b > 0)
-        virgin_bits_count = sum(1 for b in self.virgin_bits if b == 255)
-        
-        trend = self.get_coverage_trend()
-        
-        return {
-            'total_edges': total_edges,
-            'new_edges_this_run': self.new_edges_found,
-            'bitmap_density': total_edges * 100.0 / COVERAGE_MAP_SIZE,
-            'virgin_bits': virgin_bits_count,
-            'virgin_bits_percent': virgin_bits_count * 100.0 / COVERAGE_MAP_SIZE,
-            'total_executions': self.total_executions,
-            'hotspots': len(self.hotspots),
-            'rare_edges': len(self.rare_edges),
-            'stable_edges': len(self.stable_edges),
-            'unstable_edges': len(self.unstable_edges),
-            'coverage_trend': trend,
-            'avg_edges_per_exec': sum(self.edges_per_execution) / len(self.edges_per_execution) if self.edges_per_execution else 0
-        }
+        """
+        Get comprehensive coverage statistics
+
+        🔥 Phase 1优化: 使用缓存的total_edges，避免重复遍历bitmap
+        ✅ Task #10: Thread-safe read of statistics
+        """
+        # ✅ Task #10: Acquire lock for consistent state read
+        with self._lock:
+            # 🔥 优化: 使用缓存的total_edges，只在需要时重新计算virgin_bits
+            virgin_bits_count = sum(1 for b in self.virgin_bits if b == 255)
+
+            trend = self.get_coverage_trend()
+
+            return {
+                'total_edges': self.total_edges_cached,  # 🔥 使用缓存
+                'new_edges_this_run': self.new_edges_found,
+                'bitmap_density': self.total_edges_cached * 100.0 / COVERAGE_MAP_SIZE,
+                'virgin_bits': virgin_bits_count,
+                'virgin_bits_percent': virgin_bits_count * 100.0 / COVERAGE_MAP_SIZE,
+                'total_executions': self.total_executions,
+                'hotspots': len(self.hotspots),
+                'rare_edges': len(self.rare_edges),
+                'stable_edges': len(self.stable_edges),
+                'unstable_edges': len(self.unstable_edges),
+                'coverage_trend': trend,
+                'avg_edges_per_exec': sum(self.edges_per_execution) / len(self.edges_per_execution) if self.edges_per_execution else 0
+            }
     
     def should_prioritize_exploration(self):
         """

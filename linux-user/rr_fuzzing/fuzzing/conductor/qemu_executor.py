@@ -331,7 +331,7 @@ class QEMUExecutor:
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.get_env_value(),
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
-            'RR_DEBUG_LEVEL': '4',
+            'RR_DEBUG_LEVEL': '1',  # 🔥 Phase 1优化: 降低日志级别 (4→1) 减少I/O overhead
         })
         
         cmd = [self.qemu_path, self.target_binary]
@@ -376,29 +376,35 @@ class QEMUExecutor:
     def _wait_for_status(self, timeout: float) -> Optional[int]:
         """
         Wait for status update from QEMU
-        
+
         Args:
             timeout: Timeout in seconds
-        
+
         Returns:
             int: Status code or None if timeout
+
+        🔥 性能优化: 降低select timeout减少等待时间
         """
         start_time = time.time()
-        
+
         while (time.time() - start_time) < timeout:
-            ready, _, _ = select.select([self.status_pipe_read], [], [], 1.0)
-            
+            # 🔥 优化: 使用10ms timeout而非1s，大幅减少select等待时间
+            remaining = timeout - (time.time() - start_time)
+            select_timeout = min(0.01, remaining)  # 10ms或剩余时间
+
+            ready, _, _ = select.select([self.status_pipe_read], [], [], select_timeout)
+
             if ready:
                 status_bytes = os.read(self.status_pipe_read, 4)
                 if len(status_bytes) == 4:
                     status = struct.unpack('i', status_bytes)[0]
                     return status
-            
+
             # Check if process is still alive
             if self.qemu_process and self.qemu_process.poll() is not None:
                 # Process exited unexpectedly
                 return None
-        
+
         return None  # Timeout
     
     def _read_coverage(self) -> Optional[bytes]:
@@ -416,12 +422,10 @@ class QEMUExecutor:
         if self._shared_coverage_shm is not None:
             try:
                 coverage_bitmap = bytes(self._shared_coverage_shm.buf[:])
-                
-                # Statistics (for debugging)
-                non_zero_count = sum(1 for b in coverage_bitmap if b != 0)
-                if non_zero_count > 0:
-                    print(f"[QEMUExecutor] ✅ Read coverage: {non_zero_count} non-zero bytes from shared memory")
-                
+
+                # 🔥 Phase 1优化: 移除昂贵的调试统计（每次执行遍历64KB）
+                # 这个统计在生产环境中没有必要，消耗大量CPU
+
                 return coverage_bitmap
             except Exception as e:
                 print(f"[QEMUExecutor] ⚠️  Failed to read shared coverage: {e}")

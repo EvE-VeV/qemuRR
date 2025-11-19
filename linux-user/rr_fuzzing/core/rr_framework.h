@@ -342,6 +342,19 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr);
 void rr_fuzz_get_stats(uint64_t *total, uint64_t *arg_mut, uint64_t *buf_mut, uint64_t *boundary);
 void rr_fuzz_print_stats(void);
 
+/* ✅ 新增：IO返回值变异支持 */
+bool rr_fuzz_has_retval_override(void);
+abi_long rr_fuzz_get_retval_override(void);
+void rr_fuzz_clear_retval_override(void);
+
+/* ✅ 2025-11-17: Buffer Content Mutation支持 (配合retval override) */
+void rr_fuzz_set_buffer_fill(target_ulong buf_addr, size_t size,
+                               const uint8_t *pattern, size_t pattern_len);
+bool rr_fuzz_has_buffer_fill(void);
+size_t rr_fuzz_get_buffer_fill(target_ulong *out_addr, size_t *out_size,
+                                 const uint8_t **out_pattern);
+void rr_fuzz_clear_buffer_fill(void);
+
 /* Fuzz Engine内部状态 - 供replay模块查询mutation状态 */
 extern FuzzInstruction g_fuzz_instructions[];
 extern size_t g_instruction_count;
@@ -523,5 +536,10 @@ static inline bool rr_is_output_syscall(int syscall_nr)
 #ifdef RR_ENABLE_DYNAMIC_TRACE
 #include "../utils/rr_dynamic_trace.h"
 #endif
+
+/* ========== ✅ 2025-11-17: IO Mutation 返回值覆盖支持 ========== */
+/* 定义在 fuzzing/qemu_integration/rr_fuzz_engine.c */
+extern bool g_has_retval_override;      /* 是否需要覆盖返回值 */
+extern abi_long g_retval_override;      /* 覆盖的返回值 */
 
 #endif /* RR_FRAMEWORK_H */

@@ -35,6 +35,7 @@ rr_fuzz_sources = files(
   'utils/rr_checkpoint.c',       # ✅ checkpoint机制
   'utils/rr_fork_server.c',
   'utils/rr_nested_fork.c',      # ✅ autonomous nested fork
+  'utils/rr_syscall_tree.c',     # ✅ C-Tree-P2: syscall tree builder
 )
 
 # RR-Fuzz configuration option

@@ -127,13 +127,18 @@ class AdvancedSeedQueue:
         Returns:
             True if added, False if rejected (duplicate/full)
         """
-        # 去重检查
+        # ✅ 2025-11-18: 改进去重检查 - 只拒绝完全相同coverage且无新edges的seed
         if self.dedup:
             cov_hash = self._hash_coverage(seed.coverage)
-            if cov_hash in self.coverage_hashes:
+            # 如果有新coverage（new_coverage_count > 0），总是接受
+            if seed.new_coverage_count > 0:
+                self.coverage_hashes.add(cov_hash)
+            elif cov_hash in self.coverage_hashes:
+                # 无新coverage且coverage hash重复，才拒绝
                 self.stats['duplicates_rejected'] += 1
                 return False
-            self.coverage_hashes.add(cov_hash)
+            else:
+                self.coverage_hashes.add(cov_hash)
         
         # 如果使用高级调度，计算初始能量
         if self.use_advanced_scheduling and self.energy_scheduler:

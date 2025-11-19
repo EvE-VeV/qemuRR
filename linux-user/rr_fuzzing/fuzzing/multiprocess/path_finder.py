@@ -190,9 +190,68 @@ class PathFinder:
             )
             handler.setFormatter(formatter)
             logger.addHandler(handler)
-        
+
         return logger
-    
+
+    def load_syscall_tree(self, tree_file: str = "/tmp/syscall_tree.json") -> bool:
+        """
+        Load syscall tree from JSON file exported by C side.
+
+        This provides precise BB→Syscall mapping instead of estimation.
+
+        Args:
+            tree_file: Path to syscall tree JSON file
+
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        import os
+
+        if not os.path.exists(tree_file):
+            self.logger.warning(f"Syscall tree file not found: {tree_file}")
+            return False
+
+        try:
+            with open(tree_file, 'r') as f:
+                tree_data = json.load(f)
+
+            # Extract nodes from tree
+            nodes = tree_data.get('nodes', [])
+            if not nodes:
+                self.logger.warning(f"Syscall tree is empty: {tree_file}")
+                return False
+
+            # Build BB→Syscall mapping
+            # Note: We need BB trace to connect BB addresses to syscall indices
+            # The tree provides syscall_index directly from C side
+            self.syscall_tree_data = tree_data
+            self.bb_to_syscall_map = {}  # Will be populated when BB trace is available
+
+            self.logger.info(f"✅ Loaded syscall tree: {len(nodes)} nodes from {tree_file}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to load syscall tree: {e}")
+            return False
+
+    def get_precise_syscall_index(self, bb_addr: int) -> int:
+        """
+        Get precise syscall index for a BB address using syscall tree.
+
+        This replaces the rough estimation (source_addr >> 4) % 20.
+
+        Args:
+            bb_addr: Basic block address
+
+        Returns:
+            Syscall index, or -1 if not found
+        """
+        if not hasattr(self, 'bb_to_syscall_map'):
+            return -1
+
+        # Direct lookup from BB→Syscall map
+        return self.bb_to_syscall_map.get(bb_addr, -1)
+
     def build_from_trace(self, trace_file: str) -> bool:
         """
         根据trace文件构建动态CFG（无需angr）
@@ -247,13 +306,20 @@ class PathFinder:
         nodes = {}
         edges = defaultdict(set)
         syscalls = defaultdict(list)
-        
+
+        # ✅ 2025-11-17: Initialize BB→Syscall mapping for precise mutation targeting
+        if not hasattr(self, 'bb_to_syscall_map'):
+            self.bb_to_syscall_map = {}
+
         prev_node = None
         for entry in entries:
             node_id = entry.pc & 0xFFFF  # 与覆盖率bitmap一致的索引
             if node_id not in nodes:
                 nodes[node_id] = entry.pc
             if entry.syscall_idx >= 0:
+                # ✅ 2025-11-17: Build BB→Syscall mapping for precise PathFinder targeting
+                self.bb_to_syscall_map[entry.pc] = entry.syscall_idx
+
                 while len(analyzer.syscalls) <= entry.syscall_idx:
                     break
                 if 0 <= entry.syscall_idx < len(analyzer.syscalls):
@@ -323,6 +389,10 @@ class PathFinder:
 
     def ensure_cfg_ready(self) -> bool:
         """🔥 新增: 确保CFG就绪（按需构建）"""
+        # 🔥 性能修复：如果使用动态模式，跳过静态CFG构建
+        if self.graph_mode == "dynamic":
+            return True  # 动态模式不需要静态CFG
+
         if self.cfg is not None:
             return True  # 已经有CFG
 

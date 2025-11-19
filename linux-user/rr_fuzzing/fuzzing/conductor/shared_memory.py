@@ -16,7 +16,7 @@ import struct
 from pathlib import Path
 from typing import List
 from .constants import (
-    FUZZ_MAGIC, FUZZ_MAX_INSTRUCTIONS, FUZZ_SHM_SIZE,
+    FUZZ_MAGIC, FUZZ_MAX_INSTRUCTIONS, FUZZ_MAX_VARIANTS, FUZZ_SHM_SIZE,
     FUZZ_FLAG_CAPTURE_SEED
 )
 
@@ -109,10 +109,24 @@ class FuzzSharedMemory:
         
         if mutation_variants is None:
             mutation_variants = [[]]  # 空变异列表
-        
+
         num_variants = len(mutation_variants)
-        if num_variants > 10:
-            raise ValueError(f"Too many variants: {num_variants} (max 10)")
+
+        # ✅ 边界检查1: 检查变体数量是否超过限制
+        if num_variants > FUZZ_MAX_VARIANTS:
+            raise ValueError(
+                f"Too many variants: {num_variants} (max {FUZZ_MAX_VARIANTS}). "
+                f"This would overflow FuzzSharedMemory.variants[{FUZZ_MAX_VARIANTS}] array."
+            )
+
+        # ✅ 边界检查2: 检查每个变体的指令数量是否超过限制
+        for i, instructions in enumerate(mutation_variants):
+            if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
+                raise ValueError(
+                    f"Variant {i} has too many instructions: {len(instructions)} "
+                    f"(max {FUZZ_MAX_INSTRUCTIONS}). "
+                    f"This would overflow FuzzVariant.instructions[{FUZZ_MAX_INSTRUCTIONS}] array."
+                )
         
         # Increment sequence
         self.sequence += 1
@@ -142,20 +156,27 @@ class FuzzSharedMemory:
         # Header: 9个uint32_t = 36字节
         # instructions[32]: 32 * 280字节(FuzzInstruction.struct_size) = 8960字节
         # variants[0]起始: 36 + 8960 = 8996字节
-        offset = 36 + 32 * 280
-        
+        base_offset = 36 + 32 * 280
+
+        # 🔥 关键修复：每个FuzzVariant固定大小 = 4 + 32*280 = 8964字节
+        variant_struct_size = 4 + 32 * 280  # instruction_count + instructions[32]
+
         for variant_idx, instructions in enumerate(mutation_variants):
+            # 计算当前variant的起始offset
+            variant_offset = base_offset + variant_idx * variant_struct_size
+
             # Variant header: instruction_count
-            self.mem.seek(offset)
+            self.mem.seek(variant_offset)
             self.mem.write(struct.pack('I', len(instructions)))
-            offset += 4
-            
-            # Variant instructions
+
+            # Variant instructions (写入到固定位置，确保对齐)
+            inst_offset = variant_offset + 4
             for inst in instructions:
-                self.mem.seek(offset)
+                self.mem.seek(inst_offset)
                 self.mem.write(inst.pack())
-                # 🔥 修复：使用固定的C结构体大小而不是数据大小
-                offset += inst.struct_size
+                inst_offset += 280  # FuzzInstruction固定大小
+
+            # 注意：剩余的instruction槽位保持为零（已在create时初始化）
         
         self.mem.flush()
         
