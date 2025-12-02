@@ -19,9 +19,9 @@ from .energy_scheduler import AdvancedEnergyScheduler, ExplorationExploitationBa
 try:
     from coverage_feedback import SeedPriority
 except ImportError:
-    from enum import Enum
-    
-    class SeedPriority(Enum):
+    from enum import IntEnum
+
+    class SeedPriority(IntEnum):
         LOW = 0
         NORMAL = 1
         HIGH = 2

@@ -33,8 +33,15 @@ class CoverageTracker:
     
     # AFL-style hit count buckets
     HIT_COUNT_BUCKETS = [1, 2, 3, 4, 8, 16, 32, 128]
-    
-    def __init__(self, pid=None):
+
+    def __init__(self, pid=None, shared_coverage=None):
+        """
+        初始化CoverageTracker
+
+        Args:
+            pid: 进程ID
+            shared_coverage: Optional SharedCoverage实例（用于多进程模式）
+        """
         self.pid = pid if pid else os.getpid()
         # QEMU 创建的 coverage 共享内存路径
         # 注意：这是 QEMU 子进程的 PID，需要动态获取
@@ -44,6 +51,9 @@ class CoverageTracker:
         # ✅ Task #10: Thread-safe lock for concurrent access
         # 保护global_bitmap和统计数据的并发访问
         self._lock = threading.Lock()
+
+        # 多进程共享coverage支持
+        self.shared_coverage = shared_coverage
 
         # Coverage bitmaps
         self.global_bitmap = bytearray(COVERAGE_MAP_SIZE)
@@ -102,12 +112,27 @@ class CoverageTracker:
 
         🔥 Phase 1优化: 减少bitmap遍历，使用缓存计数器
         ✅ Task #10: Thread-safe with locking protection
+        ✅ Multi-process: 与SharedCoverage同步
         """
         if not current_map or len(current_map) != COVERAGE_MAP_SIZE:
             return False
 
         # ✅ Task #10: Acquire lock for thread-safe bitmap updates
         with self._lock:
+            # ✅ Multi-process: 定期从SharedCoverage同步（每100次执行）
+            if self.shared_coverage and self.total_executions % 100 == 0:
+                synced_edges = self.shared_coverage.sync_coverage()
+                if synced_edges > 0:
+                    # 更新本地bitmap为全局状态
+                    for i in range(COVERAGE_MAP_SIZE):
+                        shared_val = self.shared_coverage.local_bitmap[i]
+                        if shared_val > self.global_bitmap[i]:
+                            if self.global_bitmap[i] == 0:
+                                self.total_edges_cached += 1
+                            self.global_bitmap[i] = shared_val
+                            if self.virgin_bits[i] > 0:
+                                self.virgin_bits[i] = 0
+
             self.total_executions += 1
             new_coverage = False
             new_edges = 0
@@ -157,6 +182,10 @@ class CoverageTracker:
                         self.edge_hit_counts[i] = current_val
                     elif new_coverage:
                         self.edge_hit_counts[i] += current_val
+
+            # ✅ Multi-process: 发现新coverage时更新SharedCoverage
+            if new_coverage and self.shared_coverage:
+                self.shared_coverage.update_coverage(bytes(self.global_bitmap))
 
             # Record coverage history (使用缓存的total_edges)
             if new_coverage:

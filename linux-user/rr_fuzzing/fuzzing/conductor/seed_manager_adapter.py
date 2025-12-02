@@ -251,11 +251,37 @@ class SeedManagerAdapter:
 
             # Update context in queue
             self.queue.update_context(
-                new_coverage=new_coverage,
-                current_time=time.time(),
-                total_execs=self.queue.stats['total_execs'],
-                no_new_coverage_count=self.queue.stats['no_new_coverage_count']
+                global_coverage=new_coverage,
+                new_coverage_found=bool(new_coverage)
             )
+
+    def record_execution(self, trace_id: str, trace_file: str, mutations: list,
+                         has_new_coverage: bool = False):
+        """
+        Record execution statistics (TraceManager-compatible)
+
+        Args:
+            trace_id: Trace ID
+            trace_file: Trace file path
+            mutations: List of mutations applied
+            has_new_coverage: Whether new coverage was found
+        """
+        if self.use_advanced:
+            # For advanced mode, we track executions in the seed itself
+            # The execution count is already updated in select_trace()
+            # Here we can update additional statistics if needed
+            if trace_id in self.trace_to_seed_map:
+                seed = self.trace_to_seed_map[trace_id]
+                if has_new_coverage:
+                    seed.new_coverage_count += 1
+            # Update global stats
+            if has_new_coverage:
+                self.queue.stats['no_new_coverage_count'] = 0
+            else:
+                self.queue.stats['no_new_coverage_count'] += 1
+        else:
+            # Delegate to TraceManager
+            self.queue.record_execution(trace_id, trace_file, mutations, has_new_coverage)
 
     def save_corpus(self, output_dir: str):
         """Save corpus to output directory (TraceManager-compatible)"""

@@ -30,7 +30,7 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from multiprocess import FuzzMaster
+from multiprocess.fuzz_master import FuzzMaster
 
 
 # Global for signal handling

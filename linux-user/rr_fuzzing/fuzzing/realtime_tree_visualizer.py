@@ -100,6 +100,9 @@ class RealtimeTreeBuilder:
         self.fork_nodes: Dict[tuple, TreeNode] = {}  # (parent_pid, fork_index) -> fork_node
         self.fork_child_to_fork_node: Dict[int, TreeNode] = {}  # child_pid -> fork_node
 
+        # 🔥 Performance fix: O(1) index for syscall lookups (pid, syscall_index) -> node
+        self.syscall_index: Dict[tuple, TreeNode] = {}  # (pid, syscall_index) -> syscall_node
+
         # Statistics
         self.total_forks = 0
         self.total_executions = 0
@@ -267,17 +270,14 @@ class RealtimeTreeBuilder:
         fork_key = (parent_pid, fork_index)
         print(f"[Visualizer] DEBUG: Checking fork_key={fork_key}, already exists={fork_key in self.fork_nodes}", flush=True)
         if fork_key not in self.fork_nodes:
-            # Find the syscall node at fork_index for parent_pid
-            print(f"[Visualizer] DEBUG: Searching for syscall node, all_nodes count={len(self.all_nodes)}", flush=True)
-            fork_syscall_node = None
-            checked_count = 0
-            for node in self.all_nodes.values():
-                checked_count += 1
-                if node.syscall_index == fork_index and node.pid == parent_pid and not node.is_fork_node:
-                    fork_syscall_node = node
-                    print(f"[Visualizer] DEBUG: Found matching node after checking {checked_count} nodes", flush=True)
-                    break
-            print(f"[Visualizer] DEBUG: Search complete, checked {checked_count} nodes, found={fork_syscall_node is not None}", flush=True)
+            # 🔥 Performance fix: O(1) hash lookup instead of O(N) linear search
+            syscall_key = (parent_pid, fork_index)
+            fork_syscall_node = self.syscall_index.get(syscall_key)
+
+            if fork_syscall_node:
+                print(f"[Visualizer] DEBUG: Found syscall node via O(1) hash lookup", flush=True)
+            else:
+                print(f"[Visualizer] DEBUG: Syscall node not found (key={syscall_key}), may arrive later", flush=True)
 
             if fork_syscall_node:
                 # Create fork node as a child of the fork_syscall_node
@@ -320,6 +320,10 @@ class RealtimeTreeBuilder:
         )
         self.node_counter += 1
         self.all_nodes[node.node_id] = node
+
+        # 🔥 Performance fix: Add to O(1) index for fast fork lookups
+        syscall_key = (info.pid, info.index)
+        self.syscall_index[syscall_key] = node
 
         # Determine parent
         parent_node = None

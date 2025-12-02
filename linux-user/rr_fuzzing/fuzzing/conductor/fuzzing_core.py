@@ -102,7 +102,7 @@ except ImportError:
 #     print("[FuzzingCore] ⚠️  TreeVisualizer不可用")
 
 # ✅ 实时tree visualizer不需要导入，将作为独立进程运行
-_HAS_REALTIME_VIZ = True  # Realtime visualizer始终可用（独立进程）
+_HAS_REALTIME_VIZ = False  # ⚠️ DISABLED: Visualizer O(N) search causing 10-100x slowdown
 
 
 @dataclass
@@ -220,9 +220,10 @@ class FuzzingCore:
         mutator: Optional[BaseMutator] = None,
         enable_monitoring: bool = True,
         enable_pathfinder: bool = True,  # ✅ 新增：默认启用PathFinder
-        enable_tree_viz: bool = True,    # 🔥 修复：默认启用Tree Visualizer（测试时很有用）
+        enable_tree_viz: bool = False,   # 🔥 性能修复：禁用Visualizer(C端已生成tree,Python端重复且开销巨大)
         enable_persistent: bool = False,  # 持久化执行器（QEMUExecutor已是persistent fork server）
-        use_energy_scheduler: bool = True  # ✅ 新增：启用能量调度器 (2025-11-17)
+        use_energy_scheduler: bool = True,  # ✅ 新增：启用能量调度器 (2025-11-17)
+        shared_coverage=None  # ✅ 多进程：SharedCoverage实例（多进程模式下使用）
     ):
         """
         初始化FuzzingCore
@@ -238,6 +239,7 @@ class FuzzingCore:
             enable_tree_viz: 启用Syscall Tree可视化 (默认: True)
             enable_persistent: 启用持久化QEMU执行器 (默认: False)
             use_energy_scheduler: 启用高级能量调度器 (默认: True, 2025-11-17新增)
+            shared_coverage: SharedCoverage实例（多进程模式下用于进程间coverage同步）
         """
         print(f"[FuzzingCore] 正在初始化...")
 
@@ -255,7 +257,8 @@ class FuzzingCore:
         
         # 第2层: 核心组件
         self.mutator = mutator if mutator else BaseMutator()
-        self.coverage_tracker = CoverageTracker(pid=0)  # 单进程使用pid 0
+        # ✅ 多进程：传递shared_coverage给CoverageTracker
+        self.coverage_tracker = CoverageTracker(pid=0, shared_coverage=shared_coverage)
 
         # ✅ 选择执行器：持久化 vs 传统
         self.enable_persistent = enable_persistent
@@ -399,6 +402,7 @@ class FuzzingCore:
                     mutator=self.mutator,
                     recipe_pool=self.recipe_pool,
                     coverage_tracker=self.coverage_tracker,
+                    trace_manager=self.trace_manager,  # ✅ 修复2: 传递trace_manager用于保存新种子
                     fuzzing_stats=self.stats,  # ✅ Pass stats for unified tracking
                     mutation_graph=self.mutation_graph  # ✅ Task #6补充: Pass mutation graph
                 )
@@ -509,7 +513,16 @@ class FuzzingCore:
         print(f"Iteration: {self.stats.total_execs}")
         print(f"{'━' * 60}")
         print(f"Exec speed:  {self.stats.execs_per_sec:.1f} exec/s")
-        print(f"Trace pool:  {len(self.trace_manager.trace_pool)} traces")
+
+        # ✅ 兼容SeedManagerAdapter和TraceManager
+        if hasattr(self.trace_manager, 'trace_pool'):
+            trace_count = len(self.trace_manager.trace_pool)
+        elif hasattr(self.trace_manager, 'trace_to_seed_map'):
+            trace_count = len(self.trace_manager.trace_to_seed_map)
+        else:
+            trace_count = 0
+        print(f"Trace pool:  {trace_count} traces")
+
         print(f"Coverage:    {cov_stats['total_edges']} edges")
         print(f"Paths found: {self.stats.paths_found}")
         print(f"Crashes:     {self.stats.crashes_found} "
@@ -608,6 +621,10 @@ class FuzzingCore:
             # 步骤3: 在智能选择的fork点执行mutation
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             results = self.execution_engine.execute_fork(trace.file_path, fork_point, [mutations], 0, iteration_id)
+
+            # ✅ 记录成功的fork操作（修复统计bug）
+            if results and len(results) > 0:
+                self.metrics.success_counts['successful_forks'] += 1
 
             # 处理结果
             for result in results:
@@ -1139,9 +1156,11 @@ class FuzzingCore:
                     if trace:
                         print(f"[FuzzingCore] Selected trace: {trace.id} ({trace.file_path})")
                         try:
+                            # ✅ 修复2: 设置current_trace_id以便保存种子时使用parent_id
+                            self.dynamic_fork_controller.current_trace_id = trace.id
                             # ✅ 传递iteration_id
                             success = self.dynamic_fork_controller.explore_multi_path(
-                                trace, 
+                                trace,
                                 iteration_id=iteration
                             )
                             if success:

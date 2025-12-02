@@ -331,7 +331,7 @@ class QEMUExecutor:
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.get_env_value(),
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
-            'RR_DEBUG_LEVEL': '1',  # 🔥 Phase 1优化: 降低日志级别 (4→1) 减少I/O overhead
+            'RR_DEBUG_LEVEL': '0',  # 🔥 Phase 2优化: 完全禁用RR日志 (1→0) 进一步减少I/O
         })
         
         cmd = [self.qemu_path, self.target_binary]

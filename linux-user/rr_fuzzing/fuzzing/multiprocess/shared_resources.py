@@ -3,7 +3,7 @@
 Shared Resources for Multi-Process Fuzzing
 
 This module implements shared resources for inter-process communication:
-1. SharedCoverage: Shared coverage bitmap using mmap
+1. SharedCoverage: Shared coverage bitmap using multiprocessing.Array (process-safe)
 2. WorkerSeedQueue: Per-worker seed queue with sync mechanism
 """
 
@@ -13,9 +13,13 @@ import time
 import pickle
 import random
 import hashlib
+import multiprocessing as mp
 from pathlib import Path
 from typing import List, Set, Optional, Any
 from dataclasses import dataclass
+
+# Coverage bitmap size (64KB standard)
+COVERAGE_MAP_SIZE = 64 * 1024
 
 
 @dataclass
@@ -53,123 +57,97 @@ class SeedMetadata:
 
 class SharedCoverage:
     """
-    共享Coverage Bitmap（基于mmap）
-    
-    多进程通过mmap共享一个coverage bitmap，实现：
-    1. Worker发现新coverage时更新全局bitmap
+    共享Coverage Bitmap（基于multiprocessing.Array - 进程安全）
+
+    多进程通过multiprocessing.Array共享一个coverage bitmap，实现：
+    1. Worker发现新coverage时原子更新全局bitmap
     2. Worker定期从全局bitmap同步到本地
-    3. 使用版本号机制检测更新
+    3. 使用进程锁保证原子性，无race condition
     """
-    
-    def __init__(self, sync_dir: Path, worker_id: int):
+
+    # 类级别的共享资源（所有实例共享）
+    _shared_array = None
+    _lock = None
+
+    @classmethod
+    def _ensure_shared_resources(cls):
+        """确保共享资源已初始化（只初始化一次）"""
+        if cls._shared_array is None:
+            cls._shared_array = mp.Array('B', COVERAGE_MAP_SIZE)  # unsigned char array
+            cls._lock = mp.Lock()
+
+    def __init__(self, worker_id: int = 0):
         """
         初始化共享coverage
-        
+
         Args:
-            sync_dir: 同步目录
             worker_id: Worker ID
         """
-        self.sync_dir = sync_dir
+        # 确保共享资源存在
+        SharedCoverage._ensure_shared_resources()
+
         self.worker_id = worker_id
-        self.bitmap_size = 1024 * 1024  # 1MB bitmap
-        
-        # 打开共享bitmap文件
-        self.bitmap_file = sync_dir / "coverage" / "global_bitmap.bin"
-        self.version_file = sync_dir / "coverage" / "version.txt"
-        
-        # 确保文件存在
-        if not self.bitmap_file.exists():
-            with open(self.bitmap_file, 'wb') as f:
-                f.write(b'\x00' * self.bitmap_size)
-        
-        # 使用mmap映射
-        self.fd = os.open(self.bitmap_file, os.O_RDWR)
-        self.bitmap = mmap.mmap(self.fd, self.bitmap_size)
-        
-        # 本地副本（快速查询）
-        self.local_bitmap = bytearray(self.bitmap_size)
-        
-        # 版本号管理
-        self.last_version = self._read_version()
-    
-    def _read_version(self) -> int:
-        """读取版本号"""
-        try:
-            with open(self.version_file, 'r') as f:
-                return int(f.read().strip())
-        except:
-            return 0
-    
-    def _increment_version(self):
-        """递增版本号"""
-        try:
-            version = self._read_version()
-            with open(self.version_file, 'w') as f:
-                f.write(f"{version + 1}\n")
-        except:
-            pass
+
+        # 引用类级别的共享资源
+        self.shared_array = SharedCoverage._shared_array
+        self.lock = SharedCoverage._lock
+
+        # 本地副本（减少锁竞争，快速查询）
+        self.local_bitmap = bytearray(COVERAGE_MAP_SIZE)
+
+        print(f"[SharedCoverage] Worker {worker_id} initialized with multiprocessing.Array (process-safe)")
     
     def sync_coverage(self) -> int:
         """
-        从全局bitmap同步到本地
-        
+        从全局bitmap同步到本地（进程安全）
+
         Returns:
             新发现的edges数量
         """
-        # 检查版本号
-        current_version = self._read_version()
-        if current_version == self.last_version:
-            return 0  # 没有更新
-        
-        # 合并全局bitmap到本地
         new_edges = 0
-        for i in range(self.bitmap_size):
-            global_byte = self.bitmap[i]
-            local_byte = self.local_bitmap[i]
-            
-            # 发现新的coverage
-            if global_byte > local_byte:
-                # 计算新增的bit数量
-                diff = global_byte ^ local_byte
-                new_edges += bin(diff).count('1')
-                self.local_bitmap[i] = global_byte
-        
-        self.last_version = current_version
+
+        # 使用进程锁保护读取
+        with self.lock:
+            for i in range(COVERAGE_MAP_SIZE):
+                global_byte = self.shared_array[i]
+                local_byte = self.local_bitmap[i]
+
+                # 发现新的coverage
+                if global_byte > local_byte:
+                    new_edges += 1
+                    self.local_bitmap[i] = global_byte
+
         return new_edges
     
     def update_coverage(self, exec_bitmap: bytes) -> int:
         """
-        更新coverage（本地发现新coverage后更新全局）
-        
+        更新coverage（本地发现新coverage后原子更新全局）
+
         Args:
             exec_bitmap: 执行产生的coverage bitmap
-        
+
         Returns:
             新发现的edges数量
         """
-        if len(exec_bitmap) > self.bitmap_size:
-            exec_bitmap = exec_bitmap[:self.bitmap_size]
-        
+        if len(exec_bitmap) > COVERAGE_MAP_SIZE:
+            exec_bitmap = exec_bitmap[:COVERAGE_MAP_SIZE]
+
         new_edges = 0
-        
-        for i in range(len(exec_bitmap)):
-            exec_byte = exec_bitmap[i]
-            local_byte = self.local_bitmap[i]
-            
-            if exec_byte > local_byte:
+
+        # 使用进程锁保证原子性（消除race condition）
+        with self.lock:
+            for i in range(len(exec_bitmap)):
+                exec_byte = exec_bitmap[i]
+
                 # 更新本地
-                self.local_bitmap[i] = exec_byte
-                
-                # 更新全局（简单方法：直接写入）
-                # 注意：这里可能有race condition，但影响很小
-                global_byte = self.bitmap[i]
-                if exec_byte > global_byte:
-                    self.bitmap[i] = exec_byte
-                    new_edges += 1
-        
-        if new_edges > 0:
-            self._increment_version()
-        
+                if exec_byte > self.local_bitmap[i]:
+                    self.local_bitmap[i] = exec_byte
+
+                    # 更新全局（原子操作）
+                    if exec_byte > self.shared_array[i]:
+                        self.shared_array[i] = exec_byte
+                        new_edges += 1
+
         return new_edges
     
     def get_coverage_count(self) -> int:
@@ -177,14 +155,8 @@ class SharedCoverage:
         return sum(1 for b in self.local_bitmap if b > 0)
     
     def __del__(self):
-        """清理资源"""
-        try:
-            if hasattr(self, 'bitmap'):
-                self.bitmap.close()
-            if hasattr(self, 'fd'):
-                os.close(self.fd)
-        except:
-            pass
+        """清理资源（multiprocessing.Array自动管理，无需手动清理）"""
+        pass
 
 
 class WorkerSeedQueue:
@@ -442,40 +414,29 @@ class WorkStealingQueue:
 
 def test_shared_coverage():
     """测试SharedCoverage"""
-    import tempfile
-    import shutil
-    
     print("Testing SharedCoverage...")
-    
-    # 创建临时目录
-    temp_dir = Path(tempfile.mkdtemp())
-    (temp_dir / "coverage").mkdir()
-    
-    try:
-        # 创建两个worker的coverage
-        worker0 = SharedCoverage(temp_dir, 0)
-        worker1 = SharedCoverage(temp_dir, 1)
-        
-        # Worker 0 发现新coverage
-        test_bitmap = bytearray(1024 * 1024)
-        test_bitmap[0] = 0xFF
-        test_bitmap[1] = 0xAA
-        
-        new_edges = worker0.update_coverage(bytes(test_bitmap))
-        print(f"Worker 0 found {new_edges} new edges")
-        
-        # Worker 1 同步
-        new_edges = worker1.sync_coverage()
-        print(f"Worker 1 synced {new_edges} new edges")
-        
-        # 验证
-        assert worker1.local_bitmap[0] == 0xFF
-        assert worker1.local_bitmap[1] == 0xAA
-        
-        print("✓ SharedCoverage test passed")
-    
-    finally:
-        shutil.rmtree(temp_dir)
+
+    # 创建两个worker的coverage（共享multiprocessing.Array）
+    worker0 = SharedCoverage(worker_id=0)
+    worker1 = SharedCoverage(worker_id=1)
+
+    # Worker 0 发现新coverage
+    test_bitmap = bytearray(COVERAGE_MAP_SIZE)
+    test_bitmap[0] = 0xFF
+    test_bitmap[1] = 0xAA
+
+    new_edges = worker0.update_coverage(bytes(test_bitmap))
+    print(f"Worker 0 found {new_edges} new edges")
+
+    # Worker 1 同步
+    new_edges = worker1.sync_coverage()
+    print(f"Worker 1 synced {new_edges} new edges")
+
+    # 验证
+    assert worker1.local_bitmap[0] == 0xFF
+    assert worker1.local_bitmap[1] == 0xAA
+
+    print("✓ SharedCoverage test passed (multiprocessing.Array)")
 
 
 def test_worker_seed_queue():

@@ -33,6 +33,7 @@ from conductor.fuzzing_core import FuzzingCore
 from conductor.trace_manager import TraceManager
 from conductor.mutator import BaseMutator, SmartMutator
 from conductor.coverage import CoverageTracker
+from multiprocess.shared_resources import SharedCoverage
 
 
 @dataclass
@@ -118,9 +119,9 @@ class FuzzMaster:
         self.workers: List[mp.Process] = []
         self.worker_configs: List[WorkerConfig] = []
         self.worker_stats: Dict[int, WorkerStats] = {}
-        
-        # Shared resources
-        self.global_coverage: Optional[bytearray] = None
+
+        # ✅ Shared resources - 使用SharedCoverage实现进程安全的coverage同步
+        self.shared_coverage = SharedCoverage(worker_id=0)  # Master使用worker_id=0
         self.global_trace_count = 0
         self.global_crash_count = 0
         
@@ -209,8 +210,11 @@ class FuzzMaster:
         worker_id = config.worker_id
         
         print(f"[Worker{worker_id}] Starting...")
-        
+
         try:
+            # ✅ 创建SharedCoverage（所有worker共享同一个multiprocessing.Array）
+            shared_coverage = SharedCoverage(worker_id=worker_id)
+
             # Create mutator
             if config.mutator_type == "smart":
                 mutator = SmartMutator(
@@ -219,8 +223,8 @@ class FuzzMaster:
                 )
             else:
                 mutator = BaseMutator()
-            
-            # Create FuzzingCore for this worker
+
+            # ✅ Create FuzzingCore with shared_coverage for multi-process sync
             fuzzing_core = FuzzingCore(
                 qemu_path=config.qemu_path,
                 target_binary=config.target_binary,
@@ -229,7 +233,9 @@ class FuzzMaster:
                 mutator=mutator,
                 enable_pathfinder=config.enable_pathfinder,  # ✅ 传递PathFinder配置
                 enable_tree_viz=False,  # 多进程模式下禁用tree viz避免冲突
-                enable_monitoring=False
+                enable_monitoring=False,
+                use_energy_scheduler=False,  # ✅ 多进程模式使用TraceManager而非SeedManagerAdapter
+                shared_coverage=shared_coverage  # ✅ 多进程coverage同步
             )
             
             print(f"[Worker{worker_id}] FuzzingCore initialized")

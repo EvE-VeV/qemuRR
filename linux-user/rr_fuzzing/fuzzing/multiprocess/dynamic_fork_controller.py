@@ -14,6 +14,7 @@ DynamicForkController - 动态Fork探索控制器
 """
 
 import random
+import time
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ class DynamicForkController:
                  mutator: SmartMutator,
                  recipe_pool: Optional[RecipePool],
                  coverage_tracker: CoverageTracker,
+                 trace_manager: TraceManager = None,
                  fuzzing_stats=None,
                  mutation_graph=None):
         """Initialize dynamic fork controller
@@ -84,6 +86,7 @@ class DynamicForkController:
             mutator: SmartMutator instance
             recipe_pool: RecipePool instance (optional)
             coverage_tracker: CoverageTracker instance
+            trace_manager: TraceManager instance (for saving interesting seeds)
             fuzzing_stats: FuzzingStatistics instance (for unified tracking)
             mutation_graph: MutationDependencyGraph instance (for mutation tracking)
         """
@@ -92,6 +95,7 @@ class DynamicForkController:
         self.mutator = mutator
         self.recipe_pool = recipe_pool
         self.coverage_tracker = coverage_tracker
+        self.trace_manager = trace_manager  # ✅ 修复2: 添加trace_manager用于保存新种子
         self.fuzzing_stats = fuzzing_stats  # ✅ Single source of truth
         self.mutation_graph = mutation_graph  # ✅ Task #6补充: Mutation tracking
 
@@ -104,7 +108,17 @@ class DynamicForkController:
         # 传统配置（调整为支持深度模式）
         self.max_variants_per_fork = 2  # 降低并发数，支持深度探索
         self.fork_budget_per_1000 = 200  # 增加预算，支持深度探索
-        self.trigger_probability = 1.0
+
+        # ✅ 自适应trigger_probability配置
+        self.trigger_probability = 0.1  # 基础概率（初始值）
+        self.adaptive_trigger = True  # 启用自适应调整
+        self.min_trigger_probability = 0.05  # 最小触发概率
+        self.max_trigger_probability = 0.3  # 最大触发概率
+
+        # 自适应统计窗口
+        self.recent_forks = []  # [(success, timestamp), ...] 最近的fork结果
+        self.recent_window_size = 20  # 窗口大小
+        self.last_new_coverage_time = time.time()  # 最后发现新coverage的时间
 
         # 🔥 新增：当前trace对象（用于IO mutation）
         self.current_trace = None
@@ -126,14 +140,75 @@ class DynamicForkController:
         print(f"  Max exploration depth: {self.max_depth}")
         print(f"  Max variants per checkpoint: {self.max_variants_per_checkpoint}")
         print(f"  Fork budget: {self.fork_budget_per_1000}/1000 iterations")
-    
+        if self.adaptive_trigger:
+            print(f"  Adaptive Trigger: ✅ 启用 (初始={self.trigger_probability}, 范围=[{self.min_trigger_probability}, {self.max_trigger_probability}])")
+
+    def _calculate_adaptive_probability(self) -> float:
+        """
+        计算自适应trigger_probability
+
+        调整策略：
+        1. 成功率高（>30%）→ 增加触发概率（更多fork有价值）
+        2. 成功率低（<10%）→ 降低触发概率（减少浪费）
+        3. Coverage停滞（>5分钟无新coverage）→ 增加触发概率（探索新路径）
+        4. Coverage快速增长 → 保持当前概率
+
+        Returns:
+            调整后的trigger_probability
+        """
+        if not self.adaptive_trigger:
+            return self.trigger_probability
+
+        current_prob = self.trigger_probability
+
+        # 1. 基于成功率调整
+        if len(self.recent_forks) >= 10:
+            # 计算最近的成功率
+            recent_success_count = sum(1 for success, _ in self.recent_forks if success)
+            success_rate = recent_success_count / len(self.recent_forks)
+
+            if success_rate > 0.3:
+                # 成功率高，增加触发概率
+                current_prob = min(current_prob * 1.2, self.max_trigger_probability)
+            elif success_rate < 0.1:
+                # 成功率低，降低触发概率
+                current_prob = max(current_prob * 0.8, self.min_trigger_probability)
+
+        # 2. 基于Coverage停滞调整
+        time_since_last_coverage = time.time() - self.last_new_coverage_time
+        if time_since_last_coverage > 300:  # 5分钟无新coverage
+            # Coverage停滞，增加Dynamic Fork探索
+            current_prob = min(current_prob * 1.5, self.max_trigger_probability)
+
+        # 3. 限制在范围内
+        current_prob = max(self.min_trigger_probability, min(current_prob, self.max_trigger_probability))
+
+        return current_prob
+
+    def _record_fork_result(self, success: bool):
+        """
+        记录fork的成功/失败结果（用于自适应调整）
+
+        Args:
+            success: True表示发现新coverage或crash，False表示无新发现
+        """
+        if not self.adaptive_trigger:
+            return
+
+        current_time = time.time()
+        self.recent_forks.append((success, current_time))
+
+        # 保持窗口大小
+        if len(self.recent_forks) > self.recent_window_size:
+            self.recent_forks.pop(0)
+
     def should_trigger_multi_fork(self, iteration: int) -> bool:
         """
-        判断是否触发multi-fork
-        
+        判断是否触发multi-fork（自适应版本）
+
         Args:
             iteration: 当前迭代次数
-        
+
         Returns:
             True if should trigger
         """
@@ -141,13 +216,23 @@ class DynamicForkController:
         period = iteration // 1000
         if self.stats['forks_this_period'] >= self.fork_budget_per_1000:
             return False
-        
+
         # 新周期重置
         if iteration % 1000 == 0:
             self.stats['forks_this_period'] = 0
-        
-        # 概率触发
-        return random.random() < self.trigger_probability
+
+        # ✅ 自适应概率触发
+        if self.adaptive_trigger:
+            adaptive_prob = self._calculate_adaptive_probability()
+            # 每100次迭代更新一次trigger_probability
+            if iteration % 100 == 0:
+                old_prob = self.trigger_probability
+                self.trigger_probability = adaptive_prob
+                if abs(old_prob - adaptive_prob) > 0.01:  # 只在变化明显时输出
+                    print(f"[DynamicForkController] Adaptive trigger_probability: {old_prob:.3f} → {adaptive_prob:.3f}")
+            return random.random() < adaptive_prob
+        else:
+            return random.random() < self.trigger_probability
     
     def explore_multi_path(self, trace: Trace, iteration_id: int = 0) -> bool:
         """
@@ -182,28 +267,45 @@ class DynamicForkController:
     def _start_depth_exploration(self, trace: Trace, iteration_id: int) -> bool:
         """
         从根trace开始深度探索
+
+        ✅ OPTIMIZATION: 缓存baseline执行结果，避免重复fork QEMU
         """
-        print(f"[DynamicForkController] Step 1: Execute baseline to discover IO syscalls...")
+        # ✅ 检查是否已经缓存了这个trace的IO syscalls
+        cache_key = trace.file_path
+        if not hasattr(self, '_io_syscalls_cache'):
+            self._io_syscalls_cache = {}
 
-        # 执行baseline以发现IO syscalls
-        try:
-            baseline_result = self.executor.execute_baseline(
-                trace_file=trace.file_path,
-                iteration_id=iteration_id
-            )
-            # ✅ Update unified stats counter
-            if self.fuzzing_stats:
-                self.fuzzing_stats.total_execs += 1
+        if cache_key in self._io_syscalls_cache:
+            # ✅ 使用缓存，避免重复execute_baseline
+            io_syscalls = self._io_syscalls_cache[cache_key]
+            print(f"[DynamicForkController] ⚡ Using cached IO syscalls for {trace.id} (saved baseline execution)")
+        else:
+            # 首次执行：需要discover IO syscalls
+            print(f"[DynamicForkController] Step 1: Execute baseline to discover IO syscalls...")
 
-            if baseline_result.normal_exit:
-                print(f"[DynamicForkController] Baseline execution completed")
-            else:
-                print(f"[DynamicForkController] Warning: Baseline failed, continuing...")
-        except Exception as e:
-            print(f"[DynamicForkController] Warning: Baseline exception: {e}")
+            try:
+                baseline_result = self.executor.execute_baseline(
+                    trace_file=trace.file_path,
+                    iteration_id=iteration_id
+                )
+                # ✅ Update unified stats counter
+                if self.fuzzing_stats:
+                    self.fuzzing_stats.total_execs += 1
 
-        # ✅ 2025-11-18: 智能IO syscall选择（限制fork点数量）
-        io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
+                if baseline_result.normal_exit:
+                    print(f"[DynamicForkController] Baseline execution completed")
+                else:
+                    print(f"[DynamicForkController] Warning: Baseline failed, continuing...")
+            except Exception as e:
+                print(f"[DynamicForkController] Warning: Baseline exception: {e}")
+
+            # ✅ 2025-11-18: 智能IO syscall选择（限制fork点数量）
+            io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
+
+            # ✅ 缓存结果
+            self._io_syscalls_cache[cache_key] = io_syscalls
+            print(f"[DynamicForkController] 💾 Cached {len(io_syscalls)} IO syscalls for future use")
+
         if not io_syscalls:
             print(f"[DynamicForkController] No IO syscalls found")
             return False
@@ -314,12 +416,53 @@ class DynamicForkController:
                         print(f"[DynamicForkController] 💥 CRASH detected at depth={depth}!")
                         print(f"[DynamicForkController] 🎯 Crash info: {result.crash_info if hasattr(result, 'crash_info') else 'Unknown crash'}")
                         self.stats['new_paths_discovered'] += 1
+
+                        # ✅ 记录成功的fork
+                        self._record_fork_result(success=True)
+
                         print(f"[DynamicForkController] ⬅️  Program finished (crashed), backtracking to checkpoint...")
                         return True  # crash是成功的探索结果
 
                     elif has_new_coverage:
                         print(f"[DynamicForkController] 🎉 New coverage discovered at depth={depth}!")
                         self.stats['new_paths_discovered'] += 1
+
+                        # ✅ 记录成功的fork并更新last_new_coverage_time
+                        self._record_fork_result(success=True)
+                        self.last_new_coverage_time = time.time()
+
+                        # ✅ 修复2: 保存新种子到corpus
+                        if self.trace_manager:
+                            coverage_stats = self.coverage_tracker.get_stats()
+                            new_edges = coverage_stats.get('new_edges', set())
+
+                            coverage_info = {
+                                'has_new_edges': True,
+                                'new_edge_count': len(new_edges) if new_edges else 1,
+                                'total_unique_edges': coverage_stats.get('total_edges', 0),
+                                'edges': new_edges if new_edges else set()
+                            }
+
+                            # Flatten mutations list (mutations is List[List[FuzzInstruction]])
+                            mutation_dicts = []
+                            for mutation_list in mutations:
+                                if isinstance(mutation_list, list):
+                                    for instr in mutation_list:
+                                        if hasattr(instr, 'syscall_index') and hasattr(instr, 'cmd'):
+                                            mutation_dicts.append({
+                                                'syscall_index': instr.syscall_index,
+                                                'cmd': instr.cmd
+                                            })
+
+                            # 保存新种子（使用当前trace文件和mutations）
+                            parent_trace_id = getattr(self, 'current_trace_id', None)
+                            self.trace_manager.add_trace(
+                                trace_file=trace_file,
+                                coverage_info=coverage_info,
+                                parent_id=parent_trace_id,
+                                mutations=mutation_dicts
+                            )
+                            print(f"[DynamicForkController] 💾 Saved new seed to corpus (new_edges={len(new_edges) if new_edges else 1})")
 
                         # ✅ 2025-11-18: Nested Fork - 继续探索更深层次（使用预选IO syscalls）
                         if depth < self.max_depth:
@@ -359,10 +502,18 @@ class DynamicForkController:
 
                     else:
                         print(f"[DynamicForkController] 📊 No new coverage at depth={depth}")
+
+                        # ✅ 记录失败的fork
+                        self._record_fork_result(success=False)
+
                         print(f"[DynamicForkController] ⬅️  Program finished (normal exit, no new coverage), backtracking to checkpoint...")
                         return False  # 无新发现，回退
                 else:
                     print(f"[DynamicForkController] ❌ Fork execution failed")
+
+                    # ✅ 记录失败的fork
+                    self._record_fork_result(success=False)
+
                     return False
 
             except Exception as e:
