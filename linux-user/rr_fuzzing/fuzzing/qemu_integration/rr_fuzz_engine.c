@@ -112,11 +112,7 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr)
         return 0;
     }
 
-    // ✅ DEBUG: 详细验证加载后的状态
-    fprintf(stderr, "[DEBUG-LOAD] PID=%d, g_instruction_count=%zu (address=%p)\n", 
-            getpid(), g_instruction_count, &g_instruction_count);
-    fprintf(stderr, "[DEBUG-LOAD] First instruction: syscall_idx=%u, cmd=%d\n",
-            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
+    /* \n    // DEBUG: 详细验证加载后的状态\n    fprintf(stderr, "[DEBUG-LOAD] PID=%d, g_instruction_count=%zu (address=%p)\\n\", \n            getpid(), g_instruction_count, &g_instruction_count);\n    fprintf(stderr, "[DEBUG-LOAD] First instruction: syscall_idx=%u, cmd=%d\\n\",\n            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);\n    */
 
     RR_INFO("Loaded %zu fuzz instructions from shared memory (seq=%u, checksum=0x%x)", 
             g_instruction_count, shm->sequence, shm->checksum);
@@ -191,6 +187,7 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
 
     // 获取系统调用的类型和重要性（用于智能变异）
     const char *syscall_name = rr_get_syscall_name_fast(syscall_nr);
+    (void)syscall_name; // Suppress unused variable warning if logs are disabled
     
     FUZZ_DEBUG_LOG("[APPLY] Searching for mutations: syscall_idx=%u, nr=%d (%s)\n",
             syscall_index, syscall_nr, syscall_name ? syscall_name : "unknown");

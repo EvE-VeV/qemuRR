@@ -239,9 +239,7 @@ static int load_config_file(const char *config_file)
  */
 int rr_config_init(void)
 {
-    /* 强制输出以验证函数被调用 */
-    fprintf(stderr, "RR_CONFIG_INIT: Starting configuration initialization\n");
-    fflush(stderr);
+    /* fprintf(stderr, "RR_CONFIG_INIT: Starting configuration initialization\\n\");\n    fflush(stderr); */
 
     RR_VERBOSE("Initializing RR-Fuzz configuration system");
 

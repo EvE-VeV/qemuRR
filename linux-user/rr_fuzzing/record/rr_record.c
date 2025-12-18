@@ -397,17 +397,17 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
         case 318: /* x86_64 getrandom */
 #endif
             /* 关键的非确定性调用 - 总是记录 */
-            RR_VERBOSE("AUX_CAPTURE: getrandom ret=%ld, args[0]=0x%lx", ret, args[0]);
+            RR_VERBOSE("AUX_CAPTURE: getrandom ret=%ld, args[0]=0x%lx", (long)ret, (unsigned long)args[0]);
             if (ret > 0 && args[0] != 0) {
                 uint8_t *data = rr_capture_buffer(env, args[0], ret);
-                RR_VERBOSE("AUX_CAPTURE: rr_capture_buffer returned %p, size=%ld", data, ret);
+                RR_VERBOSE("AUX_CAPTURE: rr_capture_buffer returned %p, size=%ld", data, (long)ret);
                 if (data) {
                     rr_aux_data_t *aux = rr_aux_create(AUX_BUFFER, 0, data, ret);
                     RR_VERBOSE("AUX_CAPTURE: rr_aux_create returned %p", aux);
                     if (aux) {
                         rr_aux_append(&record->aux_data, aux);
                         record->has_aux_data = true;
-                        RR_VERBOSE("AUX_CAPTURE: Successfully created aux_data for getrandom, size=%ld", ret);
+                        RR_VERBOSE("AUX_CAPTURE: Successfully created aux_data for getrandom, size=%ld", (long)ret);
                     }
                     g_free(data);
                 }
@@ -453,10 +453,10 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 #ifdef TARGET_NR_sendto
         case TARGET_NR_sendto:
             /* sendto 的数据在调用前就存在（类似 write）*/
-            RR_VERBOSE("AUX_CAPTURE: sendto - args[2]=%ld, args[1]=0x%lx, args[0]=%d", args[2], args[1], (int)args[0]);
+            RR_VERBOSE("AUX_CAPTURE: sendto - args[2]=%ld, args[1]=0x%lx, args[0]=%d", (long)args[2], (unsigned long)args[1], (int)args[0]);
             if (args[2] > 0 && args[1] != 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
                 bool should_record = rr_aux_should_record(args[2], args[0], syscall_nr);
-                RR_VERBOSE("AUX_CAPTURE: rr_aux_should_record returned %d for sendto (size=%ld, fd=%d)", should_record, args[2], (int)args[0]);
+                RR_VERBOSE("AUX_CAPTURE: rr_aux_should_record returned %d for sendto (size=%ld, fd=%d)", should_record, (long)args[2], (int)args[0]);
                 if (should_record) {
                     uint8_t *data = rr_capture_buffer(env, args[1], args[2]);
                     RR_VERBOSE("AUX_CAPTURE: rr_capture_buffer returned %p", data);
@@ -466,7 +466,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
                         if (aux) {
                             rr_aux_append(&record->aux_data, aux);
                             record->has_aux_data = true;
-                            RR_VERBOSE("AUX_CAPTURE: Successfully created aux_data for sendto, size=%ld", args[2]);
+                            RR_VERBOSE("AUX_CAPTURE: Successfully created aux_data for sendto, size=%ld", (long)args[2]);
                         }
                         g_free(data);
                     }
@@ -1315,7 +1315,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
  */
 int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long ret)
 {
-    RR_VERBOSE("RECORD_SYSCALL: Called for syscall %d, ret=%ld", num, ret);
+    RR_VERBOSE("RECORD_SYSCALL: Called for syscall %d, ret=%ld", num, (long)ret);
 
     /* 🔥 修复：不跳过任何 syscall，确保 record/replay 一致 */
     /* 之前 skip 的 mmap/brk/getpid 会导致 replay 无法匹配 */
@@ -1326,7 +1326,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     }
 
     RR_VERBOSE("RECORD_SYSCALL: Trace file is open, continuing with recording");
-    RR_SYSCALL_TRACE("Recording syscall %d, ret=%ld", num, ret);
+    RR_SYSCALL_TRACE("Recording syscall %d, ret=%ld", num, (long)ret);
 
     /* 创建记录 */
     syscall_record_t *record = g_malloc0(sizeof(syscall_record_t));
@@ -1336,7 +1336,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     record->retval = ret;
 
     RR_VERBOSE("RECORD_SYSCALL: Recording index=%u, syscall=%d, ret=%ld",
-            record->index, record->syscall_nr, record->retval);
+            record->index, record->syscall_nr, (long)record->retval);
     
     /* 更新BB trace的syscall索引 */
     rr_bb_trace_update_syscall_idx(record->index);
@@ -1363,7 +1363,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     
     /* 使用 aux_data 系统捕获（推荐方式） */
     RR_VERBOSE("RECORD_SYSCALL: About to call capture_syscall_args_aux for syscall %d, ret=%ld, record=%p", 
-               num, ret, record);
+               num, (long)ret, record);
     capture_syscall_args_aux(env, num, args, ret, record);
     RR_VERBOSE("RECORD_SYSCALL: After capture_syscall_args_aux, record=%p, has_aux_data=%d, aux_data=%p", 
                record, record->has_aux_data, record->aux_data);
@@ -1486,7 +1486,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     RR_VERBOSE("RECORD_SYSCALL: Successfully recorded syscall %d (index=%u, args=%d, aux=%s, total_syscalls=%u)",
                num, record->index, arg_count, record->has_aux_data ? "yes" : "no", g_rr_framework->trace_length);
     RR_LOG("Recorded syscall %d: %s -> %ld", record->index,
-           (num >= 0 && num < 400) ? "syscall" : "unknown", ret);
+           (num >= 0 && num < 400) ? "syscall" : "unknown", (long)ret);
 
     /* 优化：每100个记录更新一次头部，减少 fseek 开销 */
     if (g_rr_framework->trace_length % 100 == 0) {

@@ -147,6 +147,8 @@ For more information, see DETAILED_ARCHITECTURE.md
                         help='Path to target binary')
     parser.add_argument('--trace', required=True,
                         help='Path to initial trace file (seed)')
+    parser.add_argument('--target-args', default='',
+                        help='Arguments to pass to target binary (quote them, e.g. "-m magic input")')
     
     # Optional arguments
     parser.add_argument('--output', default='fuzzing_output',
@@ -194,6 +196,8 @@ For more information, see DETAILED_ARCHITECTURE.md
                                help='Disable realtime syscall tree visualization (enabled by default)')
     advanced_group.add_argument('--tree-viz-interval', type=float, default=3.0,
                                help='Tree visualizer update interval in seconds (default: 3.0)')
+    advanced_group.add_argument('--persistent', action='store_true',
+                               help='Enable persistent fuzzing mode for higher performance')
 
     args = parser.parse_args()
     
@@ -269,8 +273,12 @@ For more information, see DETAILED_ARCHITECTURE.md
             target_binary=args.target  # 🔥 传递目标二进制给PathFinder
         )
     else:
-        print("[Main] Creating BaseMutator...")
-        mutator = BaseMutator()
+        print("[Main] Creating AFLEnhancedMutator (default)...")
+        mutator = AFLEnhancedMutator(
+            trace_file=args.trace,
+            recipe_file=args.recipe,
+            target_binary=args.target
+        )
     
     # Create FuzzingCore
     print("[Main] Creating FuzzingCore...")
@@ -281,7 +289,9 @@ For more information, see DETAILED_ARCHITECTURE.md
         output_dir=args.output,
         mutator=mutator,
         enable_pathfinder=not args.no_pathfinder,  # 🔥 默认启用PathFinder
-        enable_tree_viz=not args.no_tree_viz      # 🔥 默认启用可视化
+        enable_tree_viz=not args.no_tree_viz,      # 🔥 默认启用可视化
+        target_args=args.target_args,              # 🔥 传递目标参数
+        enable_persistent=args.persistent          # 🔥 启用Persistent模式
     )
     _fuzzing_core = fuzzing_core
     

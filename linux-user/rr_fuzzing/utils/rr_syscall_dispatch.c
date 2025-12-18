@@ -162,7 +162,7 @@ static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long 
         fprintf(stderr, "[MEMORY-POST-HOOK] mmap: ret=%ld, recorded_ret=%lu, MAP_FAILED=%ld\n",
                 (long)ret, (unsigned long)record->ret_value, (long)MAP_FAILED);
         
-        if (ret != (abi_long)MAP_FAILED && record->ret_value != (target_ulong)MAP_FAILED) {
+        if (ret != (abi_long)-1 && record->ret_value != (target_ulong)-1) {
             target_ulong recorded_addr = (target_ulong)record->ret_value;
             target_ulong actual_addr = (target_ulong)ret;
             size_t size = (size_t)record->args[1].value;

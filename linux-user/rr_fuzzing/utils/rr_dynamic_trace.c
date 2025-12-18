@@ -83,7 +83,9 @@ void rr_dynamic_trace_cleanup(void) {
         .pid = getpid(),
         .parent_pid = 0
     };
-    write(g_dynamic_trace_pipe_fd, &msg, sizeof(msg));
+    if (write(g_dynamic_trace_pipe_fd, &msg, sizeof(msg)) < 0) {
+        /* Ignore cleanup errors */
+    }
     
     if (g_dynamic_trace_pipe_fd >= 0) {
         close(g_dynamic_trace_pipe_fd);
@@ -279,7 +281,7 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
 
 void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t fork_syscall_index) {
     if (!g_dynamic_trace_enabled) {
-        fprintf(stderr, "[RR-DYNAMIC-TRACE] ⚠️  FORK message NOT sent: dynamic trace disabled\n");
+        /* fprintf(stderr, "[RR-DYNAMIC-TRACE] ⚠️  FORK message NOT sent: dynamic trace disabled\\n\"); */
         return;
     }
 

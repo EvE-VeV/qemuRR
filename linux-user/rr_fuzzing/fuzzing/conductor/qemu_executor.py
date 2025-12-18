@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from .instruction import FuzzInstruction
 from .shared_memory import FuzzSharedMemory
+from .async_logger import alog
 
 
 # Status codes (must match C-side definitions in rr_constants.h)
@@ -81,7 +82,7 @@ class QEMUExecutor:
     _coverage_shm_lock = threading.Lock()
     _coverage_env_value = "rr_coverage_global"
     
-    def __init__(self, qemu_path: str, target_binary: str, timeout: float = 30.0):
+    def __init__(self, qemu_path: str, target_binary: str, timeout: float = 30.0, target_args: str = "", persistent_mode: bool = True):
         """
         Initialize QEMU Executor
         
@@ -89,10 +90,14 @@ class QEMUExecutor:
             qemu_path: Path to QEMU executable
             target_binary: Path to target program
             timeout: Execution timeout in seconds
+            target_args: Arguments to pass to target binary
+            persistent_mode: Whether to keep QEMU process alive between executions (Default: True)
         """
         self.qemu_path = qemu_path
         self.target_binary = target_binary
         self.timeout = timeout
+        self.target_args = target_args
+        self.persistent_mode = persistent_mode
         
         # IPC components (initialized per execution)
         self.cmd_pipe_read = None
@@ -335,6 +340,11 @@ class QEMUExecutor:
         })
         
         cmd = [self.qemu_path, self.target_binary]
+        if self.target_args:
+            # Simple splitting by space, assuming no complex quoting for now
+            # For complex cases we might need shlex.split
+            import shlex
+            cmd.extend(shlex.split(self.target_args))
         
         # ✅ FIX: Save pipe ends to close in case of error
         child_cmd_pipe = self.cmd_pipe_read
@@ -644,10 +654,15 @@ class QEMUExecutor:
         self.total_executions += 1
         
         # ✅ DEBUG: Track _qemu_ready状态
-        print(f"[DEBUG-EXEC] execute() called (exec#{self.total_executions}), _qemu_ready={self._qemu_ready}, qemu_alive={self.qemu_process is not None and self.qemu_process.poll() is None if self.qemu_process else False}")
+        # ✅ DEBUG: Track _qemu_ready状态 (Async Log)
+        alog(f"execute() called (exec#{self.total_executions}), _qemu_ready={self._qemu_ready}, qemu_alive={self.qemu_process is not None and self.qemu_process.poll() is None if self.qemu_process else False}", "EXEC")
         
-        # ✅ CRITICAL FIX: Reset coverage before each execution for accurate diff
-        QEMUExecutor.reset_shared_coverage()
+        # ⚠️ COVERAGE BUG FIX: Disabling bitmap reset to prevent false "new" edges
+        # The issue: reset_shared_coverage() clears the entire 64KB bitmap before each execution,
+        # causing the child process to write ~3800 edges to a fresh bitmap, which Python then
+        # compares against global_bitmap and incorrectly reports 2000+ "new" edges per execution.
+        # Solution: Comment out the reset - bitmap should accumulate across executions.
+        # QEMUExecutor.reset_shared_coverage()  # DISABLED - See coverage bug analysis
         
         try:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -802,6 +817,7 @@ class QEMUExecutor:
         
         # 初始化fork server（如果未初始化）
         if not self._qemu_ready:
+            # If not persistent mode, we might need to restart, but here we just start if needed
             self._setup_ipc()
             # 不需要写入共享内存，QEMU启动时会等待第一个命令
             # self.shm.write_fork_request(fork_point=0, mutation_variants=[[]], depth=0)
@@ -885,6 +901,10 @@ class QEMUExecutor:
         
         # ❌ 不要在这里关闭QEMU - 应该在iteration间关闭，而不是每次fork后关闭
         # 当前的并发fork需要串行化或完全隔离，暂时依赖fuzzing_core的cleanup
+        
+        # If not persistent mode, ensure cleanup
+        if not self.persistent_mode:
+            self.stop_persistent_qemu()
         
         return results
     

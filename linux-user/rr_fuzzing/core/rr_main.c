@@ -561,16 +561,16 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
     /* 添加醒目的系统调用入口提示 - 调试阶段使用 */
     const char* syscall_name = get_syscall_name(num);
-    RR_INFO("===============================================================");    
+    /* RR_INFO("===============================================================");    
     RR_INFO("=== ENTERING SYSCALL: %s (%d) === MODE: %s ===",
             syscall_name, num,
             g_rr_framework->mode == RR_MODE_RECORD ? "RECORD" :
             g_rr_framework->mode == RR_MODE_REPLAY ? "REPLAY" :
-            g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN");
+            g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN"); */
 
     /* 退出系统调用需要记录结果，但仍交由宿主执行 */
     if (num == 231 || num == 60) {
-        RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num);
+        /* RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num); */
         if (g_rr_framework->mode == RR_MODE_RECORD) {
             abi_long args[8] = {
                 *arg1, *arg2, *arg3, *arg4,
@@ -790,7 +790,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                     } else {
                         /* 非预期的偏离,需要警告 */
                         RR_WARN("⚠️  UNEXPECTED DEVIATION: syscall=%d (%s), recorded_ret=%ld, actual_ret=%ld (diff=%ld)",
-                                num, get_syscall_name(num), record->retval, ret, ret - record->retval);
+                                num, get_syscall_name(num), (long)record->retval, (long)ret, (long)(ret - record->retval));
                         g_rr_framework->deviation_count++;
                     }
                 }

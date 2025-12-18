@@ -20,6 +20,11 @@
 #include "../core/rr_framework.h"
 #include "rr_syscall_info.h"  /* 新增：系统调用分类 */
 #include "rr_dynamic_trace.h"  /* 动态跟踪API */
+#include "../replay/rr_replay_strace.h"
+
+extern FILE *g_trace_file;
+extern char *g_rr_trace_path;
+// extern void rr_reset_trace_position(void);
 
 /* Status codes (must match Python-side definitions) */
 #define STATUS_NONE          0
@@ -346,8 +351,8 @@ int rr_fork_server_loop(void)
                             
                             /* 关键修复: 直接设置全局变量启用dynamic trace */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-                            extern int g_dynamic_trace_pipe_fd;
-                            extern bool g_dynamic_trace_enabled;
+                            // extern int g_dynamic_trace_pipe_fd;
+                            // extern bool g_dynamic_trace_enabled;
                             
                             RR_INFO("🔍 Child %d: pipe_fd=%d, enabled_before=%d", 
                                     variant_idx, g_dynamic_trace_pipe_fd, g_dynamic_trace_enabled);
@@ -475,13 +480,7 @@ int rr_fork_server_loop(void)
                                 RR_INFO("🎉 Child: Successfully reloaded %zu fuzz instructions", g_instruction_count);
                                 
                                 // DEBUG: 立即验证reload后的状态
-                                fprintf(stderr, "[DEBUG-CHILD-RELOAD] PID=%d, IMMEDIATELY after reload:\n", getpid());
-                                fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\n", 
-                                        g_instruction_count, &g_instruction_count);
-                                if (g_instruction_count > 0) {
-                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\n",
-                                            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
-                                }
+                                /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] PID=%d, IMMEDIATELY after reload:\\n\", getpid());\n                                fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\\n\", \n                                        g_instruction_count, &g_instruction_count);\n                                if (g_instruction_count > 0) {\n                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\\n\",\n                                            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);\n                                } */
                                 fflush(stderr);
                             }
                         }
@@ -492,8 +491,8 @@ int rr_fork_server_loop(void)
                         // g_rr_framework->fork_server_active = false;  // 保持为true
                         
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-                        extern int g_dynamic_trace_pipe_fd;
-                        extern bool g_dynamic_trace_enabled;
+                        // extern int g_dynamic_trace_pipe_fd;
+                        // extern bool g_dynamic_trace_enabled;
                         if (g_dynamic_trace_pipe_fd >= 0) {
                             g_dynamic_trace_enabled = true;
                             RR_INFO("Child (F cmd): Forced trace enabled (PID=%d, fd=%d)", 
@@ -545,8 +544,8 @@ int rr_fork_server_loop(void)
                             RR_VERBOSE("Child still running, waiting with timeout...");
                             
                             int timeout_count = 0;
-                            while (wait_result == 0 && timeout_count < 100) { // 10秒超时
-                                usleep(100000); // 100ms
+                            while (wait_result == 0 && timeout_count < 5000) { // 5秒超时
+                                usleep(1000); // 1ms (Reduced from 100ms)
                                 wait_result = waitpid(pid, &status, WNOHANG);
                                 timeout_count++;
                             }
@@ -627,8 +626,8 @@ int rr_fork_server_loop(void)
                     RR_INFO("Baseline execution: iteration=%u", iteration_id);
                     
                     // Send ITERATION message from parent
-                    extern bool g_dynamic_trace_enabled;
-                    extern int g_dynamic_trace_pipe_fd;
+                    // extern bool g_dynamic_trace_enabled;
+                    // extern int g_dynamic_trace_pipe_fd;
                     if (g_dynamic_trace_enabled && g_dynamic_trace_pipe_fd >= 0) {
                         rr_dynamic_trace_iteration(iteration_id, getpid());
                         RR_INFO("Sent ITERATION message");
@@ -674,10 +673,10 @@ int rr_fork_server_loop(void)
                             }
 
                             // 🔥 重置replay状态并初始化
-                            extern void rr_reset_trace_position(void);
+                            // extern void rr_reset_trace_position(void);
                             rr_reset_trace_position();
 
-                            extern int rr_start_replay(const char *trace_file);
+                            // extern int rr_start_replay(const char *trace_file);
                             if (rr_start_replay(abs_trace_path) < 0) {
                                 RR_ERROR("Baseline child: Failed to initialize replay system with path: %s", abs_trace_path);
                                 _exit(1);
@@ -768,7 +767,7 @@ int rr_fork_server_loop(void)
                     int status;
                     
                     /* 检查parent的strace replay状态 */
-                    extern bool rr_strace_replay_enabled(void);
+                    // extern bool rr_strace_replay_enabled(void);
                     bool parent_strace_enabled = rr_strace_replay_enabled();
                     RR_INFO("🔍 DEBUG: Parent strace_replay_enabled=%d before fork", parent_strace_enabled);
                     
@@ -794,8 +793,8 @@ int rr_fork_server_loop(void)
                             }
                             
                             /* 关键修复：每个child重新打开trace file，完全隔离！*/
-                            extern FILE *g_trace_file;  // 定义在rr_replay.c
-                            extern char *g_rr_trace_path;
+                            // extern FILE *g_trace_file;  // 定义在rr_replay.c
+                            // extern char *g_rr_trace_path;
                             
                             if (g_trace_file != NULL && g_rr_trace_path) {
                                 // 关闭继承的FILE*
@@ -819,7 +818,7 @@ int rr_fork_server_loop(void)
                                 }
 
                                 // 🔥 重新初始化replay系统（会重新打开trace文件）
-                                extern int rr_start_replay(const char *trace_file);
+                                // extern int rr_start_replay(const char *trace_file);
                                 if (rr_start_replay(abs_trace_path) < 0) {
                                     RR_ERROR("Checkpoint child %d: Failed to initialize replay system with path: %s", variant_idx, abs_trace_path);
                                     _exit(1);
@@ -829,11 +828,10 @@ int rr_fork_server_loop(void)
                             }
                             
                             /* 修复：Strace replay也需要重新初始化trace parser */
-                            extern bool rr_strace_replay_enabled(void);
                             if (rr_strace_replay_enabled()) {
                                 /* 重新初始化strace replay parser以获得独立的FILE* */
-                                extern int rr_strace_replay_cleanup(void);
-                                extern int rr_strace_replay_init(const char *trace_file);
+                                // extern int rr_strace_replay_cleanup(void);
+                                // extern int rr_strace_replay_init(const char *trace_file);
                                 
                                 const char *trace_file = g_rr_config.trace_file;
                                 if (trace_file) {
@@ -860,13 +858,13 @@ int rr_fork_server_loop(void)
                                     RR_INFO("🎉 Child %d: Successfully reloaded %zu fuzz instructions", variant_idx, g_instruction_count);
 
                                     // DEBUG: 立即验证reload后的状态
-                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD] Child %d PID=%d, IMMEDIATELY after reload:\n", variant_idx, getpid());
+                                    /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] Child %d PID=%d, IMMEDIATELY after reload:\n", variant_idx, getpid());
                                     fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\n",
                                             g_instruction_count, &g_instruction_count);
                                     if (g_instruction_count > 0) {
                                         fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\n",
                                                 g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
-                                    }
+                                    } */
                                     fflush(stderr);
                                 }
                             } else {
@@ -931,8 +929,8 @@ int rr_fork_server_loop(void)
                             g_rr_framework->child_pid = 0;
                             
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-                            extern int g_dynamic_trace_pipe_fd;
-                            extern bool g_dynamic_trace_enabled;
+                            // extern int g_dynamic_trace_pipe_fd;
+                            // extern bool g_dynamic_trace_enabled;
                             if (g_dynamic_trace_pipe_fd >= 0) {
                                 g_dynamic_trace_enabled = true;
                                 RR_INFO("Child %d: Dynamic trace enabled (PID=%d, continuing from index %d)", 
@@ -948,7 +946,7 @@ int rr_fork_server_loop(void)
                                     g_rr_framework->silent_replay_mode, g_rr_framework->checkpoint_target);
                             
                             /* 检查strace replay是否启用 */
-                            extern bool rr_strace_replay_enabled(void);
+                            // extern bool rr_strace_replay_enabled(void);
                             bool strace_enabled = rr_strace_replay_enabled();
                             RR_INFO("🔍 DEBUG: Child %d strace_replay_enabled=%d", variant_idx, strace_enabled);
                             

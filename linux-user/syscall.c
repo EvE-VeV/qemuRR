@@ -14009,12 +14009,15 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
 
 #ifdef CONFIG_RR_FUZZING
     /* RR-Fuzz系统调用拦截 */
+#if RR_ENABLE_PARAM_LOG
     abi_long orig_args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
+#endif
     abi_long rr_args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
     abi_long rr_ret = rr_do_syscall(cpu_env, num, &rr_args[0], &rr_args[1], 
                                    &rr_args[2], &rr_args[3], &rr_args[4], 
                                    &rr_args[5], &rr_args[6], &rr_args[7]);
     
+#if RR_ENABLE_PARAM_LOG
     /* 比较参数是否被修改 */
     bool args_modified = false;
     for (int i = 0; i < 8; i++) {
@@ -14023,6 +14026,7 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
             break;
         }
     }
+#endif
     
     /* 如果参数被修改，输出详细信息 */
 #if RR_ENABLE_PARAM_LOG

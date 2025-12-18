@@ -25,10 +25,12 @@ from .constants import (
     FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
     FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
     INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
-    PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS
+    PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS,
+    FUZZ_MAX_INSTRUCTIONS
 )
 from .instruction import FuzzInstruction
 from .io_mutator import IOReturnValueMutator
+from .async_logger import alog
 
 
 class BaseMutator:
@@ -73,7 +75,13 @@ class BaseMutator:
         if self.use_io_mutation and self.io_mutator and trace and random.random() < 0.7:
             # ✅ 2025-11-17: 设置 mutation type 用于跟踪
             self.last_mutation_type = 'io_mutation'
-            return self._generate_io_mutations(trace, fork_point)
+            instrs = self._generate_io_mutations(trace, fork_point)
+            
+            # ✅ 修复: 验证指令数量不超过限制
+            if len(instrs) > FUZZ_MAX_INSTRUCTIONS:
+                print(f"[BaseMutator] ⚠️  IO mutation generated {len(instrs)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}")
+                instrs = instrs[:FUZZ_MAX_INSTRUCTIONS]
+            return instrs
 
         # 否则使用传统随机变异
         # ✅ 2025-11-17: 设置 mutation type 用于跟踪
@@ -86,14 +94,14 @@ class BaseMutator:
             # 🔥 修复：如果指定了fork_point，第一个mutation目标是fork_point
             if i == 0 and fork_point is not None:
                 syscall_index = fork_point
-                print(f"[BaseMutator] Mutation {i+1} targeting fork_point={fork_point}")
+                alog(f"Mutation {i+1} targeting fork_point={fork_point}", "MUTATOR")
             else:
                 # 随机syscall索引，但确保 >= fork_point (如果指定)
                 if fork_point is not None:
                     syscall_index = random.randint(fork_point, max(fork_point + 20, 99))
                 else:
                     syscall_index = random.randint(0, 99)
-                print(f"[BaseMutator] Mutation {i+1} targeting random syscall_index={syscall_index}")
+                alog(f"Mutation {i+1} targeting random syscall_index={syscall_index}", "MUTATOR")
             
             # 随机变异类型 - ✅ 新增 Aux Data 变异命令
             mutation_types = [
@@ -164,6 +172,11 @@ class BaseMutator:
             )
             instructions.append(instruction)
 
+        # ✅ 修复: 验证指令数量不超过限制
+        if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
+            print(f"[BaseMutator] ⚠️  Generated {len(instructions)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}")
+            instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
+
         return instructions  # 这个是给Qemu读取的内容，以FuzzInstruction包装这样的一个Fuzz指令
 
     def _generate_io_mutations(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
@@ -176,11 +189,11 @@ class BaseMutator:
         返回:
             FuzzInstruction列表
         """
-        print(f"[BaseMutator] 🔥 Attempting IO mutation, trace={trace}, fork_point={fork_point}")
+        alog(f"Attempting IO mutation, trace={trace}, fork_point={fork_point}", "MUTATOR")
 
         # 识别IO syscalls
         io_syscalls = self.io_mutator.identify_io_syscalls(trace)
-        print(f"[BaseMutator] 🔍 Found {len(io_syscalls)} IO syscalls: {io_syscalls}")
+        alog(f"Found {len(io_syscalls)} IO syscalls", "MUTATOR")
 
         if not io_syscalls:
             # 没有IO syscalls，返回普通随机变异
@@ -228,7 +241,7 @@ class BaseMutator:
             )
             instructions.append(instruction)
 
-            print(f"[BaseMutator] 🎯 IO Mutation (retval): {m.description}")
+            alog(f"IO Mutation (retval): {m.description}", "MUTATOR")
 
             # 2️⃣ 如果有buffer_content，也生成REPLACE_BUFFER指令
             if m.buffer_content:
@@ -244,7 +257,12 @@ class BaseMutator:
                 )
                 instructions.append(buffer_instruction)
 
-                print(f"[BaseMutator] 🎯 IO Mutation (buffer): Fill {len(m.buffer_content)} bytes")
+                alog(f"IO Mutation (buffer): Fill {len(m.buffer_content)} bytes", "MUTATOR")
+
+        # ✅ 修复: 验证指令数量不超过限制
+        if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
+            print(f"[BaseMutator] ⚠️  IO mutation generated {len(instructions)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}")
+            instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
 
         return instructions
 
@@ -328,6 +346,11 @@ class BaseMutator:
                 mutation_type=mut_type  # ✅ 2025-11-18: 添加mutation_type参数
             )
             instructions.append(instruction)
+
+        # ✅ 修复: 验证指令数量不超过限制
+        if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
+            print(f"[BaseMutator] ⚠️  Random mutation generated {len(instructions)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}")
+            instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
 
         return instructions
 
@@ -1078,11 +1101,39 @@ class SmartMutator:
         """
         instrs = []
 
-        # ━━━━ 第2阶段: Recipe驱动模式 ━━━━
+        # ━━━━ 第2阶段: Recipe驱动模式 (概率性) ━━━━
+        # 🔥 P3 Fix 3.3: 改为概率性recipe选择，避免recipe完全主导
+        #
+        # 策略：
+        # - 前期 (<100 iters): 70% recipe, 30% 系统化探索
+        # - 中期 (100-500): 50% recipe, 50% 系统化探索
+        # - 后期 (>500): 30% recipe, 70% 系统化探索
+        #
+        # 效果：增加path discovery rate，平衡directed vs. systematic fuzzing
         if self.recipe_mode and self.recipes:
-            # ✅ 2025-11-17: 设置 mutation type 用于跟踪
-            self.last_mutation_type = 'recipe'
-            return self._build_from_recipes(iteration)
+            import random
+
+            # 根据迭代次数调整recipe概率
+            if iteration < 100:
+                recipe_probability = 0.7  # 前期70%使用recipe
+            elif iteration < 500:
+                recipe_probability = 0.5  # 中期50%使用recipe
+            else:
+                recipe_probability = 0.3  # 后期30%使用recipe
+
+            # 停滞时进一步降低recipe使用率（增加exploration）
+            if self.is_stagnant:
+                recipe_probability *= 0.6  # 停滞时降低recipe使用率
+
+            if random.random() < recipe_probability:
+                # ✅ 2025-11-17: 设置 mutation type 用于跟踪
+                self.last_mutation_type = 'recipe'
+                return self._build_from_recipes(iteration)
+            else:
+                # Fall through to systematic exploration
+                print(f"[Mutator] ⚙️ 跳过recipe，使用系统化探索 (iteration={iteration}, prob={recipe_probability:.1%})")
+
+        # ━━━━ 如果没有recipe或未命中recipe概率，使用系统化探索 ━━━━
 
         # ━━━━ 增强: 随机变异模式 ━━━━
         # ✅ 2025-11-17: 设置 mutation type 用于跟踪
@@ -1183,6 +1234,14 @@ class SmartMutator:
             instr = self._generate_advanced_mutation(target_candidate, strategy_type, iteration)
             if instr:
                 instrs.append(instr)
+        
+        # ✅ 2025-11-18: 记录mutation_type
+        self.last_mutation_type = 'smart' if len(instrs) > 0 else 'none'
+        
+        # ✅ 修复: 验证指令数量不超过限制
+        if len(instrs) > FUZZ_MAX_INSTRUCTIONS:
+            print(f"[SmartMutator] ⚠️  Generated {len(instrs)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}")
+            instrs = instrs[:FUZZ_MAX_INSTRUCTIONS]
         
         print(f"[Mutator] Generated {len(instrs)} mutation instructions")
         return instrs

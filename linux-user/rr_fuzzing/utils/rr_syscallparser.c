@@ -604,9 +604,10 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
     if (!next) return 0;
     
     /* 复制系统调用名称 */
+    /* 复制系统调用名称 */
     size_t name_len = next - current;
     if (name_len >= sizeof(record->syscall_name)) name_len = sizeof(record->syscall_name) - 1;
-    strncpy(record->syscall_name, current, name_len);
+    memcpy(record->syscall_name, current, name_len);
     record->syscall_name[name_len] = '\0';
     
     /* 移除系统调用名称末尾的空格 */
@@ -627,7 +628,7 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
     char args_buffer[1024] = {0};
     size_t args_len = next - current;
     if (args_len >= sizeof(args_buffer)) args_len = sizeof(args_buffer) - 1;
-    strncpy(args_buffer, current, args_len);
+    memcpy(args_buffer, current, args_len);
     args_buffer[args_len] = '\0';
     
     /* 解析参数 */
@@ -668,15 +669,15 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
             if (str_start && str_end && str_start != str_end) {
                 size_t str_len = str_end - str_start - 1;
                 if (str_len >= RR_STRACE_MAX_STRING_LENGTH) str_len = RR_STRACE_MAX_STRING_LENGTH - 1;
-                strncpy(arg->str, str_start + 1, str_len);
+                memcpy(arg->str, str_start + 1, str_len);
                 arg->str[str_len] = '\0';
             } else {
-                strncpy(arg->str, arg_str, RR_STRACE_MAX_STRING_LENGTH - 1);
+                snprintf(arg->str, RR_STRACE_MAX_STRING_LENGTH, "%s", arg_str);
                 arg->value = 0;
             }
         } else if (arg->type == RR_STRACE_ARG_TYPE_PTR) {
             /* 处理标志等 */
-            strncpy(arg->str, arg_str, RR_STRACE_MAX_STRING_LENGTH - 1);
+            snprintf(arg->str, RR_STRACE_MAX_STRING_LENGTH, "%s", arg_str);
             arg->value = rr_strace_parse_flags(arg_str, record->syscall_name, record->arg_count);
         } else {
             /* 处理数字参数 */
@@ -744,7 +745,7 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
             if (next) {
                 size_t err_len = next - current;
                 if (err_len >= sizeof(record->error_msg)) err_len = sizeof(record->error_msg) - 1;
-                strncpy(record->error_msg, current, err_len);
+                memcpy(record->error_msg, current, err_len);
                 record->error_msg[err_len] = '\0';
             }
         }

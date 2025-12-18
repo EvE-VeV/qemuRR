@@ -303,7 +303,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
         if (syscall_nr == 262) {
             if (record->arg_count > 3 && args) {
                 if (args[3] == record->args[3].value) {  // flags相同
-                    STRACE_VERBOSE("✓ Semantic match: newfstatat flags=0x%lx", args[3]);
+                    STRACE_VERBOSE("✓ Semantic match: newfstatat flags=0x%lx", (unsigned long)args[3]);
                     if (skip_count > 0) {
                         STRACE_INFO("Semantic match successful after skipping %d records: %s", 
                                 skip_count, syscall_name);
@@ -322,7 +322,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
                 
                 if (prot_match && flags_match) {
                     STRACE_VERBOSE("✓ Semantic match: mmap prot=0x%lx flags=0x%lx", 
-                               args[2], args[3]);
+                               (unsigned long)args[2], (unsigned long)args[3]);
                     if (skip_count > 0) {
                         STRACE_INFO("Semantic match successful after skipping %d records: %s", 
                                 skip_count, syscall_name);
@@ -606,7 +606,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         if (orig_args[i] != args[i]) {
             args_modified = true;
             STRACE_DEBUG("TRACE_REPLAY: %s arg[%d] %ld -> %ld", 
-                    record->syscall_name, i, orig_args[i], args[i]);
+                    record->syscall_name, i, (long)orig_args[i], (long)args[i]);
         }
     }
     
@@ -650,7 +650,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
             if (pre_fuzz_args[i] != args[i]) {
                 fuzz_modified = true;  // 任何参数变化都算作变异
                 STRACE_VERBOSE("FUZZ_MUTATED: %s arg[%d] %ld -> %ld",
-                          record->syscall_name, i, pre_fuzz_args[i], args[i]);
+                          record->syscall_name, i, (long)pre_fuzz_args[i], (long)args[i]);
             }
         }
         
@@ -678,7 +678,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
                 record->syscall_name, original_ret, mutated_ret);
 
         fprintf(stderr, "[STRACE] 🎯 RETVAL OVERRIDE: %s %ld → %ld (pure replay with mutated retval)\n",
-                record->syscall_name, original_ret, mutated_ret);
+                record->syscall_name, (long)original_ret, (long)mutated_ret);
         fflush(stderr);
 
         // ✅ 直接返回变异的返回值，不执行真实系统调用
@@ -697,7 +697,7 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
     
     const char *syscall_name = rr_get_syscall_name_fast(num);
     STRACE_DEBUG("Optimized post-hook for %s, ret=%ld", 
-             syscall_name ? syscall_name : "unknown", ret);
+             syscall_name ? syscall_name : "unknown", (long)ret);
     
     // 使用优化的POST处理
     rr_syscall_post_hook_optimized(num, g_current_record_strace, ret, args);
@@ -724,7 +724,6 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
             RR_INFO("✅ Reached fork_point[%u], switching to normal mode", target_fork_point);
             
             // ✅ 现在发送iteration消息（child正式开始）
-            extern int g_dynamic_trace_pipe_fd;
             if (g_dynamic_trace_pipe_fd >= 0) {
                 rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
             }

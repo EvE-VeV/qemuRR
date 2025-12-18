@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include "../utils/rr_syscall_dispatch.h"
 
 FILE *g_trace_file = NULL;  // ✅ 改为非static，让fork_server可以访问
 syscall_record_t *g_current_record = NULL;  // 非static，供fork_server访问
@@ -171,7 +172,7 @@ static syscall_record_t *read_next_record(void)
 
     RR_VERBOSE("READ_NEXT_RECORD: Successfully read record fields");
     RR_VERBOSE("READ_NEXT_RECORD: Record data - index=%u, syscall=%d, ret=%ld",
-               record->index, record->syscall_nr, record->retval);
+               record->index, record->syscall_nr, (long)record->retval);
 
     /* 读取参数数据 */
     int arg_index;
@@ -358,7 +359,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
             RR_INFO("✅ [Hybrid] Reached fork_point[%u], switching to normal mode", target_fork_point);
             
             // ✅ 发送iteration消息
-            extern int g_dynamic_trace_pipe_fd;
+            // extern int g_dynamic_trace_pipe_fd;
             if (g_dynamic_trace_pipe_fd >= 0) {
                 rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
             }
@@ -378,8 +379,8 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                     g_rr_framework->replay_index, num);
             
             /* ✅ 修复：真实执行也要发送dynamic trace！*/
-            extern bool g_dynamic_trace_enabled;
-            extern int g_dynamic_trace_pipe_fd;
+            // extern bool g_dynamic_trace_enabled;
+            // extern int g_dynamic_trace_pipe_fd;
             RR_INFO("🔍 About to send dynamic trace: silent=%d, enabled=%d, pipe_fd=%d",
                     g_rr_framework->silent_replay_mode, g_dynamic_trace_enabled, g_dynamic_trace_pipe_fd);
             if (!g_rr_framework->silent_replay_mode) {
@@ -626,9 +627,9 @@ try_hybrid:
         ret = rr_fuzz_get_retval_override();  /* 获取覆盖值并清除标志 */
 
         RR_INFO("🎯 IO RETVAL OVERRIDE (Hybrid): syscall %d (%s): %ld → %ld",
-                num, rr_get_syscall_name_fast(num), original_ret, ret);
+                num, rr_get_syscall_name_fast(num), (long)original_ret, (long)ret);
 
-        fprintf(stderr, "[REPLAY-HYBRID] 🎯 RETVAL OVERRIDE: %ld → %ld\n", original_ret, ret);
+        fprintf(stderr, "[REPLAY-HYBRID] 🎯 RETVAL OVERRIDE: %ld → %ld\n", (long)original_ret, (long)ret);
         fflush(stderr);
 
         /* ✅ 2025-11-17: Hybrid路径的Buffer Fill */
@@ -642,7 +643,7 @@ try_hybrid:
             if (fill_size > 0 && buf_addr != 0 && pattern != NULL) {
                 if (cpu_memory_rw_debug(env_cpu(env), buf_addr, (uint8_t *)pattern, fill_size, 1) == 0) {
                     fprintf(stderr, "[REPLAY-HYBRID] 🎨 BUFFER FILLED: addr=0x%lx, size=%zu\n",
-                            buf_addr, fill_size);
+                            (unsigned long)buf_addr, fill_size);
                     fflush(stderr);
                 }
             }
@@ -695,10 +696,10 @@ replay_success:
         ret = rr_fuzz_get_retval_override();  // 这会自动清除标志
 
         RR_INFO("🎯 IO RETVAL OVERRIDE: syscall %d (%s): recorded=%ld, ret_before=%ld → ret_after=%ld",
-                num, rr_get_syscall_name_fast(num), recorded_ret_for_debug, original_ret, ret);
+                num, rr_get_syscall_name_fast(num), (long)recorded_ret_for_debug, (long)original_ret, (long)ret);
 
         fprintf(stderr, "[REPLAY] 🎯 RETVAL OVERRIDE: recorded=%ld, before=%ld → after=%ld\n",
-                recorded_ret_for_debug, original_ret, ret);
+                (long)recorded_ret_for_debug, (long)original_ret, (long)ret);
         fflush(stderr);
     }
 
@@ -714,15 +715,15 @@ replay_success:
             /* 填充guest buffer */
             if (cpu_memory_rw_debug(env_cpu(env), buf_addr, (uint8_t *)pattern, fill_size, 1) == 0) {
                 RR_INFO("🎨 BUFFER FILLED: syscall %d (%s): addr=0x%lx, size=%zu",
-                        num, rr_get_syscall_name_fast(num), buf_addr, fill_size);
+                        num, rr_get_syscall_name_fast(num), (unsigned long)buf_addr, fill_size);
 
                 fprintf(stderr, "[REPLAY] 🎨 BUFFER FILLED: addr=0x%lx, size=%zu (first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
-                        buf_addr, fill_size,
+                        (unsigned long)buf_addr, fill_size,
                         pattern[0], pattern[1], pattern[2], pattern[3],
                         pattern[4], pattern[5], pattern[6], pattern[7]);
                 fflush(stderr);
             } else {
-                RR_WARN("Failed to fill buffer at addr=0x%lx, size=%zu", buf_addr, fill_size);
+                RR_WARN("Failed to fill buffer at addr=0x%lx, size=%zu", (unsigned long)buf_addr, fill_size);
             }
         }
     }

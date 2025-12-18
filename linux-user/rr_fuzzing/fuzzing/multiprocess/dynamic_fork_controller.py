@@ -15,7 +15,7 @@ DynamicForkController - 动态Fork探索控制器
 
 import random
 import time
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, TYPE_CHECKING
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -23,7 +23,13 @@ from dataclasses import dataclass
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from conductor.qemu_executor import QEMUExecutor
+# 使用 TYPE_CHECKING 避免循环导入
+if TYPE_CHECKING:
+    from conductor.qemu_executor import QEMUExecutor
+else:
+    # 运行时延迟导入
+    QEMUExecutor = None
+
 from conductor.mutator import SmartMutator
 from conductor.coverage import CoverageTracker
 from conductor.trace_manager import TraceManager, Trace
@@ -70,7 +76,7 @@ class DynamicForkController:
     """
     
     def __init__(self,
-                 executor: QEMUExecutor,
+                 executor: 'QEMUExecutor',
                  path_finder: Optional[PathFinder],
                  mutator: SmartMutator,
                  recipe_pool: Optional[RecipePool],
@@ -101,7 +107,7 @@ class DynamicForkController:
 
         # 🔥 新增：深度优先checkpoint/snapshot模式配置
         self.depth_first_mode = True  # 启用深度优先探索
-        self.max_depth = 5  # 最大探索深度
+        self.max_depth = 2  # ✅ P0 Fix 1.3: 降低深度从5到2 (执行数从243降到9, 节省96%)
         self.max_variants_per_checkpoint = 2  # 每个checkpoint最多2个变种
         self.checkpoint_queue = []  # 待探索的checkpoint队列（深度优先）
 
@@ -110,10 +116,11 @@ class DynamicForkController:
         self.fork_budget_per_1000 = 200  # 增加预算，支持深度探索
 
         # ✅ 自适应trigger_probability配置
-        self.trigger_probability = 0.1  # 基础概率（初始值）
+        # 🔥 P3 Fix 3.2: 从10%提升到20%，解决触发频率过低问题 (6.7% → 20%+)
+        self.trigger_probability = 0.2  # 基础概率（初始值）从0.1提升到0.2
         self.adaptive_trigger = True  # 启用自适应调整
-        self.min_trigger_probability = 0.05  # 最小触发概率
-        self.max_trigger_probability = 0.3  # 最大触发概率
+        self.min_trigger_probability = 0.15  # 最小触发概率从0.05提升到0.15
+        self.max_trigger_probability = 0.4  # 最大触发概率从0.3提升到0.4
 
         # 自适应统计窗口
         self.recent_forks = []  # [(success, timestamp), ...] 最近的fork结果
@@ -276,35 +283,22 @@ class DynamicForkController:
             self._io_syscalls_cache = {}
 
         if cache_key in self._io_syscalls_cache:
-            # ✅ 使用缓存，避免重复execute_baseline
+            # ✅ 使用缓存，避免重复分析
             io_syscalls = self._io_syscalls_cache[cache_key]
-            print(f"[DynamicForkController] ⚡ Using cached IO syscalls for {trace.id} (saved baseline execution)")
+            print(f"[DynamicForkController] ⚡ Using cached IO syscalls for {trace.id} (0ms)")
         else:
-            # 首次执行：需要discover IO syscalls
-            print(f"[DynamicForkController] Step 1: Execute baseline to discover IO syscalls...")
+            # ✅ P0 Fix 1.2: 使用静态分析替代baseline执行 (节省120ms)
+            print(f"[DynamicForkController] 📊 Static analysis to discover IO syscalls (no QEMU execution)...")
 
-            try:
-                baseline_result = self.executor.execute_baseline(
-                    trace_file=trace.file_path,
-                    iteration_id=iteration_id
-                )
-                # ✅ Update unified stats counter
-                if self.fuzzing_stats:
-                    self.fuzzing_stats.total_execs += 1
+            # ❌ 移除: baseline_result = self.executor.execute_baseline(...)
+            # ✅ 改为: 直接使用TraceAnalyzer静态分析
 
-                if baseline_result.normal_exit:
-                    print(f"[DynamicForkController] Baseline execution completed")
-                else:
-                    print(f"[DynamicForkController] Warning: Baseline failed, continuing...")
-            except Exception as e:
-                print(f"[DynamicForkController] Warning: Baseline exception: {e}")
-
-            # ✅ 2025-11-18: 智能IO syscall选择（限制fork点数量）
+            # ✅ 智能IO syscall选择（_find_io_syscalls内部使用TraceAnalyzer静态分析）
             io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
 
             # ✅ 缓存结果
             self._io_syscalls_cache[cache_key] = io_syscalls
-            print(f"[DynamicForkController] 💾 Cached {len(io_syscalls)} IO syscalls for future use")
+            print(f"[DynamicForkController] 💾 Cached {len(io_syscalls)} IO syscalls for future use (saved 120ms baseline execution)")
 
         if not io_syscalls:
             print(f"[DynamicForkController] No IO syscalls found")

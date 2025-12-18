@@ -13,11 +13,7 @@ tests/programs/test_programs/
 # Trace文件
 *.dat
 *.dat.bbl
-/tmp/trace.dat*
-/tmp/fuzz_demo/
-/tmp/complex_test_suite/
-/tmp/integrated_test/
-/tmp/conductor_test/
+
 
 # 测试日志和临时文件
 *.log
@@ -26,6 +22,9 @@ test/*.strace
 test/rr_test_file.txt
 test/simple_qemu_test.log
 compare/
+data/*
+__MACOSX/
+
 
 # 文档归档（旧文档）
 docs/old-archive/

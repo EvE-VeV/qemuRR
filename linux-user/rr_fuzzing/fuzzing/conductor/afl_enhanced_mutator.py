@@ -219,8 +219,8 @@ class AFLEnhancedMutator(SmartMutator):
         """AFL 1/1位翻转"""
         instructions = []
 
-        # 限制变异数量，避免爆炸
-        max_mutations = min(len(seed_data) * 8, 64)  # 最多64个变异
+        # 限制变异数量，避免爆炸 (C端FuzzVariant.instructions[32]限制)
+        max_mutations = min(len(seed_data) * 8, 32)  # 最多32个变异
 
         for bit_idx in range(max_mutations):
             byte_idx = bit_idx // 8

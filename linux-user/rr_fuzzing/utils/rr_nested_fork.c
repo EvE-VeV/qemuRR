@@ -73,6 +73,11 @@ bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long re
  * 
  * Child在执行中自主决定fork出多个grandchildren
  */
+#define NUM_NESTED_VARIANTS 2
+
+extern FILE *g_trace_file;
+extern char *g_rr_trace_path;
+
 void rr_autonomous_nested_fork(int fork_index) {
     RR_INFO("🔄 Autonomous nested fork at syscall[%d] (depth=%u, iteration=%u)", 
             fork_index, g_rr_framework->current_depth, g_rr_framework->current_iteration_id);
@@ -80,14 +85,14 @@ void rr_autonomous_nested_fork(int fork_index) {
     g_rr_framework->forks_this_iteration++;
     
     /* ✅ 真正的nested fork实现！*/
-    const int NUM_NESTED_VARIANTS = 2;  // 每次fork出2个grandchildren
+    // const int NUM_NESTED_VARIANTS = 2;  // 每次fork出2个grandchildren
     
     pid_t my_pid = getpid();
     pid_t grandchild_pids[NUM_NESTED_VARIANTS];
     
     // 保存当前状态（trace file需要每个grandchild独立）
-    extern FILE *g_trace_file;
-    extern char *g_rr_trace_path;
+    // extern FILE *g_trace_file;
+    // extern char *g_rr_trace_path;
     
     for (int i = 0; i < NUM_NESTED_VARIANTS; i++) {
         pid_t pid = fork();
