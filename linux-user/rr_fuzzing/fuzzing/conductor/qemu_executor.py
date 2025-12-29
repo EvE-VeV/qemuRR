@@ -232,9 +232,40 @@ class QEMUExecutor:
     def _setup_ipc(self):
         """Setup IPC channels (pipes and shared memory)"""
         # Create pipes
-        self.cmd_pipe_read, self.cmd_pipe_write = os.pipe()
-        self.status_pipe_read, self.status_pipe_write = os.pipe()
+        r1, w1 = os.pipe()
+        r2, w2 = os.pipe()
         
+        # 🔥 P0 Fix: Move pipes to high FDs to avoid collision with target program FDs
+        # QEMU's align_fd_state might clobber low FDs like 10
+        try:
+            self.cmd_pipe_read = os.dup(r1) 
+            # We don't control the target FD number easily in Python without os.dup2 to a specific int
+            # But just duping usually finds the lowest available.
+            # We want SPECIFIC high FDs.
+            
+            # Let's try to dup2 to 100, 101, 102, 103 manually
+            TARGET_FD_BASE = 150
+            
+            os.dup2(r1, TARGET_FD_BASE)
+            os.dup2(w1, TARGET_FD_BASE + 1)
+            os.dup2(r2, TARGET_FD_BASE + 2)
+            os.dup2(w2, TARGET_FD_BASE + 3)
+            
+            # Close originals
+            os.close(r1); os.close(w1); os.close(r2); os.close(w2)
+            
+            self.cmd_pipe_read = TARGET_FD_BASE
+            self.cmd_pipe_write = TARGET_FD_BASE + 1
+            self.status_pipe_read = TARGET_FD_BASE + 2
+            self.status_pipe_write = TARGET_FD_BASE + 3
+            
+        except Exception as e:
+            print(f"[QEMUExecutor] ⚠️ Failed to relocate FDs, falling back to default: {e}")
+            self.cmd_pipe_read = r1
+            self.cmd_pipe_write = w1
+            self.status_pipe_read = r2
+            self.status_pipe_write = w2
+
         # Create shared memory
         shm_name = f"rr_fuzz_{os.getpid()}_{self.total_executions}"
         self.shm = FuzzSharedMemory(shm_name, fallback_dir=str(self._ipc_fallback_dir))
@@ -315,18 +346,20 @@ class QEMUExecutor:
         # Our trace files are TRRR binary format, use native replay module
         # which already supports silent_replay_mode
         
-        # Set RR_TRACE_PIPE for dynamic trace visualization
-        if 'RR_TRACE_PIPE' in os.environ:
-            env['RR_TRACE_PIPE'] = os.environ['RR_TRACE_PIPE']
-            print(f"[QEMUExecutor] Passing RR_TRACE_PIPE={env['RR_TRACE_PIPE']} to QEMU")
-        else:
-            # Default to /tmp/rr_dynamic_trace if not set
-            default_pipe = '/tmp/rr_dynamic_trace'
-            if os.path.exists(default_pipe):
-                env['RR_TRACE_PIPE'] = default_pipe
-                print(f"[QEMUExecutor] Using default RR_TRACE_PIPE={default_pipe}")
-            else:
-                print(f"[QEMUExecutor] Warning: RR_TRACE_PIPE not set and {default_pipe} not found - dynamic trace disabled")
+        # ✅ 修复：预防启动死锁 (DEADLOCK PREVENTION)
+        # QEMU 会以阻塞模式 (O_WRONLY) 尝试打开 RR_TRACE_PIPE。
+        # 如果管道文件存在（例如来自上一次运行的残留）但没有任何读取者（如 visualizer 未连接），
+        # QEMU 将在 open() 调用处无限期挂起。
+        # 因此，除非我们确信 Visualizer 已经准备就绪，否则严禁将此环境变量传递给 QEMU。
+        if 'RR_TRACE_PIPE' in env:
+             print(f"[QEMUExecutor] ⚠️ 在环境变量中检测到 RR_TRACE_PIPE={env['RR_TRACE_PIPE']}")
+             print("[QEMUExecutor] 🛑 为了防止 QEMU 启动死锁（阻塞式打开），正在移除该变量")
+             del env['RR_TRACE_PIPE']
+        
+        # 同时禁用默认管道的自动检测逻辑，原因同上
+        # default_pipe = '/tmp/rr_dynamic_trace'
+        # if os.path.exists(default_pipe): ...
+
         
         env.update({
             'RR_FUZZING_ENABLED': '1',
@@ -336,7 +369,7 @@ class QEMUExecutor:
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.get_env_value(),
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
-            'RR_DEBUG_LEVEL': '0',  # 🔥 Phase 2优化: 完全禁用RR日志 (1→0) 进一步减少I/O
+            'RR_DEBUG_LEVEL': os.environ.get('RR_DEBUG_LEVEL', '1'),
         })
         
         cmd = [self.qemu_path, self.target_binary]
@@ -383,7 +416,7 @@ class QEMUExecutor:
             except:
                 pass
     
-    def _wait_for_status(self, timeout: float) -> Optional[int]:
+    def _wait_for_status(self, timeout: float) -> Optional[tuple]:
         """
         Wait for status update from QEMU
 
@@ -391,7 +424,9 @@ class QEMUExecutor:
             timeout: Timeout in seconds
 
         Returns:
-            int: Status code or None if timeout
+            tuple: (status, exit_code, signal_number) or None if timeout
+                  For non-crash statuses: (status, None, None)
+                  For crashes: (STATUS_CRASH, exit_code, signal_number)
 
         🔥 性能优化: 降低select timeout减少等待时间
         """
@@ -405,10 +440,28 @@ class QEMUExecutor:
             ready, _, _ = select.select([self.status_pipe_read], [], [], select_timeout)
 
             if ready:
+                # 先读取status (4字节)
                 status_bytes = os.read(self.status_pipe_read, 4)
+                print(f"[DEBUG-PIPE] Read {len(status_bytes)} bytes: {status_bytes.hex() if status_bytes else 'None'}")
                 if len(status_bytes) == 4:
                     status = struct.unpack('i', status_bytes)[0]
-                    return status
+                    
+                    # ✅ 如果是崩溃，读取额外的exit_code和signal (各4字节)
+                    if status == STATUS_CRASH:
+                        try:
+                            extra_bytes = os.read(self.status_pipe_read, 8)
+                            if len(extra_bytes) == 8:
+                                exit_code, signal_number = struct.unpack('ii', extra_bytes)
+                                return (status, exit_code, signal_number)
+                            else:
+                                print(f"[QEMUExecutor] ⚠️ Incomplete crash data: {len(extra_bytes)} bytes")
+                                return (status, None, None)
+                        except Exception as e:
+                            print(f"[QEMUExecutor] ⚠️ Failed to read crash details: {e}")
+                            return (status, None, None)
+                    else:
+                        # 非崩溃状态，不需要额外数据
+                        return (status, None, None)
 
             # Check if process is still alive
             if self.qemu_process and self.qemu_process.poll() is not None:
@@ -682,7 +735,7 @@ class QEMUExecutor:
                 self._trace_file = trace_file
                 
                 # Wait for initial READY status
-                status = self._wait_for_status(timeout=5.0)
+                status = self._wait_for_status(timeout=20.0)
                 if status != STATUS_READY:
                     print(f"[DEBUG-EXEC] ❌ QEMU init failed (status={status}), setting _qemu_ready=False")
                     self._qemu_ready = False
@@ -824,8 +877,9 @@ class QEMUExecutor:
             self._fork_qemu(trace_file)
             self._trace_file = trace_file
             
-            status = self._wait_for_status(timeout=5.0)
-            if status != STATUS_READY:
+            status_data = self._wait_for_status(timeout=20.0)
+            if status_data is None or status_data[0] != STATUS_READY:
+                print(f"[DEBUG-EXEC] ❌ QEMU init failed (data={status_data})")
                 raise RuntimeError("QEMU init failed")
             
             # 不需要发送'F'命令，QEMU已经在fork server loop中等待
@@ -858,9 +912,9 @@ class QEMUExecutor:
         extended_timeout = self.timeout * len(mutation_variants)
         
         for variant_idx in range(len(mutation_variants)):
-            status = self._wait_for_status(timeout=extended_timeout)
+            result_data = self._wait_for_status(timeout=extended_timeout)
             
-            if status is None:
+            if result_data is None:
                 # Timeout
                 self.total_timeouts += 1
                 results.append(ExecutionResult(
@@ -870,6 +924,9 @@ class QEMUExecutor:
                     execution_time=time.time() - start_time
                 ))
                 continue
+            
+            # ✅ 解包status和crash详细信息
+            status, exit_code, signal_number = result_data
             
             # 读取coverage
             coverage_bitmap = self._read_coverage()
@@ -884,15 +941,20 @@ class QEMUExecutor:
             }
             status_name = status_map.get(status, f"unknown_{status}")
             
+            # ✅ DEBUG: Log every status read
+            print(f"[QEMUExecutor] 📊 Read status={status}, name={status_name}, is_crash={status == STATUS_CRASH}")
+            
             if status == STATUS_CRASH:
                 self.total_crashes += 1
+                print(f"[QEMUExecutor] 💥 CRASH DETECTED! exit_code={exit_code}, signal={signal_number}, Total crashes: {self.total_crashes}")
             
             results.append(ExecutionResult(
                 status=status,
                 status_name=status_name,
                 coverage_bitmap=coverage_bitmap,
                 execution_time=time.time() - start_time,
-                qemu_exit_code=None
+                qemu_exit_code=exit_code,      # ✅ 填充exit_code
+                signal_number=signal_number     # ✅ 填充signal_number
             ))
             
             self.total_executions += 1

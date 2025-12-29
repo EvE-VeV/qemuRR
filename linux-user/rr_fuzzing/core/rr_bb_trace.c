@@ -95,7 +95,7 @@ int rr_bb_trace_init(const char *trace_file)
     
     RR_INFO("BB trace initialized: %s (buffer: %zu entries)",
             g_bb_trace->trace_file, g_bb_trace->buffer_size);
-    
+            
     return 0;
 }
 
@@ -138,7 +138,6 @@ void rr_bb_trace_log(uint64_t pc)
         return;
     }
     
-    /* 地址过滤：只记录主程序的BB */
     if (g_bb_trace->filter_enabled) {
         if (pc < g_bb_trace->main_start || pc >= g_bb_trace->main_end) {
             /* 这是库函数BB，跳过 */
@@ -244,33 +243,13 @@ void rr_bb_trace_print_stats(void)
 
 void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code)
 {
-    fprintf(stderr, "[BB_TRACE] set_main_range called: 0x%lx - 0x%lx (g_bb_trace=%p)\n", 
-            start_code, end_code, (void*)g_bb_trace);
-    
-    if (!g_bb_trace) {
-        fprintf(stderr, "[BB_TRACE] ERROR: g_bb_trace is NULL!\n");
-        return;
-    }
-    
+    if (!g_bb_trace) return;
     g_bb_trace->main_start = start_code;
     g_bb_trace->main_end = end_code;
-    
-    fprintf(stderr, "[BB_TRACE] Range set successfully: 0x%lx - 0x%lx\n", 
-            start_code, end_code);
 }
 
 void rr_bb_trace_set_filter(bool enabled)
 {
-    fprintf(stderr, "[BB_TRACE] set_filter called: %s (g_bb_trace=%p)\n",
-            enabled ? "enabled" : "disabled", (void*)g_bb_trace);
-    
-    if (!g_bb_trace) {
-        fprintf(stderr, "[BB_TRACE] ERROR: g_bb_trace is NULL!\n");
-        return;
-    }
-    
+    if (!g_bb_trace) return;
     g_bb_trace->filter_enabled = enabled;
-    
-    fprintf(stderr, "[BB_TRACE] Filter %s successfully\n", enabled ? "enabled" : "disabled");
 }
-

@@ -9,7 +9,7 @@ test_debug
 tests/test_bb_trace
 tests/complex_test_*
 tests/programs/test_programs/
-
+fuzzing_output_*
 # Trace文件
 *.dat
 *.dat.bbl

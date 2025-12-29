@@ -11,9 +11,20 @@
 #endif
 
 /* ===== 系统调用分类表 ===== */
-/* 
- * 参考 EnvFuzz 的 P_IO 分类
- * 只列出最常用的系统调用，未列出的默认为 MISC 类
+/**
+ * @brief 系统调用分类表 (P0 Key Data Structure)
+ * 
+ * 定义了所有受支持的系统调用的分类信息。
+ * 
+ * **分类 (Class)**:
+ * - `SYSCALL_CLASS_IO`:   读写数据 (fuzzing 重点)
+ * - `SYSCALL_CLASS_FD`:   管理 FD (open, close, socket)
+ * - `SYSCALL_CLASS_MEM`:  内存管理 (mmap)
+ * - `SYSCALL_CLASS_PROC`: 进程控制 (fork, exec)
+ * 
+ * **属性**:
+ * - `is_input`: 标记该 syscall 是否为输入源 (如 read 是, write 不是)。
+ *               这对于 Auto Fork 策略至关重要。
  */
 static const syscall_info_t g_syscall_table[] = {
     /* ===== P_IO 类（18个）- fuzzing 目标 ===== */
@@ -161,6 +172,22 @@ const syscall_info_t *rr_get_syscall_info(int syscall_nr)
     return &default_info;
 }
 
+/**
+ * @brief 判断是否应该自动 Fork (Auto Fork Heuristic)
+ * 
+ * Fork Server 的核心决策函数。在 `rr_check_auto_fork_point` 中被调用。
+ * 决定当前系统调用执行完毕后，是否应该作为一个新的 Fork 点。
+ * 
+ * **策略 (Strategy)**:
+ * - `STRICT`: 仅当成功读取且被标记为 input 时 fork (保守)。
+ * - `RELAXED`: 允许部分错误 (如 ENOENT)。
+ * - `AGGRESSIVE`: 只要是 IO 类 syscall 就 fork (覆盖率最大化)。
+ * - `FALLBACK`: 留给上层逻辑决定。
+ * 
+ * @param syscall_nr 系统调用号
+ * @param ret 返回值
+ * @return true 应该 fork, false 不 fork
+ */
 bool rr_should_auto_fork(int syscall_nr, abi_long ret)
 {
     const syscall_info_t *info = rr_get_syscall_info(syscall_nr);

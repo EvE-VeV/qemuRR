@@ -1,7 +1,6 @@
 /**
  * RR-Fuzz IPC通信模块
  * 实现Conductor与QEMU之间的管道和共享内存通信
- * 对应design.md中的rr_ipc.c
  */
 
 #ifndef RR_DEBUG
@@ -17,262 +16,139 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static void *rr_map_shared_memory(const char *identifier);
-/**
- * 初始化IPC系统
- * 使用统一配置系统
- */
+
 int rr_ipc_init(void)
 {
     RR_IPC_TRACE("Initializing IPC system");
 
-    /* 从配置获取管道路径，支持FD数字或文件路径 */
     if (g_rr_config.cmd_pipe_path) {
-        /* 尝试将路径作为FD数字解析 */
         char *endptr;
         long fd = strtol(g_rr_config.cmd_pipe_path, &endptr, 10);
         if (*endptr == '\0' && fd >= 0) {
-            /* 是数字，作为已打开的FD使用 */
             g_rr_framework->cmd_pipe_fd = (int)fd;
             RR_IPC_TRACE("Using command pipe FD: %d", g_rr_framework->cmd_pipe_fd);
         } else {
-            /* 不是数字，作为文件路径打开（QEMU读取命令） */
             g_rr_framework->cmd_pipe_fd = open(g_rr_config.cmd_pipe_path, O_RDONLY | O_NONBLOCK);
             if (g_rr_framework->cmd_pipe_fd < 0) {
-                RR_WARN("Failed to open command pipe: %s (errno=%d)", g_rr_config.cmd_pipe_path, errno);
-            } else {
-                RR_IPC_TRACE("Opened command pipe: %s -> FD %d", 
-                             g_rr_config.cmd_pipe_path, g_rr_framework->cmd_pipe_fd);
+                RR_WARN("Failed to open command pipe: %s", g_rr_config.cmd_pipe_path);
             }
         }
     } else {
         g_rr_framework->cmd_pipe_fd = -1;
-        RR_IPC_TRACE("No command pipe configured");
     }
 
     if (g_rr_config.status_pipe_path) {
-        /* 尝试将路径作为FD数字解析 */
         char *endptr;
         long fd = strtol(g_rr_config.status_pipe_path, &endptr, 10);
         if (*endptr == '\0' && fd >= 0) {
-            /* 是数字，作为已打开的FD使用 */
             g_rr_framework->status_pipe_fd = (int)fd;
             RR_IPC_TRACE("Using status pipe FD: %d", g_rr_framework->status_pipe_fd);
         } else {
-            /* 不是数字，作为文件路径打开（QEMU写入状态） */
             g_rr_framework->status_pipe_fd = open(g_rr_config.status_pipe_path, O_WRONLY | O_NONBLOCK);
             if (g_rr_framework->status_pipe_fd < 0) {
-                RR_WARN("Failed to open status pipe: %s (errno=%d)", g_rr_config.status_pipe_path, errno);
-            } else {
-                RR_IPC_TRACE("Opened status pipe: %s -> FD %d", 
-                             g_rr_config.status_pipe_path, g_rr_framework->status_pipe_fd);
+                RR_WARN("Failed to open status pipe: %s", g_rr_config.status_pipe_path);
             }
         }
     } else {
         g_rr_framework->status_pipe_fd = -1;
-        RR_IPC_TRACE("No status pipe configured");
     }
 
-    /* 初始化共享内存 */
     if (g_rr_config.shared_memory_name) {
         g_rr_framework->shared_memory = rr_map_shared_memory(g_rr_config.shared_memory_name);
-        if (!g_rr_framework->shared_memory) {
-            RR_WARN("Failed to initialize shared memory '%s'", g_rr_config.shared_memory_name);
-        } else {
-            RR_IPC_TRACE("Shared memory ready: %s (size=%zu)",
-                         g_rr_config.shared_memory_name,
-                         g_rr_config.shared_memory_size);
-        }
-    } else {
-        RR_IPC_TRACE("No shared memory configured");
     }
 
     RR_INFO("IPC system initialized");
     return 0;
 }
 
-/**
- * 清理IPC系统
- */
 void rr_ipc_cleanup(void)
 {
     RR_IPC_TRACE("Cleaning up IPC system");
-
     if (g_rr_framework->shared_memory) {
         munmap(g_rr_framework->shared_memory, g_rr_config.shared_memory_size);
         g_rr_framework->shared_memory = NULL;
-        RR_IPC_TRACE("Unmapped shared memory");
     }
-
     if (g_rr_framework->cmd_pipe_fd >= 0) {
         close(g_rr_framework->cmd_pipe_fd);
         g_rr_framework->cmd_pipe_fd = -1;
-        RR_IPC_TRACE("Closed command pipe");
     }
-
     if (g_rr_framework->status_pipe_fd >= 0) {
         close(g_rr_framework->status_pipe_fd);
         g_rr_framework->status_pipe_fd = -1;
-        RR_IPC_TRACE("Closed status pipe");
     }
 }
 
-/**
- * 发送状态消息
- * 实现design.md中的状态管道协议
- */
 int rr_ipc_send_status(int status)
 {
-    if (g_rr_framework->status_pipe_fd < 0) {
-        RR_WARN("Cannot send status %d: status_pipe_fd is invalid", status);
-        return 0; // 如果没有状态管道，直接返回成功
-    }
-
-    RR_INFO("📤 Sending status: %d (fd=%d, pid=%d)", status, g_rr_framework->status_pipe_fd, getpid());
-    
-    /* 🔥 修复：添加重试机制，处理非阻塞写入 */
-    int retry_count = 0;
-    const int max_retries = 3;
-    ssize_t written;
-    
-    while (retry_count < max_retries) {
-        written = write(g_rr_framework->status_pipe_fd, &status, sizeof(status));
-        if (written == sizeof(status)) {
-            RR_INFO("✅ Status %d sent successfully", status);
-            return 0;
-        }
-        
-        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* 管道缓冲区满，短暂等待后重试 */
-            retry_count++;
-            RR_WARN("Status pipe full, retrying (%d/%d)...", retry_count, max_retries);
-            usleep(10000); // 10ms
-            continue;
-        }
-        
-        /* 其他错误 */
-        break;
-    }
-    
-    RR_ERROR("Failed to send status %d after %d retries: written=%zd, errno=%d (%s)", 
-             status, retry_count, written, errno, strerror(errno));
+    if (g_rr_framework->status_pipe_fd < 0) return 0;
+    ssize_t written = write(g_rr_framework->status_pipe_fd, &status, sizeof(status));
+    if (written == sizeof(status)) return 0;
     return -1;
 }
 
 /**
- * 接收命令
- * 实现design.md中的控制管道协议
+ * Send crash status with additional details (exit code and signal)
+ * 
+ * When a crash is detected, this function sends 3 integers:
+ * 1. status (STATUS_CRASH = 4)
+ * 2. exit_code (e.g., 134 for SIGABRT, 139 for SIGSEGV)
+ * 3. signal_number (e.g., 6 for SIGABRT, 11 for SIGSEGV)
+ * 
+ * Python side reads these 3 ints to populate ExecutionResult fully.
  */
+int rr_ipc_send_crash_status(int status, int exit_code, int signal_number)
+{
+    if (g_rr_framework->status_pipe_fd < 0) return 0;
+    
+    // Send 3 integers: [status, exit_code, signal_number]
+    int buffer[3] = {status, exit_code, signal_number};
+    ssize_t written = write(g_rr_framework->status_pipe_fd, buffer, sizeof(buffer));
+    
+    if (written == sizeof(buffer)) {
+        RR_VERBOSE("Sent crash status: status=%d, exit_code=%d, signal=%d", 
+                   status, exit_code, signal_number);
+        return 0;
+    }
+    
+    RR_WARN("Failed to send full crash status (wrote %zd of %zu bytes)", 
+            written, sizeof(buffer));
+    return -1;
+}
+
 int rr_ipc_receive_command(void)
 {
-    if (g_rr_framework->cmd_pipe_fd < 0) {
-        RR_WARN("cmd_pipe_fd is invalid (<0), returning 0");
-        return 0; // 如果没有命令管道，返回无命令
-    }
-
+    if (g_rr_framework->cmd_pipe_fd < 0) return 0;
     char cmd;
-    RR_VERBOSE("Calling read() on cmd_pipe_fd=%d...", g_rr_framework->cmd_pipe_fd);
     ssize_t n = read(g_rr_framework->cmd_pipe_fd, &cmd, 1);
-    RR_INFO("📥 IPC read: fd=%d, n=%zd, cmd='%c' (%d)", g_rr_framework->cmd_pipe_fd, n, 
-            (n == 1 && cmd > 0) ? cmd : '?', (int)(unsigned char)cmd);
-    
-    if (n != 1) {
-        if (n < 0) {
-            RR_WARN("read() failed with errno=%d (%s)", errno, strerror(errno));
-            return 0;
-        } else if (n == 0) {
-            /* 🔥 修复：管道关闭（EOF），应返回退出命令 */
-            RR_WARN("Command pipe closed (EOF), conductor disconnected");
-            return 'Q'; // 返回退出命令，让 fork server 安全停机
-        } else {
-            RR_VERBOSE("read() returned %zd (partial read)", n);
-            return 0;
-        }
-    }
-
-    RR_LOG("Received command: %c", cmd);
-
-    switch (cmd) {
-        case 'F': // Fork命令
-            return 'F';
-        case 'B': // Batch fork命令
-            return 'B';
-        case 'C': // Checkpoint fork命令
-            return 'C';
-        case 'E': // Baseline execution命令
-            return 'E';
-        case 'Q': // 退出命令
-            return 'Q';
-        case 'S': // 保存Snapshot命令
-            return 'S';
-        case 'L': // 加载Snapshot命令
-            return 'L';
-        default:
-            RR_LOG("Unknown command: %c", cmd);
-            return 0;
-    }
+    if (n == 1) return (unsigned char)cmd;
+    if (n == 0) return 'Q';
+    return 0;
 }
+
 static void *rr_map_posix_shared_memory(const char *name)
 {
     int shm_fd = shm_open(name, O_RDWR, 0666);
-    char prefixed_name[RR_MAX_PATH_LENGTH];
-    
-    if (shm_fd < 0 && name && name[0] != '/') {
-        /* Some platforms require a leading slash */
-        snprintf(prefixed_name, sizeof(prefixed_name), "/%s", name);
-        shm_fd = shm_open(prefixed_name, O_RDWR, 0666);
-    }
-    
-    if (shm_fd < 0) {
-        RR_WARN("Failed to open posix shared memory '%s' (errno=%d)", name, errno);
-        return NULL;
-    }
-    
-    void *addr = mmap(NULL, g_rr_config.shared_memory_size,
-                      PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (addr == MAP_FAILED) {
-        RR_WARN("Failed to mmap shared memory '%s' (errno=%d)", name, errno);
-        close(shm_fd);
-        return NULL;
-    }
-    
+    if (shm_fd < 0) return NULL;
+    void *addr = mmap(NULL, g_rr_config.shared_memory_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
-    RR_IPC_TRACE("Mapped POSIX shared memory '%s'", name);
-    return addr;
+    return addr == MAP_FAILED ? NULL : addr;
 }
 
 static void *rr_map_file_backed_memory(const char *path)
 {
     int fd = open(path, O_RDWR, 0);
-    if (fd < 0) {
-        RR_WARN("Failed to open file-backed shared memory '%s' (errno=%d)", path, errno);
-        return NULL;
-    }
-    
-    void *addr = mmap(NULL, g_rr_config.shared_memory_size,
-                      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (addr == MAP_FAILED) {
-        RR_WARN("Failed to mmap file-backed shared memory '%s' (errno=%d)", path, errno);
-        close(fd);
-        return NULL;
-    }
-    
+    if (fd < 0) return NULL;
+    void *addr = mmap(NULL, g_rr_config.shared_memory_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    RR_IPC_TRACE("Mapped file-backed shared memory '%s'", path);
-    return addr;
+    return addr == MAP_FAILED ? NULL : addr;
 }
 
 static void *rr_map_shared_memory(const char *identifier)
 {
-    if (!identifier) {
-        return NULL;
-    }
-    
-    if (strncmp(identifier, "file:", 5) == 0) {
-        const char *path = identifier + 5;
-        return rr_map_file_backed_memory(path);
-    }
-    
+    if (!identifier) return NULL;
+    if (strncmp(identifier, "file:", 5) == 0) return rr_map_file_backed_memory(identifier + 5);
     return rr_map_posix_shared_memory(identifier);
 }

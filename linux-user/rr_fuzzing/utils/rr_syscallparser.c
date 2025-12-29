@@ -578,6 +578,22 @@ int rr_strace_get_syscall_number(const char *syscall_name) {
 /**
  * 解析单行strace记录
  */
+/**
+ * @brief 解析单行 Strace 记录
+ * 
+ * 将一行文本格式的 strace 输出解析为结构化的 `rr_strace_record_t`。
+ * 
+ * **解析步骤**:
+ * 1. 提取 PID (如果有)。
+ * 2. 提取系统调用名称。
+ * 3. 提取参数列表 (括号内的内容)。
+ * 4. 识别并解析每个参数 (Int/String/Flag/Ptr)。
+ * 5. 提取返回值和错误码 (errno)。
+ * 
+ * @param line 输入的文本行 (会被修改，strtok/trim)
+ * @param record 输出的记录结构体
+ * @return int 1 成功, 0 失败
+ */
 int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
     if (!line || !record) return 0;
     
@@ -776,6 +792,18 @@ rr_strace_parser_t *rr_strace_parser_init(const char *filename) {
 
 /**
  * 加载并解析strace文件
+ */
+/**
+ * @brief 加载并解析完整的 Strace 文件
+ * 
+ * 读取指定文件，逐行解析系统调用记录。
+ * 
+ * **注意**: 
+ * - 这是一个内存密集型操作，会将所有记录加载到内存中 (`parser->records`)。
+ * - 解析后的记录用于 Replay 驱动。
+ * 
+ * @param parser 解析器上下文 (已包含 filename)
+ * @return int 0 成功, -1 失败
  */
 int rr_strace_parser_load(rr_strace_parser_t *parser) {
     fprintf(stderr, "[FORCE_DEBUG] rr_strace_parser_load called with filename: %s\n", 

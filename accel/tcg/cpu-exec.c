@@ -907,10 +907,6 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
         rr_bb_trace_log(pc);
     }
     
-    /* RR-Fuzz Phase 3: Coverage tracking */
-    if (rr_coverage_is_enabled_check()) {
-        rr_coverage_trace_edge(pc);
-    }
 #endif
     
     tb = cpu_tb_exec(cpu, tb, tb_exit);

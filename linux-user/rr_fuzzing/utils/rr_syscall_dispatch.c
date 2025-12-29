@@ -12,7 +12,21 @@
 
 /* ==================== 具体的处理函数实现 ==================== */
 
-/* 文件I/O类系统调用处理 */
+/* ==================== 具体的处理函数实现 ==================== */
+
+/**
+ * @brief 文件 I/O 类系统调用的参数应用函数
+ * 
+ * 在重放 (Replay) 模式下，将 trace 记录中的参数值应用到当前的系统调用参数中。
+ * 主要处理：
+ * - openat/open: flags, mode
+ * - read/write: count
+ * - pread64: count, offset
+ * - ioctl: request
+ * 
+ * @param record Trace 记录
+ * @param args 当前系统调用的参数数组 (将被修改)
+ */
 static void apply_file_io_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
@@ -36,6 +50,17 @@ static void apply_file_io_args(rr_strace_record_t *record, abi_long *args) {
     }
 }
 
+/**
+ * @brief 文件 I/O 类系统调用的 FD 映射应用
+ * 
+ * 将参数中的 recorded_fd 替换为 actual_fd。
+ * 适用于：read, write, close, fstat, ioctl, getdents64 等。
+ * 
+ * @param syscall_name 系统调用名称
+ * @param args 系统调用参数数组 (args[0] 通常是 fd，将被修改)
+ * 
+ * @note 对于 openat/newfstatat，args[0] 是 dirfd，也需要映射 (除非是 AT_FDCWD)
+ */
 static void apply_file_io_fd_mapping(const char *syscall_name, abi_long *args) {
     if (strcmp(syscall_name, "read") == 0 || 
         strcmp(syscall_name, "write") == 0 ||
@@ -54,6 +79,18 @@ static void apply_file_io_fd_mapping(const char *syscall_name, abi_long *args) {
     }
 }
 
+/**
+ * @brief 文件 I/O 类系统调用的 Post Hook
+ * 
+ * 在系统调用执行后调用，主要用于**建立和维护 FD 映射**。
+ * 
+ * - open/openat/dup: 成功后建立 recorded_fd -> actual_fd 的映射
+ * - close: 成功后移除映射
+ * 
+ * @param record Trace 记录 (包含 recorded_fd / ret_value)
+ * @param ret 实际返回值 (actual_fd)
+ * @param args 系统调用参数
+ */
 static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
     
@@ -86,7 +123,18 @@ static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
     }
 }
 
-/* 内存管理类系统调用处理 */
+/**
+ * @brief 内存管理类系统调用的参数应用
+ * 
+ * 处理 mmap, munmap, mprotect, brk 等。
+ * 关键功能是**应用地址映射**: 将 trace 中的 recorded_addr 转换为 actual_addr。
+ * 
+ * @param record Trace 记录
+ * @param args 系统调用参数数组 (地址参数 args[0] 将被修改)
+ * 
+ * @note mmap 的 args[0] 是建议地址，通常被视为 hint
+ * @note munmap/mprotect 的 args[0] 是必须精确匹配的地址
+ */
 static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
@@ -133,6 +181,15 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
     }
 }
 
+/**
+ * @brief 内存管理类系统调用的 FD 映射应用
+ * 
+ * 专门处理 mmap 的 fd 参数 (args[4])。
+ * 如果不是匿名映射 (fd != -1)，需要应用 FD 映射。
+ * 
+ * @param syscall_name 系统调用名称
+ * @param args 系统调用参数数组
+ */
 static void apply_memory_fd_mapping(const char *syscall_name, abi_long *args) {
     if (strcmp(syscall_name, "mmap") == 0) {
         // mmap的参数4是FD (-1表示匿名映射)
@@ -155,6 +212,19 @@ static void apply_memory_fd_mapping(const char *syscall_name, abi_long *args) {
     }
 }
 
+/**
+ * @brief 内存管理类系统调用的 Post Hook
+ * 
+ * 核心功能：**维护地址映射表 (Address Mapping)**。
+ * 由于 ASLR，Replay 时的 mmap 地址通常与 Record 时不同。
+ * 
+ * - mmap 成功后: 建立 recorded_addr -> actual_addr 的映射
+ * - munmap 成功后: 移除映射
+ * 
+ * @param record Trace 记录 (包含 recorded_addr)
+ * @param ret 实际返回值 (actual_addr)
+ * @param args 参数
+ */
 static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
     
@@ -185,6 +255,18 @@ static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long 
 }
 
 /* 网络类系统调用处理 */
+
+/**
+ * @brief 网络类系统调用的参数应用
+ * 
+ * 处理 socket, connect, bind 等。
+ * 网络相关的参数结构通常比较复杂，目前主要处理：
+ * - socket: 保持协议族/类型/协议参数一致
+ * - bind/connect: 传递 addrlen
+ * 
+ * @param record Trace 记录
+ * @param args 系统调用参数
+ */
 static void apply_network_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
@@ -199,6 +281,16 @@ static void apply_network_args(rr_strace_record_t *record, abi_long *args) {
     }
 }
 
+/**
+ * @brief 网络类系统调用的 Post Hook
+ * 
+ * 主要功能：**维护 Socket FD 映射**。
+ * 当 socket/accept 创建新的 Socket FD 时，记录 recorded_fd -> actual_fd 的映射。
+ * 
+ * @param record Trace 记录
+ * @param ret 实际返回值 (Socket FD)
+ * @param args 参数
+ */
 static void network_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
     
@@ -370,6 +462,16 @@ static bool dispatch_initialized = false;
 
 /* ==================== 公共接口实现 ==================== */
 
+/* ==================== 公共接口实现 ==================== */
+
+/**
+ * @brief 初始化系统调用分发系统
+ * 
+ * 构建系统调用快速查找表 (Lookup Table)，将线性扫描转换为 O(1) 的数组索引查找。
+ * 这是一个关键的性能优化。
+ * 
+ * @return int 0 成功
+ */
 int rr_syscall_dispatch_init(void) {
     if (dispatch_initialized) {
         return 0;
@@ -395,6 +497,14 @@ void rr_syscall_dispatch_cleanup(void) {
     memset(syscall_lookup_table, 0, sizeof(syscall_lookup_table));
 }
 
+/**
+ * @brief 获取系统调用处理程序 (O(1) 查找)
+ * 
+ * 根据 syscall_nr 快速获取对应的处理函数集 (handler)。
+ * 
+ * @param syscall_nr 系统调用编号
+ * @return rr_syscall_handler_t* 处理程序结构体指针，如果未注册则返回 NULL
+ */
 rr_syscall_handler_t* rr_get_syscall_handler(int syscall_nr) {
     if (!dispatch_initialized) {
         rr_syscall_dispatch_init();
@@ -436,6 +546,17 @@ syscall_importance_t rr_get_syscall_importance(int syscall_nr) {
 
 /* ==================== 优化的处理函数 ==================== */
 
+/* ==================== 优化的处理函数 ==================== */
+
+/**
+ * @brief 优化的参数应用入口
+ * 
+ * 替代原始的 switch-case 结构，使用 handler 表进行分发。
+ * 如果找到 handler，调用其 apply_args 函数；否则回退到 apply_generic_args。
+ * 
+ * @param record Trace 记录
+ * @param args 参数数组
+ */
 void rr_apply_syscall_args_optimized(rr_strace_record_t *record, abi_long *args) {
     if (!record || !args) return;
     
@@ -457,6 +578,17 @@ void rr_apply_fd_mapping_optimized(int syscall_nr, abi_long *args) {
     }
 }
 
+/**
+ * @brief 优化的 Post Hook 入口
+ * 
+ * 根据 syscall_nr 分发到具体的 post_hook (如 memory_post_hook 维护地址映射)。
+ * 这种设计解耦了 rr_main.c 中的逻辑。
+ * 
+ * @param syscall_nr 系统调用编号
+ * @param record Trace 记录
+ * @param ret 返回值
+ * @param args 参数
+ */
 void rr_syscall_post_hook_optimized(int syscall_nr, rr_strace_record_t *record, 
                                   abi_long ret, abi_long *args) {
     /* 🔥 修复：删除了所有冗余的 stderr 输出 */

@@ -30,7 +30,38 @@ __thread bool g_syscall_already_consumed = false;
 __thread syscall_record_t *g_pending_post_record = NULL;
 
 /**
- * 开始重放
+ * @brief 初始化 Replay 模式并打开 trace 文件用于重放
+ * 
+ * 该函数是 RR-Fuzz Replay/Fuzzing 模式的入口点，负责：
+ * 1. 打开二进制 trace 文件（.dat 格式）进行读取
+ * 2. 读取并验证 trace 文件头（magic, version）
+ * 3. 读取 trace 中的系统调用记录数量
+ * 4. 支持文件已打开时的重置（rewind）机制
+ * 
+ * **文件头验证**:
+ * - Magic: 0x52525254 ("RRTR")
+ * - Version: 1
+ * - Record Count: 实际记录数量
+ * 
+ * @param trace_file Trace 文件路径。如果为 NULL，使用默认文件名 "rr_trace.dat"
+ * 
+ * @return int
+ *         - 0: 初始化成功，trace 文件已打开并验证
+ *         - -1: 初始化失败（文件无法打开或格式无效）
+ * 
+ * @note 该函数在 replay 和 fuzzing 模式下都会被调用
+ * @note 如果 trace 文件已打开（g_trace_file != NULL），会执行 rewind() 而不是重新打开
+ *       这支持 fork-server 中子进程复用父进程打开的文件句柄
+ * @note 会保存 trace 文件路径到 g_rr_trace_path，供子进程重新打开使用
+ * 
+ * @warning Magic 不匹配或文件头读取失败会导致初始化失败
+ * @warning 该函数不会预加载所有 trace 记录，而是在 replay 过程中按需读取
+ * 
+ * @see rr_stop_replay() 对应的停止函数，会关闭文件
+ * @see rr_replay_syscall() replay 时读取记录的核心函数
+ * @see rr_reset_trace_position() fork-server 使用的重置函数
+ * @see g_trace_file 全局 trace 文件句柄
+ * @see g_rr_trace_path 保存的 trace 路径
  */
 int rr_start_replay(const char *trace_file)
 {
@@ -126,7 +157,31 @@ void rr_stop_replay(void)
 }
 
 /**
- * 读取下一条记录
+ * @brief 从 trace 文件读取并解析下一条系统调用记录
+ * 
+ * 该函数负责反序列化二进制 trace 格式，重构 syscall_record_t 结构体。
+ * 它是 Replay 过程中的数据源。
+ * 
+ * **反序列化流程**:
+ * 1. **Header**: 读取 index (4B) 和 syscall_nr (4B)，手动解包以处理大端/小端问题
+ * 2. **Fields**: 读取 args, retval, arg_sizes, fd_flags 等固定长度字段
+ * 3. **Arg Data**: 读取变长参数数据 (arg_index, size, data)
+ * 4. **Aux Data**: 检查 AUXD magic (0x41555844)，如果存在则读取辅助数据链表
+ * 
+ * **文件格式细节**:
+ * - index/syscall_nr 使用手动打包 (buffer[0-7])，确保跨平台一致性
+ * - 变长数据以 -1 作为结束标记 (end_marker)
+ * - Aux Data 是可选的尾部数据，仅当 record->has_aux_data 为 true 时存在
+ * 
+ * @return syscall_record_t* 
+ *         - 指向新分配并填充的记录结构体的指针
+ *         - NULL: 如果到达文件末尾 (EOF) 或发生读取错误
+ * 
+ * @note 调用者负责释放返回的结构体 (通常由 replay 循环管理)
+ * @note 能够自动处理带有或不带有 aux_data 的记录格式
+ * 
+ * @warning 函数内部使用 g_malloc 分配内存，必须确保释放以避免泄漏
+ * @warning 文件读取错误会打印 ERROR 日志但返回 NULL，调用者需区分 EOF 和错误
  */
 static syscall_record_t *read_next_record(void)
 {
@@ -313,13 +368,49 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
  */
 
 /**
- * 重放系统调用
+ * @brief 重放单个系统调用 - Hybrid/Pure 自动分发
  * 
- * 自动智能模式：
- * 1. 如果 trace 中有 aux_data → Pure Replay（完全独立路径）
- * 2. 否则 → Hybrid Replay（传统路径）
+ * 这是 Replay/Fuzzing 模式下的核心函数，根据 trace 中的数据自动选择重放策略：
+ * - **Pure Replay**: 如果 record 有 aux_data 且不是 brk/mmap，完全在用户态恢复，不执行真实 syscall
+ * - **Hybrid Replay**: 如果没有 aux_data 或是特殊 syscall，应用 FD 映射后执行真实 syscall
  * 
- * Pure 和 Hybrid 完全分离，互不影响
+ * **工作流程**:
+ * 1. 从 trace 文件读取下一条记录并同步 (syscall_nr 匹配)
+ * 2. 检测并退出 silent replay mode（如果到达 fork point）
+ * 3. 判断是否可以 Pure Replay
+ *    - Yes: 调用 rr_replay_syscall_pure()，直接从 aux_data 恢复，返回记录的 retval
+ *    - No: Hybrid 路径，应用 FD/地址映射，返回 -1 让 QEMU 执行真实 syscall
+ * 4. Fuzzing 模式：应用 mutation（fuzz_mutate_syscall）
+ * 
+ * **Trace 同步机制**:
+ * - 如果当前 syscall 与 trace 不匹配，会自动跳过 trace 中的记录直到找到匹配的
+ * - 这提供了一定的容错能力，允许 record 和 replay 之间有小的差异
+ * 
+ * **Special Cases**:
+ * - Output syscalls (write/writev): 强制使用 Hybrid，保持 I/O 状态同步
+ * - mmap/brk: 强制使用 Hybrid，因为需要 QEMU 管理内存映射
+ * 
+ * @param env CPU 架构状态指针（用于读/写 guest 内存）
+ * @param num 当前系统调用编号
+ * @param args 系统调用参数数组（8个参数），Pure Replay 中会修改这些值
+ * 
+ * @return abi_long
+ *         - 非 -1: Pure Replay 成功，直接返回记录的 retval 给 QEMU
+ *         - -1: Hybrid Replay，让 QEMU 执行真实 syscall（参数可能已被修改）
+ * 
+ * @note 会自动递增 g_rr_framework->replay_index
+ * @note 支持动态跟踪（RR_ENABLE_DYNAMIC_TRACE）用于可视化
+ * @note 维护全局状态：g_current_record, g_pending_post_record
+ * 
+ * @warning ⚠️ 复杂的状态管理: g_syscall_already_consumed, g_pending_mmap_recorded_addr 等
+ *          需要仔细维护以避免重复消费或遗漏 record
+ * @warning Fuzzing mutation 会修改 args 数组，影响后续执行
+ * 
+ * @see rr_start_replay() 必须先调用该函数打开 trace 文件
+ * @see rr_replay_syscall_pure() Pure Replay 的实现
+ * @see read_next_record() 从 trace 文件读取记录
+ * @see apply_fd_mapping() 应用 FD 映射的核心逻辑
+ * @see rr_fuzz_mutate_syscall() Fuzzing 模式下的 mutation 应用
  */
 abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 {

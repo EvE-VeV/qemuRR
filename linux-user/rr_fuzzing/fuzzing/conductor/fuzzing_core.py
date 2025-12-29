@@ -49,18 +49,8 @@ try:
     _HAS_PATH_FINDER = True
     print("[FuzzingCore] ✅ 加载DualLevelPathFinder (双层CFG)")
 except ImportError:
-    # 如果双层CFG不可用，回退到原版PathFinder
-    try:
-        from multiprocess import path_finder as _pf_module
-        PathFinder = _pf_module.PathFinder
-        PathFinderConfig = _pf_module.PathFinderConfig
-        _HAS_PATH_FINDER = True
-        print("[FuzzingCore] ⚠️ 回退到单层PathFinder")
-    except Exception as e:
-        # Debug: 显示导入失败原因
-        import traceback
-        print(f"[DEBUG] PathFinder import failed: {e}")
-        traceback.print_exc()
+    print("[FuzzingCore] ⚠️ DualLevelPathFinder import failed. PathFinder unavailable.")
+    _HAS_PATH_FINDER = False
 
 # 尝试导入RecipePool
 _HAS_RECIPE_POOL = False
@@ -169,11 +159,27 @@ class CrashDetector:
         
         # 保存crash元数据
         crash_meta = crash_dir / f"{crash_id}.meta"
+        
+        # 获取系统调用名称映射（使用TraceAnalyzer加载trace）
+        from .constants import get_mutation_type_name
+        from ..trace_analyzer import TraceAnalyzer
+        
+        syscall_names = {}
+        try:
+            # 使用TraceAnalyzer加载trace文件以获取系统调用信息
+            analyzer = TraceAnalyzer(trace.file_path)
+            if analyzer.syscalls:
+                for sc in analyzer.syscalls:
+                    syscall_names[sc.index] = sc.name
+        except Exception as e:
+            print(f"[CrashDetector] ⚠️  无法从trace提取系统调用名称: {e}")
+        
         with open(crash_meta, 'w') as f:
             json.dump({
                 'crash_id': crash_id,
                 'crash_hash': crash_hash,
                 'trace_id': trace.id,
+                'trace_file': trace.file_path,
                 'status': result.status,
                 'status_name': result.status_name,
                 'exit_code': result.qemu_exit_code,
@@ -182,12 +188,13 @@ class CrashDetector:
                 'mutations': [
                     {
                         'syscall_index': m.syscall_index,
+                        'syscall_name': syscall_names.get(m.syscall_index, 'unknown'),  # ✅ 从TraceAnalyzer获取
                         'cmd': m.cmd,
+                        'mutation_type': get_mutation_type_name(m.cmd),  # ✅ 使用映射
                         'arg_index': m.arg_index,
-                        'data': m.data.hex() if isinstance(m.data, bytes) else m.data,
+                        'data': m.data.hex() if isinstance(m.data, bytes) else str(m.data),
                         'offset': m.offset,
                         'size': m.size,
-                        'mutation_type': getattr(m, 'mutation_type', 'unknown')
                     }
                     for m in mutations
                 ]
@@ -268,11 +275,15 @@ class FuzzingCore:
         else:
             self.trace_manager = TraceManager(initial_trace=initial_trace)
             print("[FuzzingCore] 📝 使用传统TraceManager")
+        print("[DEBUG] TraceManager initialized")
+
         
         # 第2层: 核心组件
         self.mutator = mutator if mutator else BaseMutator()
         # ✅ 多进程：传递shared_coverage给CoverageTracker
         self.coverage_tracker = CoverageTracker(pid=0, shared_coverage=shared_coverage)
+        print("[DEBUG] CoverageTracker initialized")
+
 
         # ✅ 选择执行器：持久化 vs 传统
         self.enable_persistent = enable_persistent
@@ -287,8 +298,12 @@ class FuzzingCore:
             target_args=target_args,
             persistent_mode=enable_persistent
         )
+        print("[DEBUG] QEMUExecutor initialized")
+
 
         self.crash_detector = CrashDetector(output_dir)
+        print("[DEBUG] CrashDetector initialized")
+
 
         # 统计信息
         self.stats = FuzzingStatistics()
@@ -313,12 +328,20 @@ class FuzzingCore:
             try:
                 print(f"[FuzzingCore] 🧭 初始化PathFinder...")
                 # DualLevelPathFinder不需要PathFinderConfig
-                if PathFinderConfig is not None:
+                if isinstance(self.mutator, SmartMutator) and getattr(self.mutator, 'path_finder', None):
+                     print(f"[FuzzingCore] ♻️ Reusing PathFinder from Mutator")
+                     self.path_finder = self.mutator.path_finder
+                elif PathFinderConfig is not None:
                     cfg_config = PathFinderConfig(verbose=False)
                     self.path_finder = PathFinder(target_binary, config=cfg_config)
                 else:
                     # DualLevelPathFinder使用简化的初始化
                     self.path_finder = PathFinder(target_binary, config=None)
+                
+                # 如果mutator是SmartMutator但还没有PathFinder（例如BaseMutator升级来的），注入它
+                if isinstance(self.mutator, SmartMutator) and not getattr(self.mutator, 'path_finder', None):
+                     print(f"[FuzzingCore] 💉 Injecting PathFinder into Mutator")
+                     self.mutator.path_finder = self.path_finder
 
                 # 创建RecipePool（使用模块级变量，避免shadowing）
                 if _HAS_RECIPE_POOL and RecipePool is not None:
@@ -491,11 +514,11 @@ class FuzzingCore:
 
                 # 从trace中找到接近这些分支的syscall
                 for branch in top_branches:
-                    # 简化：使用分支地址的低位作为大致的syscall index
-                    # 实际应该通过CFG分析找到最近的syscall
-                    if 'to' in branch:
-                        estimated_index = (branch['to'] % 50) + 10  # 粗略估计
-                        fork_points.append(estimated_index)
+                    # ✅ 使用PathFinder提供的精确syscall index
+                    if 'target_syscall_idx' in branch:
+                       fork_points.append(branch['target_syscall_idx'])
+                    elif 'from_syscall_idx' in branch:
+                       fork_points.append(branch['from_syscall_idx'])
 
                     if len(fork_points) >= count:
                         break
@@ -504,22 +527,21 @@ class FuzzingCore:
                     print(f"[FuzzingCore] 🎯 Using PathFinder-guided fork points: {fork_points[:count]}")
                     return fork_points[:count]
 
-        # 策略2: Fallback to IO syscall rotation
+        # 策略2: Fallback - 如果PathFinder没有建议 (如已全覆盖或分析失败)
+        # 使用随机Syscall Index作为Fork点，以探索可能的隐藏状态
+        print(f"[FuzzingCore] ⚠️ PathFinder无建议，启用随机探索 (Random Exploration)")
+        
+        # 假设trace有syscall_count属性，或者是通过trace.metadata获取
+        # 简单起见，从 0 到 30 (假设) 随机选
         import random
-        io_syscalls = [10, 15, 20, 25, 30]  # 简化：使用固定的IO syscall候选点
-
-        # 轮换 + 随机扰动
-        base_index = self.stats.total_execs % len(io_syscalls)
-        selected = []
-        for i in range(count):
-            idx = (base_index + i) % len(io_syscalls)
-            selected.append(io_syscalls[idx])
-
-        # 20%概率随机选择
-        if random.random() < 0.2:
-            selected[-1] = random.choice(io_syscalls)
-
-        return selected
+        # 尝试获取真实的syscall count
+        limit = 20
+        if hasattr(trace, 'metadata') and hasattr(trace.metadata, 'syscall_count'):
+             limit = trace.metadata.syscall_count
+        
+        # 随机选择 count 个点
+        random_points = sorted(random.sample(range(max(1, limit)), min(count, limit)))
+        return random_points
 
     def _display_progress(self, force: bool = False):
         """显示fuzzing进度 (每100次执行或强制显示)"""
@@ -604,6 +626,7 @@ class FuzzingCore:
         has_new_coverage = False  # ✅ 修复: 初始化变量避免UnboundLocalError
         new_paths_found = 0
         crashes_found_count = 0
+        result = None  # ✅ Fix: Initialize result for subsequent usage
 
         for i, fork_point in enumerate(fork_points):
             mutations = self.mutator.mutate(trace)
@@ -703,6 +726,9 @@ class FuzzingCore:
                     timed_out=getattr(result, 'timed_out', False),
                     exec_time=getattr(result, 'exec_time', 0.0)
                 )
+                
+                # ❌ REMOVED: Duplicate crash detection (already handled in step 6 around line 917)
+                # Original code was redundant and caused double-counting
         
         # ═════════════════════════════════════════════════════════════════
         # CFG引导的Fuzzing (关键修复!)
@@ -861,7 +887,7 @@ class FuzzingCore:
         if self.recipe_pool and hasattr(self.mutator, 'last_recipe_used'):
             recipe_used = getattr(self.mutator, 'last_recipe_used', None)
             
-            if recipe_used:
+            if recipe_used and result:
                 # 检查recipe是否成功
                 if has_new_coverage:
                     # TODO: 检查目标分支是否真的被覆盖
@@ -892,6 +918,7 @@ class FuzzingCore:
                 if result.crashed:
                     self.stats.crashes_found += 1
                     crashes_found_count += 1
+                    print(f"[FuzzingCore] 💥 CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
                     self.crash_detector.save_crash(result, trace, mutations)
 
                 # 处理超时
@@ -951,113 +978,17 @@ class FuzzingCore:
         
         参考fuzz_conductor.py的进程管理模式
         """
-        if not _HAS_REALTIME_VIZ:
-            return None
-        # ✅ Tree visualizer不依赖于monitoring
-        
-        # 创建pipe路径（unique per session）
-        self.realtime_viz_pipe = f"/tmp/rr_dynamic_trace_{os.getpid()}"
-        output_html = Path(self.output_dir) / "realtime_tree.html"
-        
-        # 确保输出目录存在
-        output_html.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 清理旧pipe
-        if os.path.exists(self.realtime_viz_pipe):
-            os.remove(self.realtime_viz_pipe)
-        
-        # 启动visualizer进程
-        visualizer_script = Path(__file__).parent.parent / "realtime_tree_visualizer.py"
-        # visualizer_script = Path(__file__).parent.parent / "simple_tree_visualizer.py"
-        
-        cmd = [
-            sys.executable,
-            str(visualizer_script),
-            "--pipe", self.realtime_viz_pipe,
-            "--output", str(output_html),
-            "--update-interval", "3.0"  # 每3秒更新一次
-        ]
-        
-        print(f"\n[FuzzingCore] 📡 正在启动Realtime Tree Visualizer...")
-        print(f"  Pipe: {self.realtime_viz_pipe}")
-        print(f"  输出: {output_html}")
-        
-        try:
-            self.realtime_viz_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # 合并stderr到stdout
-                bufsize=1,  # Line buffered
-                universal_newlines=True,  # Text mode for readline()
-                encoding='utf-8'
-            )
-            
-            # 启动线程读取visualizer输出（参考conductor模式）
-            self.realtime_viz_thread = threading.Thread(
-                target=self._read_visualizer_output,
-                daemon=True
-            )
-            self.realtime_viz_thread.start()
-            
-            # 等待pipe创建（最多10秒）
-            print(f"[FuzzingCore] ⏳ 等待visualizer创建pipe...")
-            for i in range(20):
-                if os.path.exists(self.realtime_viz_pipe):
-                    print(f"[FuzzingCore] ✅ Visualizer pipe已创建")
-                    break
-                time.sleep(0.5)
-            else:
-                print(f"[FuzzingCore] ⚠️  Pipe创建超时，但继续运行")
-            
-            # 设置环境变量，让QEMU连接到pipe
-            os.environ['RR_TRACE_PIPE'] = self.realtime_viz_pipe
-            print(f"[FuzzingCore] ✅ Realtime Visualizer已启动")
-            print(f"  - PID: {self.realtime_viz_process.pid}")
-            print(f"  - Pipe: {self.realtime_viz_pipe}")
-            print(f"  - RR_TRACE_PIPE环境变量: {os.environ.get('RR_TRACE_PIPE')}")
-            
-            # ✅ 验证pipe文件存在
-            if os.path.exists(self.realtime_viz_pipe):
-                print(f"  - Pipe文件: ✅ 存在")
-            else:
-                print(f"  - Pipe文件: ❌ 不存在!")
-            
-            return self.realtime_viz_pipe
-            
-        except Exception as e:
-            print(f"[FuzzingCore] ❌ 启动Realtime Visualizer失败: {e}")
-            return None
+        # Requested to remove Realtime Visualizer functionality
+        # visualizer_script = Path(__file__).parent.parent / "realtime_tree_visualizer.py"
+        # Since file is deleted, this function should do nothing
+        print(f"[FuzzingCore] 📡 Realtime Tree Visualizer removed by user request.")
+        return None
+
     
     def _stop_realtime_visualizer(self):
-        """停止Realtime Visualizer进程（参考fuzz_conductor.py的清理模式）"""
-        if not self.realtime_viz_process:
-            return
-        
-        print(f"\n[FuzzingCore] 🛑 正在停止Realtime Visualizer...")
-        
-        try:
-            # 尝试优雅终止
-            self.realtime_viz_process.terminate()
-            try:
-                self.realtime_viz_process.wait(timeout=5)
-                print(f"[FuzzingCore] ✅ Visualizer已优雅退出")
-            except subprocess.TimeoutExpired:
-                # 强制终止
-                print(f"[FuzzingCore] ⚠️  Visualizer未响应，强制终止...")
-                self.realtime_viz_process.kill()
-                self.realtime_viz_process.wait(timeout=2)
-        except Exception as e:
-            print(f"[FuzzingCore] ⚠️  停止Visualizer时出错: {e}")
-        
-        # 清理pipe
-        if self.realtime_viz_pipe and os.path.exists(self.realtime_viz_pipe):
-            try:
-                os.remove(self.realtime_viz_pipe)
-            except:
-                pass
+        """Stub for removed Realtime Visualizer"""
+        pass
 
-        self.realtime_viz_process = None
-        self.realtime_viz_pipe = None
 
     def _get_coverage_percentage(self):
         """获取当前覆盖率百分比"""
@@ -1190,6 +1121,7 @@ class FuzzingCore:
                 use_dynamic_fork = (self.dynamic_fork_controller and 
                                   self.dynamic_fork_controller.should_trigger_multi_fork(iteration))
                 
+                result = None  # ✅ Fix: Initialize result to avoid UnboundLocalError
                 if use_dynamic_fork:
                     # 动态fork模式：在trace中间点fork多个variants
                     print(f"\n{'='*60}")
@@ -1218,7 +1150,7 @@ class FuzzingCore:
                     result = self.run_single_iteration(iteration_id=iteration)
                     # ✅ Task #8: 使用IterationResult
                     # 打印详细结果（可选）
-                    if result.is_failure():
+                    if result and result.is_failure():
                         print(f"[FuzzingCore] ⚠️  {result}")
                 
                 iteration += 1

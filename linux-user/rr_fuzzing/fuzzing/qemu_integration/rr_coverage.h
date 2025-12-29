@@ -131,4 +131,14 @@ bool rr_coverage_has_new_edges(const uint8_t *baseline_map);
  */
 void rr_coverage_copy_map(uint8_t *dest);
 
+/**
+ * 设置目标代码范围（用于自动过滤非目标代码，如libc）
+ */
+void rr_set_target_range(uint64_t start, uint64_t end);
+
+/**
+ * 检查PC是否在目标范围内
+ */
+bool rr_in_target_range(uint64_t pc);
+
 #endif /* RR_COVERAGE_H */

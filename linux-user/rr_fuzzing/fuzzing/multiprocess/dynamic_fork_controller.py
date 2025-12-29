@@ -33,7 +33,7 @@ else:
 from conductor.mutator import SmartMutator
 from conductor.coverage import CoverageTracker
 from conductor.trace_manager import TraceManager, Trace
-from .path_finder import PathFinder
+from .dual_level_path_finder import DualLevelPathFinder as PathFinder
 from .recipe_pool import RecipePool
 
 

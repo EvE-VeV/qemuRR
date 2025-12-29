@@ -45,6 +45,29 @@ static void free_fd_mapping(rr_fd_mapping_t *mapping) {
     }
 }
 
+/**
+ * @brief 添加一个新的 FD 映射记录
+ * 
+ * 在 Replay/Fuzzing 模式下，当 guest 程序执行 open/dup/socket 等创建 FD 的系统调用后，
+ * 实际获得的 FD (actual_fd) 可能与 trace 中记录的 FD (recorded_fd) 不同。
+ * 该函数负责记录这种对应关系，供后续系统调用使用。
+ * 
+ * **使用场景**:
+ * - open/openat: 记录 open 返回的新 FD
+ * - dup/dup2/dup3: 记录复制后的 FD
+ * - socket/accept: 记录网络 socket FD
+ * 
+ * @param recorded_fd Trace 中记录的 FD (record 阶段的值)
+ * @param actual_fd Replay 阶段实际获得的 FD
+ * 
+ * @return int 
+ *         - 0: 添加成功 (新建或更新)
+ *         - -1: 添加失败 (内存分配错误或未初始化)
+ * 
+ * @note 如果映射已存在，会更新 actual_fd 和访问时间戳
+ * @note 使用哈希表存储，查找复杂度为 O(1)
+ * @note 这是一个高频调用函数，性能至关重要
+ */
 int rr_fd_mapping_add(int recorded_fd, int actual_fd) {
     if (!g_initialized || !g_fd_table) return -1;
     
@@ -74,6 +97,23 @@ int rr_fd_mapping_add(int recorded_fd, int actual_fd) {
     return 0;
 }
 
+/**
+ * @brief 查找 FD 映射 - 获取当前实际的 FD
+ * 
+ * 当 guest 程序尝试使用一个 FD (如 read/write/close) 时，需要将 trace 中的
+ * recorded_fd 转换为当前有效的 actual_fd。
+ * 
+ * @param recorded_fd Trace 中记录的 FD
+ * 
+ * @return int
+ *         - 如果找到映射: 返回对应的 actual_fd
+ *         - 如果未找到: 返回原 recorded_fd (假设一致)
+ * 
+ * @note 会更新统计信息 (lookups, hits, misses) 和访问时间戳 (LRU)
+ * @note 如果未初始化，直接返回 recorded_fd
+ * 
+ * @warning 调用者应处理返回的 FD 可能无效的情况 (虽然在 replay 中通常是有效的)
+ */
 int rr_fd_mapping_get(int recorded_fd) {
     if (!g_initialized || !g_fd_table) return recorded_fd;
     
@@ -152,6 +192,23 @@ static void free_addr_mapping(rr_addr_mapping_t *mapping) {
     }
 }
 
+/**
+ * @brief 添加一个新的地址映射记录
+ * 
+ * 类似于 FD 映射，由于 ASLR (地址空间布局随机化)，mmap/brk 等返回的内存地址
+ * 在 Replay 阶段通常与 Record 阶段不同。该函数记录这种地址偏差。
+ * 
+ * @param recorded_addr Trace 中记录的内存地址
+ * @param actual_addr Replay 阶段实际获得的内存地址
+ * @param size 内存区域的大小 (字节)
+ * 
+ * @return int
+ *         - 0: 添加成功
+ *         - -1: 添加失败
+ * 
+ * @note 地址映射通常用于 mmap, mremap, shmat 等系统调用
+ * @note 需要记录 size 以便支持范围查询 (Range Query)
+ */
 int rr_addr_mapping_add(target_ulong recorded_addr, target_ulong actual_addr, size_t size) {
     if (!g_initialized || !g_addr_table) return -1;
     
@@ -182,6 +239,26 @@ int rr_addr_mapping_add(target_ulong recorded_addr, target_ulong actual_addr, si
     return 0;
 }
 
+/**
+ * @brief 查找地址映射 - 支持精确匹配和范围匹配
+ * 
+ * 将 trace 中的 recorded_addr 转换为 replay 阶段的 actual_addr。
+ * 
+ * **查询策略**:
+ * 1. **精确匹配** (Fast Path): 哈希查找 O(1)。适用于 munmap(base_addr) 等操作。
+ * 2. **范围匹配** (Slow Path): 遍历所有映射 O(N)。适用于 munmap(base + offset) 
+ *    或指针算术操作访问映射内存内部的情况。
+ * 
+ * @param recorded_addr Trace 中记录的地址
+ * 
+ * @return target_ulong
+ *         - 映射后的实际地址 (mapped_base + offset)
+ *         - 如果未找到，返回原 recorded_addr
+ * 
+ * @note 范围匹配用于处理 "指向映射区域内部的指针"
+ * @note 范围匹配有性能开销，应尽量优化或减少使用
+ * @warning 范围匹配目前使用简单的线性遍历，映射数量多时可能会慢
+ */
 target_ulong rr_addr_mapping_get(target_ulong recorded_addr) {
     if (!g_initialized || !g_addr_table) return recorded_addr;
     

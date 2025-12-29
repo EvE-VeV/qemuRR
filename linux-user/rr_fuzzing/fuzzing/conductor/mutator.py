@@ -366,7 +366,7 @@ class SmartMutator:
     # 类级别缓存，避免重复解析相同的trace
     _trace_cache = {}  # {trace_file: TraceAnalyzer}
     
-    def __init__(self, trace_file, recipe_file=None, target_binary=None):
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None):
         """
         初始化SmartMutator
 
@@ -374,6 +374,7 @@ class SmartMutator:
             trace_file: Trace文件路径
             recipe_file: Recipe文件路径 (可选, 第2阶段)
             target_binary: 目标二进制文件路径 (用于PathFinder CFG分析)
+            path_finder: 现有的PathFinder实例 (可选, 避免重复初始化)
         """
         # 如果可用则使用缓存的TraceAnalyzer
         if trace_file in SmartMutator._trace_cache:
@@ -395,28 +396,18 @@ class SmartMutator:
         # 获取所有纯重放syscall (带aux_data的syscall)
         pure_syscalls = self.analyzer.get_pure_syscalls()
         
-        # 定义Candidate类
-        class Candidate:
-            def __init__(self, index, name, nr):
-                self.index = index
-                self.name = name
-                self.syscall_nr = nr
+        # 保存所有syscall以备后用
+        self.syscalls = self.analyzer.syscalls
         
-        # 转换为Candidate对象
-        self.pure_candidates = [
-            Candidate(sc.index, sc.name, sc.syscall_nr)
-            for sc in pure_syscalls
-        ]
+        # 转换为Candidate对象 (带全量元数据)
+        self.pure_candidates = [sc for sc in pure_syscalls]
         
         # 获取混合重放syscall (不带aux_data的syscall)
         hybrid_syscalls = self.analyzer.get_hybrid_syscalls()
-        self.hybrid_candidates = [
-            Candidate(sc.index, sc.name, sc.syscall_nr)
-            for sc in hybrid_syscalls
-        ]
+        self.hybrid_candidates = [sc for sc in hybrid_syscalls]
         
-        # 保存所有syscall以备后用
-        self.syscalls = self.analyzer.syscalls
+        # ━━━━ 第0阶段: FD 追踪与环境过滤 ━━━━
+        self._perform_fd_tracking()
         
         # 这些其实也需要删除
         print(f"[Mutator] 发现 {len(self.pure_candidates)} 个纯重放syscall:")
@@ -425,8 +416,8 @@ class SmartMutator:
         if len(self.pure_candidates) > 10:
             print(f"[Mutator]   ... 以及 {len(self.pure_candidates) - 10} 个更多")
         
-        # 第1阶段: 过滤不可变异的syscall
-        self.mutable_candidates = self._filter_mutable_candidates()
+        # 第1阶段: 延迟过滤，等待 PathFinder 就绪
+        self.mutable_candidates = []
         
         # ━━━━ 第2阶段: PathFinder & Recipe驱动模式 ━━━━
         self.recipes = []
@@ -435,8 +426,13 @@ class SmartMutator:
         self.target_binary = target_binary
 
         # PathFinder集成（自动recipe生成）
-        if target_binary:
+        if path_finder:
+            self.path_finder = path_finder
+            print(f"[Mutator] ✅ 使用外部传入的PathFinder实例")
+        elif target_binary:
             self._init_pathfinder(trace_file, target_binary)
+        else:
+            self.path_finder = None
 
         # 手动recipe文件加载
         if recipe_file and os.path.exists(recipe_file):
@@ -456,6 +452,9 @@ class SmartMutator:
         else:
             print(f"[Mutator] 🎲 随机变异模式 (未提供recipe文件且自动生成失败)")
         
+        # 现在 PathFinder 已初始化，进行候选过滤
+        self.mutable_candidates = self._filter_mutable_candidates()
+        
         # P1修复: 停滞检测（Stagnation Detection）
         self.last_new_coverage_iter = 0  # 上次发现新coverage的迭代
         self.stagnation_threshold = 1000  # 🔥 提高阈值: 1000次迭代无新coverage = 停滞
@@ -464,6 +463,59 @@ class SmartMutator:
         # ✅ 2025-11-17: 初始化 mutation type 跟踪
         self.last_mutation_type = 'unknown'
         print(f"[Mutator] 🔍 停滞检测已启用 (阈值={self.stagnation_threshold} 次迭代)")
+    
+    def _perform_fd_tracking(self):
+        """
+        追踪追踪文件描述符 (FD) 的打开和关闭。
+        识别加载库文件等系统级 FD，并在对应的 syscall 索引处标记为禁用。
+        """
+        active_forbidden_fds = set()
+        self.syscall_forbidden_map = {} # index -> bool
+        
+        for sc in self.syscalls:
+            # 1. 检查当前 syscall 是否使用了已被标记为禁止的 FD
+            is_forbidden = False
+            if sc.uses_fd and sc.args:
+                fd = sc.args[0]
+                if fd in active_forbidden_fds:
+                    is_forbidden = True
+            
+            self.syscall_forbidden_map[sc.index] = is_forbidden
+            
+            # 2. 追踪 FD 打开并更新状态
+            if sc.creates_fd and sc.created_fd > 2:
+                filename = "unknown"
+                if sc.name in ['open', 'openat']:
+                    idx = 1 if sc.name == 'openat' else 0
+                    if idx in sc.arg_data:
+                        try:
+                            filename = sc.arg_data[idx].split(b'\x00')[0].decode('utf-8', errors='ignore')
+                        except:
+                            filename = str(sc.arg_data[idx])
+                
+                # 如果是系统库，或者在初始化阶段且文件名未知，加入禁止集合
+                is_library = "/lib/" in filename or "/usr/lib/" in filename or "ld.so.cache" in filename
+                is_early_unknown = (sc.index < 30 and filename == "unknown")
+                
+                if is_library or is_early_unknown:
+                    active_forbidden_fds.add(sc.created_fd)
+                    reason = "library" if is_library else "early_init"
+                    alog(f"FD {sc.created_fd} (index={sc.index}) marked FORBIDDEN ({reason}): {filename}", "MUTATOR")
+                else:
+                    # 如果 FD 被复用于普通文件，从禁止集合移除
+                    if sc.created_fd in active_forbidden_fds:
+                        active_forbidden_fds.discard(sc.created_fd)
+                        alog(f"FD {sc.created_fd} (index={sc.index}) UNMARKED (reused): {filename}", "MUTATOR")
+            
+            # 3. 追踪 FD 关闭
+            if sc.name == 'close' and sc.args:
+                fd = sc.args[0]
+                if fd in active_forbidden_fds:
+                    active_forbidden_fds.discard(fd)
+        
+        forbidden_count = sum(1 for v in self.syscall_forbidden_map.values() if v)
+        if forbidden_count > 0:
+            print(f"[Mutator] 🛡️  环境过滤: 识别到 {forbidden_count} 个涉及系统库的 IO 调用已受保护")
     
     def _should_skip_mutation(self, syscall_info, index):
         """
@@ -476,11 +528,23 @@ class SmartMutator:
         返回:
             bool: True表示跳过, False表示可以变异
         """
+        # ━━━━ 核心保护 ━━━━
+        # 1. 通用启动阶段保护: 前 40 个 syscall 通常属于 ld.so 和 libc 初始化
+        # 1. 通用启动阶段保护: 前 40 个 syscall 通常属于 ld.so 和 libc 初始化
+        # 🔥 FIX: 移除硬编码的 index < 40 检查，改用 PathFinder 的智能过滤
+        # if index < 40:
+        #    alog(f"[Mutator] 🛡️  启动阶段保护: 跳过早期启动 syscall (index={index})", "MUTATOR")
+        #    return True
+            
         syscall_name = getattr(syscall_info, 'name', '').lower()
         
-        # 重要的IO syscall永不跳过
+        # 2. 已识别的 Forbidden FD 保护
+        if self.syscall_forbidden_map.get(index, False):
+            alog(f"[Mutator] ⏭️  跳过Forbidden IO: {syscall_name} (index={index})", "MUTATOR")
+            return True
+        
+        # 重要的IO syscall永不跳过 (已经经过了 FD 和 启动阶段过滤)
         if syscall_name in IMPORTANT_SYSCALLS:
-            print(f"[Mutator] 保留重要的IO syscall: {syscall_name} (index={index})")
             return False  # 永不跳过
         
         # 在初始化阶段跳过关键syscall (使用动态阈值)
@@ -491,8 +555,21 @@ class SmartMutator:
                 print(f"[Mutator] ⏭️  跳过初始化syscall: {syscall_name} (index={index}, threshold={threshold})")
                 return True
         
-        # 2. 跳过没有可变异数据的syscall (以后可以扩展)
-        # 当前TraceAnalyzer已经过滤出了pure/hybrid候选
+        # 1. PathFinder 增强过滤:
+        # 如果有 PathFinder，检查该 syscall 是否能被目标代码段到达
+        if self.path_finder and hasattr(self.path_finder, 'bb_to_syscall'):
+            # 查找是否有任何目标 BB 映射到这个 syscall
+            is_target_reachable = False
+            for bb_addr, sc_idx in self.path_finder.bb_to_syscall.items():
+                if sc_idx == index:
+                    is_target_reachable = True
+                    break
+            
+            if not is_target_reachable:
+                # 如果这个 syscall 在 trace 中，但从未被目标范围内的 BB 调用/覆盖，
+                # 说明它极可能是 early loader 或 libc 初始化代码调用的。
+                alog(f"[Mutator] 🛡️  PathFinder 过滤: 跳过非目标代码调用的 syscall (index={index}, {syscall_name})", "MUTATOR")
+                return True
         
         return False
     
@@ -579,16 +656,24 @@ class SmartMutator:
             if str(multiprocess_dir) not in sys.path:
                 sys.path.insert(0, str(multiprocess_dir))
 
-            from path_finder import PathFinder, PathFinderConfig
+            # 尝试导入PathFinder (DualLevel)
+            from multiprocess.dual_level_path_finder import DualLevelPathFinder as PathFinder
+            # Config is part of DB or params, maybe unnecessary or can use dummy
+            # DualLevel uses different config, let's omit Config class import as it's not strictly needed if we pass dict or it handles it.
+            # actually DualLevelPathFinder constructor signature might be different. 
+            # Original: PathFinder(binary, config)
+            # DualLevel: DualLevelPathFinder(binary, config_dict/obj)
+
 
             # 创建配置（保守设置）
-            config = PathFinderConfig(
-                verbose=False,
-                timeout=30,  # 30秒超时
-                max_cfg_nodes=5000,  # 限制节点数
-                graceful_disable=True,  # 出错时禁用而不是抛异常
-                enable_auto_fast_mode=True  # 自动简化模式
-            )
+            # 创建配置（保守设置）
+            config = {
+                "verbose": False,
+                "timeout": 30,  # 30秒超时
+                "max_cfg_nodes": 5000,  # 限制节点数
+                "graceful_disable": True,  # 出错时禁用而不是抛异常
+                "enable_auto_fast_mode": True  # 自动简化模式
+            }
 
             # 初始化PathFinder
             self.path_finder = PathFinder(target_binary, config)
@@ -649,7 +734,8 @@ class SmartMutator:
         """
         基于动态CFG找到未覆盖的分支（简化实现）
         """
-        if not self.path_finder:
+        if not self.path_finder or not hasattr(self.path_finder, 'dynamic_edges'):
+            # 对于 DualLevelPathFinder, 我们在运行期根据覆盖率生成分支
             return []
 
         uncovered = []

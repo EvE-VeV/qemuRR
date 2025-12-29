@@ -333,6 +333,7 @@ void rr_clear_checkpoint(void);
 int rr_ipc_init(void);
 void rr_ipc_cleanup(void);
 int rr_ipc_send_status(int status);
+int rr_ipc_send_crash_status(int status, int exit_code, int signal_number);  /* ✅ Send crash with details */
 int rr_ipc_receive_command(void);
 
 /* Fuzz Engine模块 */

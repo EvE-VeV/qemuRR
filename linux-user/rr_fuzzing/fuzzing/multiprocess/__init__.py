@@ -17,14 +17,12 @@ RR-Fuzz 多进程模糊测试模块
 # from .shared_resources import SharedCoverage, WorkerSeedQueue
 # from .recipe_pool import RecipePool, RecipeStats
 
-# PathFinder 是可选的（需要 angr）
+# DualLevelPathFinder 是可选的（需要 angr）
 try:
-    from .path_finder import PathFinder, MutationRecipe, PathFinderConfig
+    from .dual_level_path_finder import DualLevelPathFinder as PathFinder
     _has_path_finder = True
 except ImportError:
     PathFinder = None
-    MutationRecipe = None
-    PathFinderConfig = None
     _has_path_finder = False
 
 __all__ = [
@@ -35,7 +33,7 @@ __all__ = [
     'energy_scheduler',
     'seed_queue_advanced',
     'shared_resources',
-    'path_finder',
+    'dual_level_path_finder',  # Update this
     'recipe_pool',
     'dynamic_fork_controller',
 ]

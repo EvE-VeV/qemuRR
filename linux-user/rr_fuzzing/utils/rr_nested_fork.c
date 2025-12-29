@@ -32,6 +32,21 @@ bool is_io_syscall(int syscall_nr) {
  * 3. 限制每个进程的fork次数（防止fork炸弹）
  * 4. 只在第一个IO syscall触发（简化测试）
  */
+/**
+ * @brief 判断是否触发嵌套 Fork (Nested Fork Heuristic)
+ * 
+ * 决定当前子进程是否应该进一步 Fork 出孙进程 (Grandchildren)。
+ * 这是一个高级特性，允许在 Trace 的深处进行局部探索。
+ * 
+ * **触发条件**:
+ * 1. 必须是 Autonomous Child (由 Fork Server 创建)。
+ * 2. 嵌套深度 < 2 (防止 Fork 炸弹)。
+ * 3. 每个进程限制 Fork 次数 (当前限制为 1)。
+ * 4. **硬编码触发**: 当前仅在第 5 个 Syscall 触发 (用于演示/测试)。
+ * 
+ * @param syscall_nr 系统调用号
+ * @return true 触发嵌套 Fork
+ */
 bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long ret) {
     /* 只有autonomous child才能嵌套fork */
     if (!g_rr_framework->is_autonomous_child) {
@@ -78,6 +93,20 @@ bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long re
 extern FILE *g_trace_file;
 extern char *g_rr_trace_path;
 
+/**
+ * @brief 执行自主嵌套 Fork (Autonomous Nested Fork)
+ * 
+ * 这是真正的"多级 Fork"实现。当前进程 (Child) 暂停，
+ * 并 Fork 出多个 (默认2个) 孙进程 (Grandchild) 并行探索。
+ * 
+ * **机制**:
+ * 1. Fork 出 N 个 Grandchild。
+ * 2. Grandchild 重新打开 Trace 文件 (以获得独立的文件指针)。
+ * 3. Grandchild 继承当前状态继续执行。
+ * 4. **Parent (Child) 等待所有 Grandchild 完成**，维持进程树结构。
+ * 
+ * @param fork_index 当前的系统调用索引
+ */
 void rr_autonomous_nested_fork(int fork_index) {
     RR_INFO("🔄 Autonomous nested fork at syscall[%d] (depth=%u, iteration=%u)", 
             fork_index, g_rr_framework->current_depth, g_rr_framework->current_iteration_id);

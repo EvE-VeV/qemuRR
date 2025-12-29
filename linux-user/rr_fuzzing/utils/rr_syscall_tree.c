@@ -6,7 +6,13 @@
  * Date: 2025-11-14
  */
 
+/* 确保RR_DEBUG被定义 */
+#ifndef RR_DEBUG
+#define RR_DEBUG 1
+#endif
+
 #include "rr_syscall_tree.h"
+#include "../core/rr_framework.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -19,6 +25,7 @@ RRSyscallTree g_syscall_tree = {0};
  * 初始化syscall tree
  */
 void rr_tree_init(void) {
+    RR_INFO("[RR-Tree] Initializing syscall tree builder");
     memset(&g_syscall_tree, 0, sizeof(RRSyscallTree));
     g_syscall_tree.enabled = true;
     g_syscall_tree.node_count = 0;
@@ -32,6 +39,7 @@ void rr_tree_init(void) {
         g_syscall_tree.nodes[i].parent_id = (uint32_t)-1;
         g_syscall_tree.nodes[i].id = i;
     }
+    RR_INFO("[RR-Tree] Tree builder initialized, enabled=%d", g_syscall_tree.enabled);
 }
 
 /**
@@ -55,6 +63,26 @@ static uint64_t get_timestamp_ns(void) {
  *
  * @return 新创建的节点ID
  */
+/**
+ * @brief 添加 Syscall 节点到执行树
+ * 
+ * 在每次系统调用执行时被调用。记录 syscall 的元数据、参数、返回值和时间戳。
+ * 它是构建执行路径树的核心函数。
+ * 
+ * **性能优化**:
+ * - 使用预分配的节点池 (`g_syscall_tree.nodes`)，避免 malloc。
+ * - 使用索引而非指针链接，内存布局紧凑。
+ * 
+ * @param pid 进程ID
+ * @param syscall_index Trace文件中的索引
+ * @param syscall_nr 系统调用号
+ * @param syscall_name 名称
+ * @param args 参数数组 (6个)
+ * @param retval 返回值
+ * @param timestamp_enter 进入时间戳 (0 = 自动获取)
+ * @param timestamp_exit 退出时间戳 (0 = 自动获取)
+ * @return uint32_t 新节点的 ID
+ */
 uint32_t rr_tree_add_syscall_node(
     uint32_t pid,
     uint32_t syscall_index,
@@ -66,6 +94,7 @@ uint32_t rr_tree_add_syscall_node(
     uint64_t timestamp_exit
 ) {
     if (!g_syscall_tree.enabled) {
+        RR_VERBOSE("[RR-Tree] add_syscall_node: tree NOT enabled!");
         return 0;
     }
 
@@ -173,8 +202,19 @@ const char* rr_tree_get_syscall_name(uint32_t syscall_nr) {
 /**
  * 导出tree为JSON格式
  */
+/**
+ * @brief 导出执行树为 JSON
+ * 
+ * 将整棵树 (元数据 + 节点列表) 序列化为 JSON 格式。
+ * 用于离线分析或可视化工具。
+ * 
+ * @param output_file 输出文件路径
+ */
 void rr_tree_export_json(const char *output_file) {
+    RR_INFO("[RR-Tree] Exporting syscall tree to %s (nodes=%u)", 
+            output_file ? output_file : "DEFAULT", g_syscall_tree.node_count);
     if (!g_syscall_tree.enabled) {
+        RR_WARN("[RR-Tree] Tree NOT enabled, skip export");
         return;
     }
 
@@ -203,6 +243,12 @@ void rr_tree_export_json(const char *output_file) {
         fprintf(fp, "      \"syscall_index\": %u,\n", node->syscall_index);
         fprintf(fp, "      \"syscall_nr\": %u,\n", node->syscall_nr);
         fprintf(fp, "      \"syscall_name\": \"%s\",\n", node->syscall_name);
+        
+        // Export args
+        fprintf(fp, "      \"args\": [%lu, %lu, %lu, %lu, %lu, %lu],\n",
+                node->args[0], node->args[1], node->args[2], 
+                node->args[3], node->args[4], node->args[5]);
+
         fprintf(fp, "      \"retval\": %ld,\n", node->retval);
         fprintf(fp, "      \"timestamp_enter\": %lu,\n", node->timestamp_enter);
         fprintf(fp, "      \"timestamp_exit\": %lu,\n", node->timestamp_exit);
@@ -234,5 +280,5 @@ void rr_tree_export_json(const char *output_file) {
     fprintf(fp, "}\n");
 
     fclose(fp);
-    fprintf(stdout, "[RR-Tree] ✅ Exported %u nodes to %s\n", g_syscall_tree.node_count, output_file);
+    RR_INFO("[RR-Tree] ✅ Exported %u nodes to %s", g_syscall_tree.node_count, output_file);
 }

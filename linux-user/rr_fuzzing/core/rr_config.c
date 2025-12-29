@@ -15,7 +15,15 @@
 rr_config_t g_rr_config = {0};
 
 /**
- * 默认配置值
+ * 默认配置值 (Fallback Defaults)
+ * 
+ * 如果未通过环境变量或配置文件指定，则使用这些默认值。
+ * 
+ * **关键默认值**:
+ * - `mode`: DISABLED (需显式启用)
+ * - `fork_strategy`: AGGRESSIVE (最大化覆盖率)
+ * - `shared_memory_size`: 64KB (适配标准 fuzzing 负载)
+ * - `use_legacy_capture`: false (避免双重捕获 bug)
  */
 static const rr_config_t DEFAULT_CONFIG = {
     .enabled = false,
@@ -235,7 +243,18 @@ static int load_config_file(const char *config_file)
 }
 
 /**
- * 初始化配置系统
+ * @brief 初始化配置系统 (Global Config Init)
+ * 
+ * 加载顺序 (优先级从低到高):
+ * 1. 默认值 (`DEFAULT_CONFIG`)
+ * 2. 配置文件 (`RR_CONFIG_FILE` 指定)
+ * 3. 环境变量 (如 `RR_MODE`, `RR_TRACE_FILE`)
+ * 
+ * **副作用**:
+ * - 初始化全局变量 `g_rr_config`。
+ * - 可能修改一些环境变量 (如 `RR_DEBUG_LEVEL`) 以适配底层库。
+ * 
+ * @return int 0 成功
  */
 int rr_config_init(void)
 {

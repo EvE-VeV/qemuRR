@@ -48,6 +48,27 @@ INIT_SYSCALLS = {
 # 注意: 这是一个启发式值，可以由InitPhaseDetector自动检测
 INIT_PHASE_THRESHOLD = 25  # 默认值 (如果自动检测失败)
 
+# ===== Mutation Type Names Mapping =====
+# 将 cmd 值映射到可读的变异类型名称（用于崩溃元数据）
+MUTATION_TYPE_NAMES = {
+    FUZZ_CMD_NONE: "NONE",
+    FUZZ_CMD_MUTATE_ARG: "MUTATE_ARG",
+    FUZZ_CMD_REPLACE_BUFFER: "REPLACE_BUFFER",
+    FUZZ_CMD_MUTATE_FLAGS: "MUTATE_FLAGS",
+    FUZZ_CMD_BOUNDARY_VALUE: "BOUNDARY_VALUE",
+    FUZZ_CMD_MUTATE_AUX_BUFFER: "MUTATE_AUX_BUFFER",
+    FUZZ_CMD_FLIP_BITS: "FLIP_BITS",
+    FUZZ_CMD_TRUNCATE: "TRUNCATE",
+    FUZZ_CMD_EXTEND: "EXTEND",
+    FUZZ_CMD_INTERESTING_VALUES: "INTERESTING_VALUES",
+    FUZZ_CMD_LIGHT_MUTATION: "LIGHT_MUTATION",
+    FUZZ_CMD_OVERWRITE_AT_OFFSET: "OVERWRITE_AT_OFFSET",
+}
+
+def get_mutation_type_name(cmd):
+    """从 cmd 值获取可读的变异类型名称"""
+    return MUTATION_TYPE_NAMES.get(cmd, f"UNKNOWN_{cmd}")
+
 # 应该始终变异的重要I/O系统调用 (永不跳过)
 # 扩展列表以包含所有关键IO操作
 IMPORTANT_SYSCALLS = {

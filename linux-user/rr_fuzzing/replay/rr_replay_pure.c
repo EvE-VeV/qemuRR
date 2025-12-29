@@ -18,9 +18,48 @@
 #include <unistd.h>
 
 /**
- * 纯确定性重放单个系统调用
+ * @brief 纯确定性重放 - 完全在用户态恢复系统调用，不执行真实 syscall
  * 
- * @return 成功返回 syscall 返回值，失败返回 -1（需要回退到 hybrid）
+ * 这是 RR-Fuzz 的核心创新之一，实现了 EnvFuzz 风格的确定性重放。
+ * 对于已捕获 aux_data 的系统调用，直接从 aux_data 恢复内存状态和返回值，
+ * **完全绕过**真实的系统调用执行，从而：
+ * 1. 消除 syscall 开销，提升 replay 性能
+ * 2. 避免与操作系统交互，提高确定性
+ * 3. 支持离线分析（不需要实际的文件/网络资源）
+ * 
+ * **支持的系统调用类型**:
+ * - ✅ **输入类 I/O**: read, pread64, recv, recvfrom
+ * - ✅ **非确定性源**: getrandom (关键！确保随机性可重现)
+ * - ✅ **特殊 ioctl**: 带输出缓冲区的 ioctl 命令
+ * - ❌ **输出类 I/O**: write, send (必须真实执行以维持 I/O 状态)
+ * - ❌ **内存管理**: mmap, brk (必须真实执行以维持 QEMU 内存映射状态)
+ * 
+ * **工作原理**:
+ * 1. 检查 record 是否有 aux_data (has_aux_data)
+ * 2. 根据 syscall 类型查找对应的 aux_data 条目（按 arg_index）
+ * 3. 使用 cpu_memory_rw_debug() 将 aux_data 写入 guest 内存
+ * 4. 直接返回记录的 retval，QEMU 不会执行真实 syscall
+ * 
+ * @param env CPU 架构状态指针（用于写入 guest 内存）
+ * @param num 系统调用编号
+ * @param args 系统调用参数数组（8个参数），Pure replay 可能会修改某些参数
+ * @param record 从 trace 文件读取的系统调用记录（包含 aux_data）
+ * 
+ * @return abi_long
+ *         - >= 0: Pure replay 成功，返回记录的 retval
+ *         - -1: 不支持 pure replay 或失败，需要回退到 Hybrid replay
+ * 
+ * @note 如果没有 aux_data 或 aux_data 为空，会立即返回 -1 (回退到 hybrid)
+ * @note 对于 write/send 等输出调用，强制返回 -1 以确保真实执行
+ * @note 对于 mmap/brk，强制返回 -1 因为需要 QEMU 维护内存映射
+ * 
+ * @warning cpu_memory_rw_debug 失败会打印错误但仍返回 -1（回退到 hybrid）
+ * @warning 必须确保 aux_data 的 arg_index 与实际参数索引匹配
+ * 
+ * @see rr_replay_syscall() 调用此函数，如果返回 -1 则执行 hybrid replay
+ * @see rr_aux_find() 从 aux_data 链表中查找指定 arg_index 的条目
+ * @see capture_syscall_args_aux() Record 阶段创建 aux_data 的对应函数
+ * @see cpu_memory_rw_debug() QEMU 提供的 guest 内存读写函数
  */
 abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
                                 syscall_record_t *record)

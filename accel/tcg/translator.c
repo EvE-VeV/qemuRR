@@ -21,6 +21,10 @@
 #include "disas/disas.h"
 #include "tb-internal.h"
 
+/* RR-Fuzz: Universal Range Filtering Declaration */
+extern bool rr_in_target_range(uint64_t pc);
+
+
 static void set_can_do_io(DisasContextBase *db, bool val)
 {
     QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.can_do_io) != 1);
@@ -148,6 +152,15 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
+    
+#ifdef CONFIG_USER_ONLY
+    /* RR-Fuzz: Instrument Basic Block for Coverage */
+    /* Universal Filter: Check if PC is within the loaded main binary range */
+    if (rr_in_target_range(pc)) {
+        gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
+    }
+#endif
+
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 

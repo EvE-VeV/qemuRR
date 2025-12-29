@@ -44,8 +44,8 @@ class AFLEnhancedMutator(SmartMutator):
     3. 在AFL阶段与智能变异之间找到平衡
     """
 
-    def __init__(self, trace_file, recipe_file=None, target_binary=None):
-        super().__init__(trace_file, recipe_file, target_binary)
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None):
+        super().__init__(trace_file, recipe_file, target_binary, path_finder)
 
         # AFL相关状态
         self.afl_enabled = True

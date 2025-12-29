@@ -28,7 +28,22 @@ target_ulong g_pending_mmap_recorded_addr = 0;
 target_ulong g_pending_mmap_length = 0;
 
 /**
- * 获取系统调用名称
+ * @brief 将系统调用编号转换为可读的名称字符串
+ * 
+ * 该函数提供系统调用号到名称的映射，主要用于日志和调试输出。
+ * 对于已知的常用系统调用，返回其标准名称（如 "read", "write"）。
+ * 对于未识别的系统调用，返回 "unknown"。
+ * 
+ * @param syscall_nr 系统调用编号（如 TARGET_NR_read, TARGET_NR_write）
+ * @return 系统调用名称的常量字符串指针。
+ *         - 对于已知调用：返回标准名称字符串（如 "read", "mmap"）
+ *         - 对于未知调用：返回 "unknown"
+ * 
+ * @note 当前实现仅包含约 30 个常用系统调用的映射，未覆盖所有系统调用。
+ * @note 返回的字符串指针指向静态常量区域，调用者无需释放内存。
+ * @warning 对于未映射的系统调用返回 "unknown"，调用者应注意处理。
+ * 
+ * @see rr_syscall_post_hook() 主要使用该函数进行日志输出
  */
 static const char* get_syscall_name(int syscall_nr) {
     switch (syscall_nr) {
@@ -76,12 +91,29 @@ static const char* get_syscall_name(int syscall_nr) {
 }
 
 /**
- * 判断某个 syscall 的返回值偏离是否为预期行为
+ * @brief 判断系统调用返回值的偏离是否属于预期范围
  * 
- * @param syscall_nr syscall 编号
- * @param recorded 记录的返回值
- * @param actual 实际返回值
- * @return true 如果偏离是预期的 (如 ASLR 导致的地址偏离)
+ * 在确定性重放 (deterministic replay) 过程中，某些系统调用的返回值会因为
+ * 操作系统的 ASLR (地址空间布局随机化)、PID 分配等机制而在 record 和 replay
+ * 阶段产生差异。此函数用于判断这种偏离是否在预期范围内（即是否为已知的
+ * 不确定性来源），从而决定是否应该触发不一致警告。
+ * 
+ * @param syscall_nr 系统调用编号（如 TARGET_NR_mmap, TARGET_NR_brk）
+ * @param recorded 记录 (record) 阶段该系统调用的返回值
+ * @param actual 重放 (replay) 阶段该系统调用的实际返回值
+ * @return bool
+ *         - true: 偏离属于预期范围（如地址类系统调用、PID/TID 相关调用）
+ *         - false: 偏离异常，可能需要进一步检查或警告
+ * 
+ * @note 当前支持的预期偏离场景包括：
+ *       - 内存管理: mmap, mmap2, brk, mremap (返回的地址受 ASLR 影响)
+ *       - 进程标识: set_tid_address, gettid, getpid, getppid
+ *       - 路径操作: readlink, readlinkat (路径长度可能变化)
+ * 
+ * @warning 对于未列出的系统调用，该函数会返回 false，表示不接受任何偏离。
+ *          在添加新的预期偏离场景时，需要仔细评估其合理性。
+ * 
+ * @see rr_do_syscall() 在检测到返回值不一致时会调用此函数
  */
 static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long actual) {
     /* mmap 地址偏离是预期的 (ASLR) */
@@ -150,8 +182,29 @@ static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long ac
 }
 
 /**
- * FD 环境对齐 (任务3)
- * 在 replay 模式下,尽量让 guest 程序的 FD 分配与 record 时一致
+ * @brief 在重放模式下对齐文件描述符 (FD) 环境
+ * 
+ * 为了确保确定性重放，guest 程序在 replay 阶段的 FD 分配应尽可能与
+ * record 阶段保持一致。该函数在 replay/fuzzing 模式启动时被调用，
+ * 尝试关闭一些由 QEMU 占用的 FD，使得 guest 程序的第一个 open() 调用
+ * 能够获得与 record 阶段相同的 FD 编号（通常是 FD=3）。
+ * 
+ * @return int
+ *         - 0: 对齐操作完成（无论是否成功）
+ *         - 负值: 保留用于未来错误处理扩展
+ * 
+ * @note FD 对齐策略:
+ *       1. 跳过标准流 (stdin=0, stdout=1, stderr=2)
+ *       2. 保护 IPC 通信管道 FD (fuzzing 模式必需)
+ *       3. 仅关闭以只读模式打开的 FD，避免误关闭 trace 文件
+ * 
+ * @note 如果无法完全对齐（如 QEMU 占用了多个 FD），系统会启用 FD 映射机制
+ *       来处理 record 和 replay 之间的 FD 差异。
+ * 
+ * @warning 在 multi-threaded 环境下可能存在竞态条件（当前 QEMU user-mode 是单线程）
+ * 
+ * @see rr_fd_mapping_add() FD 映射机制的实现
+ * @see rr_framework_init() 在框架初始化时调用
  */
 static int align_fd_state(void) {
     if (g_rr_config.mode != RR_MODE_REPLAY && g_rr_config.mode != RR_MODE_FUZZING) {
@@ -249,7 +302,35 @@ static int align_fd_state(void) {
 }
 
 /**
- * 初始化RR框架
+ * @brief 初始化 RR-Fuzz 框架的所有子系统
+ * 
+ * 这是 RR-Fuzz 框架的主初始化函数，负责根据配置（record/replay/fuzzing 模式）
+ * 启动相应的子系统。该函数通常在 QEMU 启动 guest 程序之前被调用一次。
+ * 
+ * 初始化流程:
+ * 1. 加载并验证配置 (rr_config_init)
+ * 2. 初始化调试日志系统
+ * 3. 分配全局框架上下文 (g_rr_framework)
+ * 4. 初始化 FD/地址映射管理器
+ * 5. 执行 FD 环境对齐 (replay/fuzzing 模式)
+ * 6. 初始化 IPC 通信管道 (fuzzing 模式)
+ * 7. 初始化覆盖率追踪模块
+ * 8. 初始化 Syscall Tree Builder
+ * 9. 根据运行模式启动 record/replay/fuzzing 子系统
+ * 
+ * @return int
+ *         - 0: 初始化成功
+ *         - -1: 初始化失败（会打印错误日志）
+ * 
+ * @note 该函数应仅被调用一次。重复调用会导致资源泄漏。
+ * @note 会自动注册 atexit 清理函数 rr_framework_cleanup()
+ * 
+ * @warning 如果初始化失败，部分子系统可能已经初始化完成。调用者应确保
+ *          正确处理错误情况并退出程序，或调用 rr_framework_cleanup() 清理。
+ * 
+ * @see rr_framework_cleanup() 对应的清理函数
+ * @see g_rr_config 全局配置对象
+ * @see g_rr_framework 全局框架上下文
  */
 int rr_framework_init(void)
 {
@@ -425,7 +506,29 @@ error:
 }
 
 /**
- * 清理RR框架
+ * @brief 清理 RR-Fuzz 框架并释放所有资源
+ * 
+ * 该函数负责停止所有运行中的子系统并释放框架占用的内存资源。
+ * 通常在程序退出时通过 atexit 机制自动调用，也可以手动调用。
+ * 
+ * 清理流程:
+ * 1. 根据当前模式停止相应子系统 (recording/replay/fork-server)
+ * 2. 导出 Syscall Tree 到 JSON 文件 (默认 /tmp/syscall_tree.json)
+ * 3. 清理覆盖率追踪模块
+ * 4. 清理 IPC 通信管道
+ * 5. 清理动态跟踪管道 (如果启用)
+ * 6. 清理 fuzzing、snapshot、调试、配置等子系统
+ * 7. 清理 FD/地址映射管理器
+ * 8. 释放 trace 记录链表
+ * 9. 释放全局框架上下文
+ * 
+ * @note 该函数可以安全地被多次调用（会检查 g_rr_framework 是否为 NULL）
+ * @note 清理顺序很重要：先停止业务逻辑，再清理底层资源
+ * 
+ * @warning 调用此函数后，g_rr_framework 会被设置为 NULL，后续不应再使用框架功能
+ * 
+ * @see rr_framework_init() 对应的初始化函数
+ * @see g_rr_framework 全局框架上下文
  */
 void rr_framework_cleanup(void)
 {
@@ -466,16 +569,18 @@ void rr_framework_cleanup(void)
     /* 清理子系统 */
     RR_VERBOSE("Cleaning up subsystems");
 
-    /* ✅ C-Tree-P2: 导出Syscall Tree为JSON */
-    const char *tree_output = getenv("RR_TREE_OUTPUT");
-    if (tree_output) {
-        rr_tree_export_json(tree_output);
-    } else {
-        /* 默认输出到 /tmp/syscall_tree.json */
-        rr_tree_export_json("/tmp/syscall_tree.json");
+    /* ✅ C-Tree-P2: 导出Syscall Tree为JSON（仅在记录模式下） */
+    if (g_rr_framework->mode == RR_MODE_RECORD) {
+        const char *tree_output = getenv("RR_TREE_OUTPUT");
+        if (tree_output) {
+            rr_tree_export_json(tree_output);
+        } else {
+            /* 默认输出到 /tmp/syscall_tree.json */
+            rr_tree_export_json("/tmp/syscall_tree.json");
+        }
     }
     rr_tree_cleanup();
-    RR_VERBOSE("Syscall tree exported and cleaned up");
+    RR_VERBOSE("Syscall tree cleaned up");
 
     /* 清理Coverage模块 */
     rr_coverage_cleanup();
@@ -516,8 +621,42 @@ void rr_framework_cleanup(void)
 }
 
 /**
- * 核心系统调用处理函数
- * 这是do_syscall调用的入口点
+ * @brief RR-Fuzz 框架的核心系统调用拦截处理函数
+ * 
+ * 该函数是 RR-Fuzz 框架与 QEMU 的主要接入点，由 `linux-user/syscall.c` 中的
+ * `do_syscall()` 在系统调用执行**之前**调用。根据当前运行模式 (record/replay/fuzzing),
+ * 决定是记录、重放还是以修改的方式执行系统调用。
+ * 
+ * **工作流程**:
+ * - **Record 模式**: 返回 -1，让 QEMU 执行原始系统调用，结果在 post-hook 中记录
+ * - **Replay 模式**: 调用 `rr_replay_syscall()` 或 `rr_replay_syscall_strace()`，
+ *   根据 trace 文件确定性反现系统调用结果
+ * - **Fuzzing 模式**: 类似 replay，但会应用 mutation 并支持 fork-server 机制
+ * 
+ * **Fork-Server 机制** (✅ Early Fork):
+ * 在 fuzzing 模式下，该函数在**第一个系统调用之前**就会进入 fork-server 循环，
+ * 确保 fork 出的子进程从 `main()` 开始执行，自然完成整个 trace 的 replay。
+ * 
+ * @param env CPU 架构状态指针 (CPUArchState)
+ * @param num 系统调用编号 (syscall number)
+ * @param arg1-arg8 系统调用的 8 个参数指针 (注意是指针，可被修改)
+ * 
+ * @return abi_long
+ *         - 非 -1: 由 RR-Fuzz 框架处理的系统调用返回值，QEMU 直接使用，不再执行原始 syscall
+ *         - -1: RR-Fuzz 未处理，让 QEMU 执行原始系统调用 (record 模式或未启用时)
+ * 
+ * @note 这是 pre-hook，在系统调用执行**之前**被调用
+ * @note Fuzzing 模式下，fork-server 只会被初始化一次 (static bool fork_server_entered)
+ * @note 退出相关的系统调用 (exit/exit_group) 在 record 模式下会被特殊处理
+ * 
+ * @warning 此函数会直接修改参数指针 (arg1-arg8) 的值，在 fuzzing 模式下用于应用 mutation
+ * @warning Fork-server 逻辑会导致进程 fork，调用者需考虑多进程场景
+ * 
+ * @see do_syscall() QEMU 中调用此函数的入口
+ * @see rr_syscall_post_hook() 对应的 post-hook (系统调用执行之后)
+ * @see rr_replay_syscall() Binary trace replay 实现
+ * @see rr_replay_syscall_strace() Strace replay 实现
+ * @see rr_fork_server_loop() Fork-server 循环实现
  */
 abi_long rr_do_syscall(CPUArchState *env, int num,
                        abi_long *arg1, abi_long *arg2, abi_long *arg3, abi_long *arg4,
@@ -687,7 +826,23 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 }
 
 /**
- * 地址映射管理函数
+ * @brief 处理 mmap 系统调用执行后的地址映射
+ * 
+ * 在 replay/fuzzing 模式下，由于 ASLR (Address Space Layout Randomization)，
+ * mmap 返回的地址会与 record 阶段不同。该函数负责建立 record 地址到
+ * replay 地址的映射关系，供后续内存相关系统调用 (munmap, mprotect 等) 使用。
+ * 
+ * @param recorded_addr mmap 在 record 阶段返回的地址 (从 trace 文件读取)
+ * @param actual_addr mmap 在 replay 阶段实际返回的地址
+ * 
+ * @note 该函数在 post-hook 中被调用，确保 mmap 已经实际执行完成
+ * @note 地址映射信息存储在全局映射管理器中
+ * 
+ * @warning 必须在 mmap 执行后立即调用，否则后续操作可能找不到正确的映射
+ * 
+ * @see rr_addr_mapping_add() 地址映射管理器的添加函数
+ * @see rr_syscall_post_hook() 调用此函数的 post-hook
+ * @see g_pending_mmap_recorded_addr 保存 recorded_addr 的全局变量
  */
 void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr)
 {
@@ -709,16 +864,43 @@ void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr)
 }
 
 /**
- * 系统调用执行后的Hook
- * 用于记录模式
+ * @brief 系统调用执行后的通用 Hook 函数
+ * 
+ * 该函数在 QEMU 执行完系统调用之后被调用，负责处理系统调用的
+ * 各种副作用，包括：
+ * - **Record 模式**: 记录系统调用的返回值和输出数据到 trace 文件
+ * - **FD 管理**: 更新 FD 映射表 (open/close/dup 等调用)
+ * - **地址映射**: 处理 mmap/munmap/mremap 的地址映射
+ * - **Fuzzing 统计**: 更新 fuzzing 模式下的执行统计信息
+ * 
+ * **处理的主要系统调用类型**:
+ * - 文件操作: open, openat, close, dup, dup2, dup3
+ * - 内存管理: mmap, mmap2, munmap, mremap, mprotect
+ * - 网络: socket, accept, accept4
+ * - 进程管理: fork, vfork, clone
+ * 
+ * @param env CPU 架构状态指针
+ * @param num 系统调用编号
+ * @param ret 系统调用的返回值
+ * @param arg1-arg8 系统调用的 8 个参数值 (注意不是指针)
+ * 
+ * @note 这是 post-hook，在系统调用执行**之后**被调用
+ * @note 与 `rr_do_syscall` 不同，这里的 arg1-arg8 是值而不是指针
+ * @note 包含一个大型 switch-case 结构 (L800-L900+)，处理各种系统调用
+ * 
+ * @warning 该函数自身没有返回值，无法阻止 QEMU 的后续处理
+ * @warning 包含大量 switch-case 逻辑，与 `rr_syscall_dispatch.c` 存在功能重复
+ * 
+ * @see rr_do_syscall() 对应的 pre-hook
+ * @see rr_syscall_dispatch.c 更模块化的 syscall 处理方式
+ * @see rr_record_syscall() Record 模式下记录系统调用
+ * @see rr_fd_mapping_add() FD 映射管理
  */
 void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                           abi_long arg1, abi_long arg2, abi_long arg3, abi_long arg4,
                           abi_long arg5, abi_long arg6, abi_long arg7, abi_long arg8)
 {
-    RR_VERBOSE("POST_HOOK: syscall=%d, enabled=%d, mode=%d, ret=%d",
-               num, rr_framework_enabled(), g_rr_framework ? g_rr_framework->mode : -1, (int)ret);
-
+    RR_VERBOSE("POST_HOOK: syscall=%d, ret=%ld", num, (long)ret);
     if (!rr_framework_enabled()) {
         RR_VERBOSE("POST_HOOK: Skipping syscall %d - framework not enabled", num);
         return;
@@ -730,9 +912,12 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
             (uint64_t)arg4, (uint64_t)arg5, (uint64_t)arg6
         };
+        uint32_t current_idx = (g_rr_framework->mode == RR_MODE_RECORD) ? 
+                               g_rr_framework->trace_length : g_rr_framework->replay_index;
+        
         uint32_t node_id = rr_tree_add_syscall_node(
             getpid(),                               // PID
-            g_rr_framework->replay_index,           // syscall_index
+            current_idx,                            // syscall_index
             num,                                     // syscall_nr
             get_syscall_name(num),                  // syscall_name
             args_arr,                                // args

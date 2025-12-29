@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QEMU_BUILD="/home/webfuzz/Documents/qemu/build/build-x86-arm-user/qemu-x86_64"
+QEMU_BUILD="/home/webfuzz/Documents/qemu/build/qemu-x86_64"
 WORK_DIR="/tmp/complex_test_suite"
 
 # 确保QEMU已构建

@@ -44,16 +44,25 @@ class AuxDataType(IntEnum):
 class SyscallRecord:
     """系统调用记录"""
     def __init__(self, index: int, syscall_nr: int, retval: int, 
-                 has_aux_data: bool, aux_data_size: int = 0):
+                 has_aux_data: bool, aux_data_size: int = 0,
+                 args: List[int] = None, creates_fd: bool = False,
+                 uses_fd: bool = False, created_fd: int = -1,
+                 arg_data: Dict[int, bytes] = None):
         self.index = index
         self.syscall_nr = syscall_nr
         self.retval = retval
         self.has_aux_data = has_aux_data
         self.aux_data_size = aux_data_size
+        self.args = args if args else [0] * 8
+        self.creates_fd = creates_fd
+        self.uses_fd = uses_fd
+        self.created_fd = created_fd
+        self.arg_data = arg_data if arg_data else {}
         self.name = self._nr_to_name(syscall_nr)
         self.category = self._categorize()
     
-    def _nr_to_name(self, nr: int) -> str:
+    @staticmethod
+    def _nr_to_name(nr: int) -> str:
         """将系统调用号转换为名称 (x86_64)"""
         # 常见系统调用映射 (x86_64)
         syscall_map = {
@@ -124,6 +133,10 @@ class SyscallRecord:
         else:
             # ✅ FIX: 未知syscall返回'unknown'，不是'hybrid_replay'
             return 'unknown'
+    
+    @staticmethod
+    def get_name(nr: int) -> str:
+        return SyscallRecord._nr_to_name(nr)
     
     def __repr__(self):
         return (f"SyscallRecord(index={self.index}, name={self.name}, "
@@ -287,6 +300,7 @@ class TraceAnalyzer:
             created_fd = struct.unpack('<i', flags[2:6])[0]
             
             # ===== Step 2: 读取variable arg_data section =====
+            arg_data_map = {}
             while True:
                 arg_idx_bytes = f.read(4)
                 if len(arg_idx_bytes) < 4:
@@ -312,6 +326,8 @@ class TraceAnalyzer:
                 if len(data) < size:
                     print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_data")
                     break
+                
+                arg_data_map[arg_idx] = data
             
             # ===== Step 3: 读取aux_data section =====
             has_aux_data = False
@@ -355,13 +371,34 @@ class TraceAnalyzer:
                         
                         aux_data_size += size
             
+            # ===== Step 3: 读取aux_data section =====
+            # ... (保持原有读取逻辑不变)
+            
+            # 手动启发式修复 (如果 C 端传来的 flags 不可靠)
+            name = SyscallRecord._nr_to_name(syscall_nr)
+            if name in ['open', 'openat', 'socket', 'accept', 'accept4', 'dup', 'dup2', 'dup3', 'epoll_create', 'epoll_create1', 'timerfd_create', 'eventfd', 'eventfd2', 'signalfd', 'signalfd4', 'memfd_create']:
+                if retval > 2: # 忽略 stdin/stdout/stderr
+                    creates_fd = True
+                    created_fd = int(retval)
+            
+            if name in ['read', 'write', 'close', 'fstat', 'lseek', 'pread64', 'pwrite64', 'readv', 'writev', 'ioctl', 'fcntl', 'fadvise64', 'ftruncate', 'fchmod', 'fchown', 'fdatasync', 'fsync', 'getdents', 'getdents64', 'sendto', 'recvfrom', 'sendmsg', 'recvmsg', 'shutdown', 'bind', 'listen', 'connect', 'getsockname', 'getpeername', 'setsockopt', 'getsockopt']:
+                uses_fd = True
+            
             # ===== Step 4: 创建记录 =====
+            # 解析args
+            args = list(struct.unpack('<8Q', args_retval[0:64]))
+            
             record = SyscallRecord(
                 index=rec_index,
                 syscall_nr=syscall_nr,
                 retval=retval,
                 has_aux_data=has_aux_data,
-                aux_data_size=aux_data_size
+                aux_data_size=aux_data_size,
+                args=args,
+                creates_fd=creates_fd,
+                uses_fd=uses_fd,
+                created_fd=created_fd,
+                arg_data=arg_data_map
             )
             
             self.syscalls.append(record)

@@ -31,6 +31,19 @@
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
 
+/* RR-Fuzz Integration */
+#ifdef CONFIG_USER_ONLY
+// Direct declaration to avoid include path complexity for now
+extern void rr_coverage_trace_edge(uint64_t cur_pc);
+#endif
+
+void HELPER(rr_coverage_trace_edge)(uint64_t cur_pc)
+{
+#ifdef CONFIG_USER_ONLY
+    rr_coverage_trace_edge(cur_pc);
+#endif
+}
+
 /* 32-bit helpers */
 
 int32_t HELPER(div_i32)(int32_t arg1, int32_t arg2)

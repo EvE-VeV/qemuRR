@@ -246,6 +246,25 @@ static void mutate_light(rr_aux_data_t *aux, const FuzzInstruction *instr) {
  * 
  * 注入特定的"有趣"值，如边界值、魔数等
  */
+/**
+ * @brief 策略 5: 特殊值注入 (Vulnerability Patterns)
+ * 
+ * 根据系统调用的类型，智能注入已知漏洞模式的 Payload。
+ * 这是发现特定类型漏洞（如格式化字符串、命令注入、缓冲区溢出）的关键策略。
+ * 
+ * **支持的模式**:
+ * - `getrandom`: 全0/全1/重复模式 (测试弱随机数)
+ * - `read/recv*`:
+ *    - Format String: `%s%n`, `%p`
+ *    - Buffer Overflow: 长字符串 ('A' * N)
+ *    - Integer Overflow: MAX_INT, 0xFFFFFFFF
+ *    - Command Injection: `$(id)`
+ *    - Path Traversal: `../../etc/passwd`
+ * 
+ * @param aux 目标 aux_data
+ * @param instr 变异指令
+ * @param syscall_nr 系统调用号
+ */
 static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction *instr,
                                       int syscall_nr) {
     if (!aux || !aux->data || aux->size == 0) {
@@ -377,6 +396,23 @@ static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction 
  * 变异 aux_data 中的数据
  * 
  * 此函数遍历所有 Fuzz 指令，对匹配的 aux_data 进行变异
+ */
+/**
+ * @brief 执行 Aux Data 变异 (入口函数)
+ * 
+ * 在 Replay 过程中，当遇到带有 aux_data 的系统调用（如 read/getrandom）时被调用。
+ * 遍历当前的 Fuzz 指令，如果找到针对该 syscall 的 aux 变异指令，则修改 aux_data 的内容。
+ * 
+ * **流程**:
+ * 1. 检查是否在 Fuzzing 模式且有指令。
+ * 2. 遍历指令集，匹配 syscall_index。
+ * 3. 查找对应的 aux_data 节点 (基于 arg_index)。
+ * 4. 调用具体的变异策略函数 (`mutate_aux_buffer`, `flip_bits`, `extend_data` 等)。
+ * 
+ * @param env CPU 环境
+ * @param record syscall 记录
+ * @param args 参数
+ * @param syscall_nr 系统调用号
  */
 void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
                               abi_long *args, int syscall_nr) {

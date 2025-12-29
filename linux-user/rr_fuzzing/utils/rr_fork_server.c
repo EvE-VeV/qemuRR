@@ -50,11 +50,17 @@ void rr_reset_fork_point(void)
 }
 
 /**
- * 启动Fork Server
+ * @brief 启动 Fork Server 机制
  * 
- * @param syscall_name 目标系统调用名称（如"openat", "read", NULL表示使用旧的索引模式）
- * @param pattern Path matching pattern, NULL matches all
- * @return 成功返回0，失败返回-1
+ * 初始化 Fork Server 状态，配置目标 fork 点（基于 syscall 名称或路径模式）。
+ * 成功后，发送 READY 状态给 Conductor，然后进入 `rr_fork_server_loop` 等待命令。
+ * 
+ * **自动检测模式**:
+ * 如果 syscall_name 为 NULL，则使用启发式规则自动选择 fork 点（通常是第一个阻塞式 IO，如 read/select）。
+ * 
+ * @param syscall_name 目标系统调用名称（如 "openat"），NULL 表示自动检测
+ * @param pattern 路径匹配模式（如 "/target/config*"），用于过滤文件路径
+ * @return int 0 成功，-1 失败
  */
 int rr_start_fork_server(const char *syscall_name, const char *pattern)
 {
@@ -192,13 +198,24 @@ static char *extract_path_from_syscall(CPUArchState *env, const char *syscall_na
 }
 
 /**
- * 检查是否到达Fork点（新实现）
+ * @brief 检查是否到达 Fork 点 (Fork Point Detection)
  * 
- * @param env CPU环境（用于读取路径）
+ * 在每次系统调用执行前被调用。判断当前 syscall 是否匹配配置的 fork 条件。
+ * 
+ * **判定逻辑**:
+ * 1. 检查 syscall 名称是否匹配
+ * 2. (可选) 检查 syscall 涉及的文件路径是否匹配 pattern
+ * 
+ * 如果匹配成功：
+ * - 设置 `g_at_fork_point = true`
+ * - 发送 `STATUS_AT_FORK_POINT` (2) 给 Conductor
+ * - 暂停执行，等待 Fork Server Loop 接管
+ * 
+ * @param env CPU环境 (用于读取 Guest 内存中的路径字符串)
  * @param syscall_nr 系统调用号
  * @param syscall_name 系统调用名称
  * @param args 系统调用参数
- * @return true表示到达fork点，false表示未到达
+ * @return true 到达 fork 点 (将触发暂停), false 继续执行
  */
 bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_name, const abi_long *args)
 {
@@ -269,8 +286,33 @@ bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_
 }
 
 /**
- * Fork Server主循环
- * 等待Conductor的命令并执行Fork
+ * @brief Fork Server 主循环 (核心性能引擎)
+ * 
+ * 这是 RR-Fuzz 的心脏。当父进程到达 Fork 点后，进入此循环等待 Python Conductor 的指令。
+ * 通过管道 (Pipe) 接收单字节命令，通过共享内存 (SHM) 交换复杂数据。
+ * 
+ * **支持命令**:
+ * - **'F' (Fork)**: 标准 Persistent Mode。
+ *    - 从 SHM 加载 fuzz 指令
+ *    - Fork 子进程
+ *    - 子进程重置状态 (trace pos, replay index) 并执行
+ *    - 父进程等待子进程结束，报告状态 (Crash/Normal)
+ * 
+ * - **'B' (Batch Fork)**: 并发探索模式。
+ *    - 一次性 Fork 多个子进程 (Variants)，每个应用不同的变异
+ *    - 利用多核并行加速
+ * 
+ * - **'C' (Checkpoint Fork / Mid-Point)**: 高级深路径 Fuzzing。
+ *    - 允许在 Trace 的**中间任意位置**进行 Fork
+ *    - 如果父进程未到达目标点，先继续 Replay
+ *    - 到达后 Fork，子进程直接继承状态继续运行 (无需从头 Replay)
+ * 
+ * - **'E' (Baseline)**: 基线执行。
+ *    - 完整运行 Trace 不进行变异，用于收集覆盖率基准
+ * 
+ * @return int 
+ *         - 1: 如果是子进程，返回 1 继续执行 syscalls
+ *         - 0: 父进程退出循环 (通常不会发生，除非收到停止信号)
  */
 int rr_fork_server_loop(void)
 {
@@ -336,8 +378,9 @@ int rr_fork_server_loop(void)
                             }
                             
                             /* 重置trace */
-                            RR_INFO("Child variant %d: Resetting trace", variant_idx);
-                            rr_reset_trace_position();
+                            RR_INFO("Child variant %d: Re-opening trace", variant_idx);
+                            if (g_trace_file) { fclose(g_trace_file); g_trace_file = NULL; }
+                            rr_start_replay(g_rr_trace_path);
                             g_rr_framework->replay_index = 0;
                             
                             if (g_current_record) {
@@ -395,18 +438,28 @@ int rr_fork_server_loop(void)
                         waitpid(child_pids[i], &status, 0);
                         
                         /* 分析退出状态 */
+                        int result_status = STATUS_NORMAL_EXIT;
                         if (WIFEXITED(status)) {
-                            RR_VERBOSE("Child variant %d exited normally", i);
+                            int exit_code = WEXITSTATUS(status);
+                            if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
+                                result_status = STATUS_CRASH;
+                                RR_INFO("Crash: Child variant %d exited with code %d", i, exit_code);
+                            } else {
+                                result_status = STATUS_NORMAL_EXIT;
+                            }
                         } else if (WIFSIGNALED(status)) {
                             int sig = WTERMSIG(status);
                             if (sig == SIGSEGV || sig == SIGABRT || sig == SIGBUS || 
                                 sig == SIGILL || sig == SIGFPE) {
+                                result_status = STATUS_CRASH;
                                 RR_INFO("Crash: Child variant %d crashed with signal %d", i, sig);
+                            } else {
+                                result_status = STATUS_OTHER_SIGNAL;
                             }
                         }
                         
                         /* 发送status（每个子进程一个） */
-                        rr_ipc_send_status(2);  // STATUS_AT_FORK_POINT = 2
+                        rr_ipc_send_status(result_status);
                     }
                     
                     RR_INFO("Batch fork completed");
@@ -455,9 +508,18 @@ int rr_fork_server_loop(void)
                             g_rr_framework->status_pipe_fd = -1;
                         }
                         
-                        /* 🔥 关键修复：重置 trace 文件指针到开头 */
-                        RR_INFO("Child: Resetting trace position to start");
-                        rr_reset_trace_position();
+                        /* 🔥 关键修复：子进程重新打开 trace 文件，确保独立的 offset */
+                        RR_INFO("Child: Re-opening trace file for independent offset");
+                        if (g_trace_file) {
+                            fclose(g_trace_file);
+                            g_trace_file = NULL;
+                        }
+                        if (g_rr_trace_path) {
+                            rr_start_replay(g_rr_trace_path);
+                        } else {
+                            RR_ERROR("Child: No trace path available to re-open!");
+                            rr_reset_trace_position();
+                        }
                         
                         /* 🔥 P0修复：重置replay_index到0 */
                         RR_INFO("Child: Resetting replay_index to 0");
@@ -572,8 +634,17 @@ int rr_fork_server_loop(void)
                         if (WIFEXITED(status)) {
                             int exit_code = WEXITSTATUS(status);
                             RR_VERBOSE("Child exited normally with code %d", exit_code);
-                            // 发送AT_FORK_POINT表示父进程ready，而不是发送NORMAL_EXIT
-                            rr_ipc_send_status(2); // 2 = AT_FORK_POINT (parent ready for next round)
+                            
+                            // ✅ 关键修复：检测 QEMU 的退出码 (128 + 信号量)
+                            // 某些情况下 QEMU 会捕获信号并以 128+sig 退出
+                            if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
+                                int sig = exit_code - 128;
+                                RR_INFO("Crash Found: Child exited with crash-like code %d (Signal %d)", exit_code, sig);
+                                rr_ipc_send_status(4); // STATUS_CRASH
+                            } else {
+                                // 发送AT_FORK_POINT表示父进程ready，而不是发送NORMAL_EXIT
+                                rr_ipc_send_status(2); // 2 = AT_FORK_POINT
+                            }
                             
                         } else if (WIFSIGNALED(status)) {
                             int sig = WTERMSIG(status);
@@ -970,20 +1041,37 @@ int rr_fork_server_loop(void)
                         if (child_pids[i] > 0) {
                             waitpid(child_pids[i], &status, 0);
                             
-                            // 分析child的退出状态
+                            // 分析child的退出状态并提取详细信息
                             int result_status = STATUS_NORMAL_EXIT;
+                            int exit_code = 0;
+                            int signal_number = 0;
+                            
                             if (WIFEXITED(status)) {
-                                result_status = STATUS_NORMAL_EXIT;
-                            } else if (WIFSIGNALED(status)) {
-                                int sig = WTERMSIG(status);
-                                if (sig == SIGSEGV || sig == SIGABRT || sig == SIGILL) {
+                                exit_code = WEXITSTATUS(status);
+                                if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
                                     result_status = STATUS_CRASH;
+                                    RR_INFO("Crash: Child %d exited with code %d", i, exit_code);
+                                } else {
+                                    result_status = STATUS_NORMAL_EXIT;
+                                }
+                            } else if (WIFSIGNALED(status)) {
+                                signal_number = WTERMSIG(status);
+                                if (signal_number == SIGSEGV || signal_number == SIGABRT || 
+                                    signal_number == SIGILL || signal_number == SIGBUS || signal_number == SIGFPE) {
+                                    result_status = STATUS_CRASH;
+                                    RR_INFO("Crash: Child %d crashed with signal %d", i, signal_number);
                                 } else {
                                     result_status = STATUS_OTHER_SIGNAL;
                                 }
                             }
                             
-                            rr_ipc_send_status(result_status);
+                            // ✅ 发送完整的崩溃信息（包含exit_code和signal）
+                            if (result_status == STATUS_CRASH) {
+                                rr_ipc_send_crash_status(result_status, exit_code, signal_number);
+                            } else {
+                                rr_ipc_send_status(result_status);
+                            }
+                            
                             RR_INFO("  Child %d (PID=%d) finished: status=%d", i, child_pids[i], result_status);
                         }
                     }

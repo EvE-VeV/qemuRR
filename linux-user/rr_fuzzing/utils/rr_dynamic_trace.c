@@ -21,6 +21,18 @@
 int g_dynamic_trace_pipe_fd = -1;  // 改为非static，让其他文件可以访问
 bool g_dynamic_trace_enabled = false;  // 改为非static，让其他文件可以访问
 
+/**
+ * @brief 初始化动态追踪系统
+ * 
+ * 建立与 Python 端 (Tree Visualizer) 的通信管道。
+ * 
+ * **特性**:
+ * 1. 自动调整管道缓冲区大小至 1MB (防止高频消息阻塞)。
+ * 2. 设置 SIGPIPE 忽略 (防止 Reader 断开导致进程退出)。
+ * 3. 发送 INIT 握手消息。
+ * 
+ * @param write_fd 写入端的文件描述符
+ */
 void rr_dynamic_trace_init(int write_fd) {
     RR_INFO("=== Dynamic Trace Init START ===");
     RR_INFO("  write_fd = %d", write_fd);
@@ -131,6 +143,23 @@ static inline void send_trace_msg(rr_dynamic_trace_msg_t *msg) {
     }
 }
 
+/**
+ * @brief 发送系统调用进入事件
+ * 
+ * 当 QEMU 即将执行系统调用时调用。
+ * 
+ * **发送数据**:
+ * - Syscall Number & Name
+ * - Arguments (Raw values)
+ * - Trace Index (关联到 trace 文件)
+ * - Fuzzing Status (是否被变异)
+ * 
+ * @param env CPU 环境
+ * @param num 系统调用号
+ * @param args 参数数组
+ * @param trace_index Trace 中的索引
+ * @param is_fuzzed 是否被 Fuzz Engine 修改过
+ */
 void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
                                      uint32_t trace_index, uint8_t is_fuzzed) {
     if (!g_dynamic_trace_enabled) {
@@ -279,6 +308,15 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
     send_trace_msg(&msg);
 }
 
+/**
+ * @brief 发送 Fork 事件
+ * 
+ * 当 Fork Server 创建新进程时调用，用于构建进程树可视化。
+ * 
+ * @param parent_pid 父进程 PID
+ * @param child_pid 子进程 PID
+ * @param fork_syscall_index 触发 Fork 的系统调用索引
+ */
 void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t fork_syscall_index) {
     if (!g_dynamic_trace_enabled) {
         /* fprintf(stderr, "[RR-DYNAMIC-TRACE] ⚠️  FORK message NOT sent: dynamic trace disabled\\n\"); */

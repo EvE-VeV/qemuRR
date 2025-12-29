@@ -98,7 +98,37 @@ void rr_record_dispose(syscall_record_t *record)
 }
 
 /**
- * 开始记录到文件
+ * @brief 初始化 Record 模式并打开 trace 文件用于记录系统调用
+ * 
+ * 该函数是 RR-Fuzz Record 模式的入口点，负责：
+ * 1. 打开二进制 trace 文件（.dat 格式）
+ * 2. 写入 trace 文件头（包含 magic 和 version）
+ * 3. 初始化 Basic Block (BB) trace 子系统
+ * 
+ * **Trace 文件格式**:
+ * ```
+ * Header: [magic=0x52525254 ("RRTR")][version=1][record_count (placeholder)]
+ * Body:   [syscall_record_1][syscall_record_2]...[syscall_record_N]
+ * ```
+ * 
+ * @param trace_file Trace 文件路径。如果为 NULL，使用默认文件名 "rr_trace.dat"
+ * 
+ * @return int
+ *         - 0: 初始化成功，trace 文件已打开并写入文件头
+ *         - -1: 初始化失败（文件无法打开）
+ * 
+ * @note 该函数只应被调用一次（在 rr_framework_init 中）
+ * @note Trace 文件使用二进制格式，不兼容文本编辑器直接查看
+ * @note record_count 在文件头中是占位符，会在 rr_stop_recording() 时更新为实际值
+ * @note BB trace 初始化失败不会导致整体失败，只会记录警告
+ * 
+ * @warning 如果文件已存在会被覆盖（"wb" 模式）
+ * @warning 必须确保在程序退出前调用 rr_stop_recording() 以正确更新文件头
+ * 
+ * @see rr_stop_recording() 对应的停止函数，会更新 record_count 并关闭文件
+ * @see rr_record_syscall() 每个系统调用都会调用该函数写入 trace
+ * @see rr_bb_trace_init() BB trace 子系统初始化
+ * @see g_trace_file 全局 trace 文件句柄
  */
 int rr_start_recording(const char *trace_file)
 {
@@ -274,8 +304,43 @@ static bool syscall_creates_fd(int syscall_nr, abi_long ret)
 }
 
 /**
- * 使用 aux_data 系统捕获参数数据 (EnvFuzz风格)
- * 自动智能捕获，无需配置
+ * @brief 使用 aux_data 系统智能捕获系统调用参数数据 (EnvFuzz 风格)
+ * 
+ * 这是推荐的参数捕获方式，会根据系统调用类型自动捕获关键数据并存储为 aux_data 链表。
+ * 相比传统的 capture_syscall_args()，这种方式更灵活，支持外部文件存储大数据，
+ * 并且包含智能阈值控制避免捕获过大的数据。
+ * 
+ * **捕获策略 (按优先级)**:
+ * 1. **非确定性数据** (必须捕获): getrandom (关键！)
+ * 2. **I/O 数据**: read/write (有大小限制，受 rr_aux_should_record 控制)
+ * 3. **内存管理**: mmap/brk/munmap/mprotect (记录地址和参数)
+ * 4. **进程管理**: fork/clone (记录返回的 PID)
+ * 5. **网络数据**: recv/send 系列 (有大小限制)
+ * 6. **ioctl**: 根据 cmd 判断是否捕获输出缓冲区
+ * 
+ * **aux_data 类型**:
+ * - AUX_BUFFER: 字节数组（如 read/write 的缓冲区）
+ * - AUX_STRUCT: 结构体（如 mmap_info, mm_params）
+ * - AUX_SCALAR: 标量值（如 brk 的返回地址）
+ * 
+ * @param env CPU 架构状态指针（用于读取 guest 内存）
+ * @param syscall_nr 系统调用编号
+ * @param args 系统调用参数数组（8个参数）
+ * @param ret 系统调用返回值
+ * @param record 系统调用记录结构体，捕获的 aux_data 会添加到 record->aux_data 链表
+ * 
+ * @note 会自动设置 record->has_aux_data = true 如果捕获了任何数据
+ * @note 使用智能阈值: <= 4KB 总是捕获, 4KB-64KB 部分捕获, > 64KB 跳过
+ * @note getrandom 数据无论大小都会被捕获（确定性重放的关键）
+ * 
+ * @warning ⚠️ 如果同时启用 use_legacy_capture，会与 capture_syscall_args() 产生重复捕获
+ * @warning Output syscalls (write/send) 的数据在 replay 时不会被使用（需要真实执行）
+ * 
+ * @see rr_aux_create() 创建 aux_data 节点
+ * @see rr_aux_append() 添加 aux_data 到链表
+ * @see rr_aux_should_record() 判断数据是否应该被记录的策略
+ * @see rr_capture_buffer() 从 guest 内存读取缓冲区
+ * @see rr_record_syscall() 调用此函数的位置
  */
 static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
                                     const abi_long *args, abi_long ret, syscall_record_t *record)
@@ -1311,7 +1376,55 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 }
 
 /**
- * 记录系统调用
+ * @brief 记录单个系统调用到 trace 文件
+ * 
+ * 这是 Record 模式下的核心函数，负责捕获系统调用的完整信息并序列化到 trace 文件。
+ * 每次 guest 程序执行系统调用后，该函数都会被 rr_syscall_post_hook() 调用一次。
+ * 
+ * **记录内容**:
+ * 1. 基本信息: syscall号、参数、返回值、索引
+ * 2. FD 信息: 是否创建/使用文件描述符
+ * 3. 参数数据: 对于 I/O 系统调用，捕获缓冲区内容
+ * 4. Aux data: EnvFuzz 风格的辅助数据（推荐）
+ * 
+ * **捕获策略**:
+ * - 默认使用 aux_data 系统 (capture_syscall_args_aux)
+ * - 如果 use_legacy_capture=true，则同时使用传统方式
+ * - ⚠️ 双重捕获问题: 同时启用两种方式会导致内存浪费
+ * 
+ * **文件写入格式** (二进制):
+ * ```
+ * [index:uint32][syscall_nr:int32][args:8*abi_long][retval:abi_long]
+ * [arg_sizes:8*size_t][creates_fd:bool][uses_fd:bool][created_fd:int32]
+ * [arg_data_entries...][end_marker:-1]
+ * [aux_data_magic:0x41555844][aux_data_entries...]
+ * ```
+ * 
+ * @param env CPU 架构状态指针（用于读取 guest 内存）
+ * @param num 系统调用编号
+ * @param args 系统调用参数数组（8个参数）
+ * @param ret 系统调用返回值
+ * 
+ * @return int
+ *         - 0: 记录成功
+ *         - -1: 记录失败（trace 文件未打开或写入错误）
+ * 
+ * @note 会自动更新 g_rr_framework->trace_length
+ * @note 每 100 条记录会执行一次 fflush() 以减少 I/O 开销
+ * @note 创建的 syscall_record_t 会被添加到全局链表 (trace_head/trace_tail)
+ * 
+ * @warning 🔥 已知问题: 如果 use_legacy_capture=true，会发生双重捕获
+ *          - capture_syscall_args() 会调用 rr_promote_arg_to_aux() 创建 aux_data
+ *          - capture_syscall_args_aux() 再次捕获相同数据
+ *          - 结果: aux_data 链表中有重复条目，浪费内存和磁盘空间
+ * @warning 不应在 record 阶段添加 FD 映射（由 rr_syscall_post_hook 统一处理）
+ * 
+ * @see rr_start_recording() 必须先调用该函数打开 trace 文件
+ * @see rr_syscall_post_hook() 调用此函数的位置
+ * @see capture_syscall_args() 传统参数捕获方式
+ * @see capture_syscall_args_aux() 推荐的 aux_data 捕获方式
+ * @see syscall_creates_fd() 判断系统调用是否创建 FD
+ * @see g_trace_file 全局 trace 文件句柄
  */
 int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long ret)
 {

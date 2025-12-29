@@ -18,6 +18,10 @@
 #include "signal-common.h"
 #include "loader.h"
 #include "user-mmap.h"
+
+/* RR-Fuzz: Universal Range Filtering Declaration */
+extern void rr_set_target_range(uint64_t start, uint64_t end);
+
 #include "disas/disas.h"
 #include "qemu/bitops.h"
 #include "qemu/path.h"
@@ -1885,6 +1889,12 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
 #endif
 
     load_elf_image(bprm->filename, &bprm->src, info, &ehdr, &elf_interpreter);
+
+    /* RR-Fuzz: Universal Automatic Range Filtering */
+    /* Capture the main binary's code range immediately after loading */
+    {
+        rr_set_target_range(info->start_code, info->end_code);
+    }
 
     /* Do this so that we can load the interpreter, if need be.  We will
        change some of these later */

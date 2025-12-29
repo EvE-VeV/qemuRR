@@ -155,8 +155,27 @@ static int create_shared_memory(const char *shm_name)
     return 0;
 }
 
+/* ================= 目标范围过滤 ================= */
+
+static uint64_t g_target_start = 0;
+static uint64_t g_target_end = 0;
+static bool g_range_set = false;
+
 /* ================= 核心函数实现 ================= */
 
+/**
+ * @brief 初始化覆盖率追踪系统
+ * 
+ * 分配覆盖率上下文，并建立与 Python 端共享的 Bitmap 内存区域。
+ * 
+ * **共享内存策略**:
+ * 1. **Global Mode** (推荐): 即使环境变量 `RR_COVERAGE_SHM` 设置了名称，主要用于 AFL++ 等外部 Fuzzer 集成。
+ * 2. **Per-Process Mode**: 使用 PID 后缀，用于多进程隔离 Fuzzing。
+ * 3. **File-Backed Mode**: 使用文件映射，用于调试。
+ * 
+ * @param shm_name 共享内存名称 (可选，默认为 RR_COVERAGE_SHM_NAME)
+ * @return int 0 成功，-1 失败
+ */
 int rr_coverage_init(const char *shm_name)
 {
     if (g_coverage) {
@@ -240,6 +259,20 @@ void rr_coverage_cleanup(void)
     RR_INFO("Coverage tracking cleanup completed");
 }
 
+/**
+ * @brief 记录一条执行边 (AFL Style)
+ * 
+ * 这是插桩代码调用的热点函数 (Hot Path)。
+ * 使用经典的 AFL 算法计算边的哈希并更新 Bitmap。
+ * 
+ * **算法**:
+ * `idx = (prev_pc >> 1) ^ cur_pc`
+ * 
+ * - `prev_pc >> 1`: 区分 A->B 和 B->A 的方向性
+ * - `^ cur_pc`: 组合源和目的地址
+ * 
+ * @param cur_pc 当前基本块的地址
+ */
 void rr_coverage_trace_edge(uint64_t cur_pc)
 {
     if (!rr_coverage_is_enabled()) {
@@ -355,4 +388,22 @@ void rr_coverage_copy_map(uint8_t *dest)
 bool rr_coverage_is_enabled_check(void)
 {
     return g_coverage && g_coverage->enabled && g_coverage->coverage_map;
+}
+
+void rr_set_target_range(uint64_t start, uint64_t end)
+{
+    g_target_start = start;
+    g_target_end = end;
+    g_range_set = true;
+    fprintf(stderr, "[RR-Fuzz] Target Range Set: 0x%lx - 0x%lx\n", start, end);
+}
+
+bool rr_in_target_range(uint64_t pc)
+{
+    if (!g_range_set) {
+        // Strict Mode: Deny everything until target range is explicitly set.
+        // This prevents instrumenting ld.so or other early setup code.
+        return false;
+    }
+    return (pc >= g_target_start && pc < g_target_end);
 }
