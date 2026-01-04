@@ -1,5 +1,5 @@
 /**
- * RR-Fuzz分级调试系统实现
+ * RR-Fuzz Layered Debug System Implementation
  */
 
 #ifndef RR_DEBUG
@@ -10,14 +10,14 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* 全局调试配置 */
+/* Global debug configuration */
 rr_debug_config_t g_rr_debug = {
-    .level = RR_DEBUG_INFO,          // 默认级别：基本信息
-    .log_file = NULL                 // 默认输出到stderr
+    .level = RR_DEBUG_INFO,          // Default level: INFO
+    .log_file = NULL                 // Default output: stderr
 };
 
 /**
- * 调试级别名称映射
+ * Debug level name mapping
  */
 static const char *debug_level_names[] = {
     [RR_DEBUG_OFF] = "OFF",
@@ -29,7 +29,7 @@ static const char *debug_level_names[] = {
 };
 
 /**
- * 获取调试级别名称
+ * Returns the debug level name.
  */
 const char *rr_debug_level_name(rr_debug_level_t level)
 {
@@ -40,7 +40,7 @@ const char *rr_debug_level_name(rr_debug_level_t level)
 }
 
 /**
- * 解析调试级别字符串
+ * Parses the debug level string.
  */
 static rr_debug_level_t parse_debug_level(const char *level_str)
 {
@@ -62,11 +62,11 @@ static rr_debug_level_t parse_debug_level(const char *level_str)
         return RR_DEBUG_TRACE;
     }
 
-    return RR_DEBUG_INFO; // 默认级别
+    return RR_DEBUG_INFO; // Default level
 }
 
 /**
- * 解析布尔值字符串
+ * Parses a boolean value string.
  */
 __attribute__((unused))
 static bool parse_bool(const char *str, bool default_val)
@@ -87,18 +87,18 @@ static bool parse_bool(const char *str, bool default_val)
 }
 
 /**
- * 初始化调试系统
+ * Initializes the debug system.
  */
 void rr_debug_init(void)
 {
-    /* 从环境变量读取调试配置 */
+    /* Read debug configuration from environment variables */
     const char *debug_level = getenv("RR_DEBUG_LEVEL");
     const char *debug_file = getenv("RR_DEBUG_FILE");
 
-    /* 设置调试级别 */
+    /* Set debug level */
     g_rr_debug.level = parse_debug_level(debug_level);
 
-    /* 设置日志文件 */
+    /* Set log file */
     if (debug_file && strcmp(debug_file, "stderr") != 0 && strcmp(debug_file, "") != 0) {
         FILE *log_file = fopen(debug_file, "a");
         if (log_file) {
@@ -110,7 +110,7 @@ void rr_debug_init(void)
         }
     }
 
-    /* 输出初始化信息 */
+    /* Output initialization info */
     fprintf(stderr, "[RR-INFO] Debug system initialized:\n");
     fprintf(stderr, "  Level: %s (%d)\n", rr_debug_level_name(g_rr_debug.level), g_rr_debug.level);
     fprintf(stderr, "  Log file: %s\n", g_rr_debug.log_file ? debug_file : "stderr");
@@ -118,7 +118,7 @@ void rr_debug_init(void)
 }
 
 /**
- * 设置调试级别
+ * Sets the debug level.
  */
 void rr_debug_set_level(rr_debug_level_t level)
 {
@@ -131,7 +131,7 @@ void rr_debug_set_level(rr_debug_level_t level)
 }
 
 /**
- * 设置日志输出文件
+ * Sets the log output file.
  */
 void rr_debug_set_output(FILE *file)
 {
@@ -143,7 +143,7 @@ void rr_debug_set_output(FILE *file)
 }
 
 /**
- * 清理调试系统
+ * Cleans up the debug system.
  */
 void rr_debug_cleanup(void)
 {

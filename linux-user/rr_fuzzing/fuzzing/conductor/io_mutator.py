@@ -42,12 +42,11 @@ class IOReturnValueMutator:
         ]
 
         # 典型的返回值策略
-        # ✅ 2025-11-17: 增强 buffer_overflow 策略以更容易触发 crash
         self.return_value_strategies = {
             'boundary': [0, 1, 2, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256],
             'powers_of_2': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
             'incremental': list(range(0, 100, 5)),  # 0, 5, 10, 15, ..., 95
-            # ⭐ 增强: 更激进的 overflow 值，包括边界附近和远超边界的值
+            # Aggressive overflow values including boundary-adjacent and large offsets
             'buffer_overflow': [
                 # 接近32字节边界
                 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
@@ -71,7 +70,7 @@ class IOReturnValueMutator:
         """
         io_syscalls = []
 
-        # 🔥 修复：Trace对象没有直接的syscalls属性，需要解析trace文件
+        # Parse trace file to retrieve syscall sequence
         try:
             import sys
             from pathlib import Path
@@ -84,17 +83,17 @@ class IOReturnValueMutator:
                 return io_syscalls
 
             for idx, syscall in enumerate(analyzer.syscalls):
-                # 🔥 SyscallRecord是对象，使用属性访问
+                # Access record attributes
                 syscall_name = getattr(syscall, 'name', '')
                 if syscall_name in self.io_syscall_names:
                     retval = getattr(syscall, 'retval', 0)
 
-                    # ✅ 2025-11-17: 过滤掉不太可能是用户输入的read()
+                    # Filter read() calls that are likely not user inputs
                     # 启发式规则：
                     # 1. 跳过返回值很大的read (>200字节) - 可能是读文件
                     # 2. 优先选择靠后的read - 用户输入通常在初始化之后
                     if syscall_name == 'read' and retval > 200:
-                        print(f"[IOReturnValueMutator] ⏭️  Skipping read @{idx} (retval={retval} > 200, likely file read)")
+                        print(f"[IOReturnValueMutator] Skipping read @{idx} (retval={retval} > 200, likely file read)")
                         continue
 
                     io_syscalls.append({
@@ -105,7 +104,7 @@ class IOReturnValueMutator:
                     })
 
         except Exception as e:
-            print(f"[IOReturnValueMutator] ⚠️  Error parsing trace: {e}")
+            print(f"[IOReturnValueMutator] Error parsing trace: {e}")
 
         return io_syscalls
 
@@ -220,7 +219,7 @@ class IOReturnValueMutator:
         Returns:
             排序后的变异列表
         """
-        # ✅ 修复 2025-11-18: 使用多样化策略，确保测试各种大小的值
+        # Employ diverse strategies for testing various return value sizes
         #
         # 策略：将mutations分组，每组随机选择，确保覆盖所有范围
         #

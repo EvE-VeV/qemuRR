@@ -1,12 +1,12 @@
 /**
- * RR-Fuzz Phase 1: aux_data 变异引擎
+ * RR-Fuzz Phase 1: aux_data Mutation Engine
  * 
- * 实现对 aux_data 的各种变异策略，用于 Pure Replay + Fuzzing 集成
+ * Implements various mutation strategies for aux_data used in Pure Replay + Fuzzing integration.
  * 
- * 设计理念：
- * 1. 在 Pure Replay 成功后，对 aux_data 进行变异
- * 2. 变异后重新应用到 guest 内存，实现确定性 Fuzzing
- * 3. 支持多种变异策略，覆盖不同的测试场景
+ * Design Concept:
+ * 1. Mutate aux_data after successful Pure Replay.
+ * 2. Re-apply mutated data back to guest memory for deterministic Fuzzing.
+ * 3. Support multiple mutation strategies to cover various test scenarios.
  */
 
 #include "../../core/rr_framework.h"
@@ -16,11 +16,11 @@
 #include <string.h>
 #include <time.h>
 
-/* ==================== 外部变量 ==================== */
+/* External Variables */
 
-// Fuzz 指令（来自 rr_fuzz_engine.c）
-
-// Fuzz 统计（来自 rr_fuzz_engine.c）
+// Fuzz Instructions (from rr_fuzz_engine.c)
+ 
+// Fuzz Statistics (from rr_fuzz_engine.c)
 typedef struct {
     uint64_t total_mutations;
     uint64_t arg_mutations;
@@ -30,10 +30,10 @@ typedef struct {
 
 extern fuzz_stats_t g_fuzz_stats;
 
-/* ==================== 辅助函数 ==================== */
+/* Helper Functions */
 
 /**
- * 生成随机字节
+ * Generate a random byte.
  */
 static uint8_t random_byte(void) {
     static bool initialized = false;
@@ -45,9 +45,9 @@ static uint8_t random_byte(void) {
 }
 
 /**
- * 查找指定 arg_mask 的 aux_data
+ * Find aux_data for a specific arg_mask.
  * 
- * arg_mask 是参数索引的位掩码（例如 arg_mask=1 表示 arg[0]）
+ * arg_mask is a bitmask of the argument index (e.g., arg_mask=1 for arg[0]).
  */
 static rr_aux_data_t *find_aux_data_by_arg_mask(rr_aux_data_t *head, uint8_t target_mask) {
     rr_aux_data_t *current = head;
@@ -60,32 +60,32 @@ static rr_aux_data_t *find_aux_data_by_arg_mask(rr_aux_data_t *head, uint8_t tar
     return NULL;
 }
 
-/* ==================== 变异策略实现 ==================== */
+/* Mutation Strategy Implementation */
 
 /**
- * 策略 1: 变异 aux_data 缓冲区
+ * Strategy 1: Mutate aux_data buffer.
  * 
- * 直接替换 aux_data 中的数据
+ * Directly replaces the data in aux_data.
  */
 static void mutate_aux_buffer(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     if (!aux || !aux->data) {
         return;
     }
     
-    // 限制变异长度，不超过 aux 的实际大小
+    // Limit mutation length, do not exceed the actual boundary of aux_data
     uint32_t copy_len = (instr->data_len < aux->size) ? instr->data_len : aux->size;
     
-    // 复制变异数据
+    // Copy mutation data
     memcpy(aux->data, instr->data, copy_len);
     
-    RR_INFO("🔧 FUZZ_AUX: Mutated buffer, copied %u/%u bytes", copy_len, aux->size);
+    RR_INFO("FUZZ_AUX: Mutated buffer, copied %u/%u bytes", copy_len, aux->size);
     g_fuzz_stats.buffer_mutations++;
 }
 
 /**
- * 策略 2: 位翻转
+ * Strategy 2: Bit Flipping.
  * 
- * 随机翻转 aux_data 中的某些位
+ * Randomly flips bits in the aux_data buffer.
  */
 static void flip_bits(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     if (!aux || !aux->data || aux->size == 0) {
@@ -94,31 +94,31 @@ static void flip_bits(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     
     uint32_t flip_count = 0;
     
-    // 从 instr->data[0] 读取翻转概率（0-100）
+    // Read flipping probability (0-100) from instr->data[0]
     uint32_t flip_prob = (instr->data_len > 0) ? instr->data[0] : 1;
     if (flip_prob == 0) flip_prob = 1;
     if (flip_prob > 100) flip_prob = 100;
     
-    // 遍历每个字节
+    // Traverse each byte
     for (uint32_t i = 0; i < aux->size; i++) {
-        // 根据概率决定是否翻转
+        // Decide whether to flip based on probability
         if ((rand() % 100) < flip_prob) {
-            // 随机选择一个位进行翻转
+            // Randomly select a bit to flip
             int bit = rand() % 8;
             aux->data[i] ^= (1 << bit);
             flip_count++;
         }
     }
     
-    RR_INFO("🔧 FUZZ_AUX: Flipped %u bits (prob=%u%%, size=%u)", 
+    RR_INFO("FUZZ_AUX: Flipped %u bits (prob=%u%%, size=%u)", 
             flip_count, flip_prob, aux->size);
     g_fuzz_stats.arg_mutations++;
 }
 
 /**
- * 策略 3: 截断数据
+ * Strategy 3: Truncate Data.
  * 
- * 减少 aux_data 的大小
+ * Reduces the size of aux_data.
  */
 static void truncate_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     if (!aux || !aux->data || aux->size == 0) {
@@ -127,28 +127,28 @@ static void truncate_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     
     __attribute__((unused)) uint32_t old_size = aux->size;
     
-    // 从 instr->data[0] 读取截断比例（如果没有，默认减半）
+    // Read truncation ratio from instr->data[0]; defaults to halving if not specified.
     if (instr->data_len > 0 && instr->data[0] > 0 && instr->data[0] < 100) {
-        // data[0] 表示保留的百分比
+        // data[0] represents the percentage to keep
         aux->size = (aux->size * instr->data[0]) / 100;
     } else {
-        // 默认减半
+        // Default to halving
         aux->size = aux->size / 2;
     }
     
-    // 至少保留 1 字节
+    // Maintain at least 1 byte
     if (aux->size == 0) {
         aux->size = 1;
     }
     
-    RR_INFO("🔧 FUZZ_AUX: Truncated %u → %u bytes", old_size, aux->size);
+    RR_INFO("FUZZ_AUX: Truncated %u → %u bytes", old_size, aux->size);
     g_fuzz_stats.boundary_tests++;
 }
 
 /**
- * 策略 4: 扩展数据
+ * Strategy 4: Extend Data.
  * 
- * 增加 aux_data 的大小（填充随机数据或零）
+ * Increases the size of aux_data (padded with zeros or random data).
  */
 static void extend_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     if (!aux || !aux->data) {
@@ -158,112 +158,113 @@ static void extend_data(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     __attribute__((unused)) uint32_t old_size = aux->size;
     uint32_t new_size;
     
-    // 🔥 修复：从 instr->data 读取绝对扩展字节数（不是倍数！）
+    // Read absolute extension byte count from instr->data (not a multiplier!)
     uint32_t extend_by;
     if (instr->data_len >= 4) {
-        // Python端用struct.pack('I', extend_by)发送4字节的绝对值
+        // Python side sends 4-byte absolute value via struct.pack('I', extend_by)
         memcpy(&extend_by, instr->data, 4);
     } else {
-        // 回退到默认值
+        // Fallback default
         extend_by = 64;
     }
 
     new_size = aux->size + extend_by;
 
-    // 🔥 提高最大大小限制以支持缓冲区溢出测试（1024 字节）
+    // Boost max size limit to support buffer overflow tests (1024 bytes)
     if (new_size > 1024) {
         new_size = 1024;
     }
     
-    // 如果没有增长，跳过
+    // Skip if no growth
     if (new_size <= aux->size) {
         RR_VERBOSE("FUZZ_AUX: Extend skipped (already max size)");
         return;
     }
     
-    // 重新分配内存
+    // Reallocate memory
     uint8_t *new_data = g_malloc(new_size);
     memcpy(new_data, aux->data, old_size);
     
-    // 填充方式：从 instr->data[1] 读取（0=零，1=随机）
+    // Fill mode: read from instr->data[1] (0=zeros, 1=random)
     uint8_t fill_mode = (instr->data_len > 1) ? instr->data[1] : 0;
     if (fill_mode == 1) {
-        // 填充随机数据
+        // Fill with random bytes
         for (uint32_t i = old_size; i < new_size; i++) {
             new_data[i] = random_byte();
         }
     } else {
-        // 填充零
+        // Fill with zeros
         memset(new_data + old_size, 0, new_size - old_size);
     }
     
-    // 替换原数据
+    // Replace original data
     g_free(aux->data);
     aux->data = new_data;
     aux->size = new_size;
     
-    RR_INFO("🔧 FUZZ_AUX: Extended %u → %u bytes (fill_mode=%u)", 
+    RR_INFO("FUZZ_AUX: Extended %u → %u bytes (fill_mode=%u)", 
             old_size, new_size, fill_mode);
     g_fuzz_stats.boundary_tests++;
 }
 
 /**
- * Phase 1 策略: 轻量级变异
+ * Phase 1 Strategy: Lightweight Mutation
  * 
- * 只翻转 1-2 个 bit，最小化破坏性
- * 适用于初期 Fuzzing，避免程序立即崩溃
+ * Flips only 1-2 bits to minimize destructiveness.
+ * Suitable for early phase Fuzzing to avoid immediate crashes.
  */
 static void mutate_light(rr_aux_data_t *aux, const FuzzInstruction *instr) {
     if (!aux || !aux->data || aux->size == 0) {
         return;
     }
     
-    // 默认只翻转 1 个 bit
+    // Default: flip only 1 bit
     uint32_t flip_count = 1;
     
-    // 如果指令提供了数据，第一个字节指定翻转数量（1-3）
+    // If instruction provides data, the first byte specifies the number of flips (1-3)
     if (instr->data_len > 0 && instr->data[0] > 0) {
         flip_count = (instr->data[0] % 3) + 1;  // 1-3 bits
     }
     
-    // 翻转指定数量的 bit
+    // Flip the specified number of bits
     for (uint32_t i = 0; i < flip_count; i++) {
-        // 随机选择一个字节
+        // Randomly select a byte
         uint32_t byte_idx = rand() % aux->size;
-        // 随机选择一个 bit
+        // Randomly select a bit
         uint8_t bit_idx = rand() % 8;
-        // 翻转
+        // Flip
         aux->data[byte_idx] ^= (1 << bit_idx);
     }
     
-    RR_INFO("🔧 FUZZ_AUX: Light mutation - flipped %u bits in %u bytes", 
+    RR_INFO("FUZZ_AUX: Light mutation - flipped %u bits in %u bytes", 
             flip_count, aux->size);
     g_fuzz_stats.arg_mutations++;
 }
 
 /**
- * 策略 5: 特殊值注入
+ * Strategy 5: Interesting Values Injection.
  * 
- * 注入特定的"有趣"值，如边界值、魔数等
+ * Injects specific "interesting" values like boundary values, magic numbers, etc.
  */
 /**
- * @brief 策略 5: 特殊值注入 (Vulnerability Patterns)
+ * @brief Strategy 5: Interesting Values Injection (Vulnerability Patterns)
  * 
- * 根据系统调用的类型，智能注入已知漏洞模式的 Payload。
- * 这是发现特定类型漏洞（如格式化字符串、命令注入、缓冲区溢出）的关键策略。
+ * Intelligently injects known vulnerability payloads based on syscall type.
+ * This is a critical strategy for discovering specific types of flaws: 
+ * format strings, command injection, and buffer overflows.
  * 
- * **支持的模式**:
- * - `getrandom`: 全0/全1/重复模式 (测试弱随机数)
+ * **Supported Patterns**:
+ * - `getrandom`: All-zeros/all-ones/repeating patterns (tests for weak RNG)
  * - `read/recv*`:
  *    - Format String: `%s%n`, `%p`
- *    - Buffer Overflow: 长字符串 ('A' * N)
+ *    - Buffer Overflow: Long strings ('A' * N)
  *    - Integer Overflow: MAX_INT, 0xFFFFFFFF
  *    - Command Injection: `$(id)`
  *    - Path Traversal: `../../etc/passwd`
  * 
- * @param aux 目标 aux_data
- * @param instr 变异指令
- * @param syscall_nr 系统调用号
+ * @param aux Target aux_data
+ * @param instr Mutation instruction
+ * @param syscall_nr Syscall number
  */
 static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction *instr,
                                       int syscall_nr) {
@@ -271,18 +272,18 @@ static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction 
         return;
     }
     
-    // 根据系统调用类型注入不同的特殊值
+    // Inject different values based on syscall type
     switch (syscall_nr) {
         case TARGET_NR_getrandom: {
-            /* 随机数特殊值：全零、全 1、重复模式 */
+            /* Random data variants: all zeros, all ones, repeating patterns */
             if (instr->data_len > 0) {
                 uint8_t pattern = instr->data[0];
                 memset(aux->data, pattern, aux->size);
-                RR_INFO("🔧 FUZZ_AUX: Injected pattern 0x%02x (getrandom)", pattern);
+                RR_INFO("FUZZ_AUX: Injected pattern 0x%02x (getrandom)", pattern);
             } else {
-                // 默认：全零
+                // Default: all zeros
                 memset(aux->data, 0x00, aux->size);
-                RR_INFO("🔧 FUZZ_AUX: Injected all zeros (getrandom)");
+                RR_INFO("FUZZ_AUX: Injected all zeros (getrandom)");
             }
             break;
         }
@@ -298,121 +299,122 @@ static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction 
         case TARGET_NR_recvfrom:
 #endif
         {
-            /* 🎯 增强：支持多种漏洞模式的特殊值注入 */
+            /* Targeted: Support for various vulnerability pattern injections */
             if (instr->data_len > 0) {
-                uint8_t pattern_type = instr->data[0] % 8;  // 8种模式
+                uint8_t pattern_type = instr->data[0] % 8;  // 8 modes
 
                 switch (pattern_type) {
                     case 0: {
-                        // 格式化字符串攻击
+                        // Format string attack
                         const char *fmt_patterns[] = {"%s%s%s%n", "%p%p%p", "%x%x%x"};
                         const char *pattern = fmt_patterns[instr->data[1] % 3];
                         size_t pattern_len = strlen(pattern);
                         size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
                         memcpy(aux->data, pattern, copy_len);
-                        RR_INFO("🔧 FUZZ_AUX: Injected format string pattern");
+                        RR_INFO("FUZZ_AUX: Injected format string pattern");
                         break;
                     }
                     case 1: {
-                        // 缓冲区溢出模式 (重复字符)
+                        // Buffer overflow pattern (repeating character)
                         uint8_t overflow_char = (instr->data_len > 1) ? instr->data[1] : 0x41;  // 'A'
                         memset(aux->data, overflow_char, aux->size);
-                        RR_INFO("🔧 FUZZ_AUX: Injected overflow pattern (0x%02x)", overflow_char);
+                        RR_INFO("FUZZ_AUX: Injected overflow pattern (0x%02x)", overflow_char);
                         break;
                     }
                     case 2: {
-                        // NULL字节注入
+                        // NULL byte injection
                         memset(aux->data, 0x00, aux->size);
-                        RR_INFO("🔧 FUZZ_AUX: Injected NULL bytes");
+                        RR_INFO("FUZZ_AUX: Injected NULL bytes");
                         break;
                     }
                     case 3: {
-                        // 高位字节测试
+                        // High-byte verification
                         memset(aux->data, 0xFF, aux->size);
-                        RR_INFO("🔧 FUZZ_AUX: Injected high bytes (0xFF)");
+                        RR_INFO("FUZZ_AUX: Injected high bytes (0xFF)");
                         break;
                     }
                     case 4: {
-                        // 整数边界值
+                        // Integer boundary values
                         if (aux->size >= 4) {
                             uint32_t boundary_vals[] = {0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF};
                             uint32_t val = boundary_vals[(instr->data[1] % 5)];
                             memcpy(aux->data, &val, 4);
-                            RR_INFO("🔧 FUZZ_AUX: Injected boundary value 0x%08x", val);
+                            RR_INFO("FUZZ_AUX: Injected boundary value 0x%08x", val);
                         }
                         break;
                     }
                     case 5: {
-                        // 路径遍历注入
+                        // Path traversal injection
                         const char *path_pattern = "/../../../etc/passwd";
                         size_t pattern_len = strlen(path_pattern);
                         size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
                         memcpy(aux->data, path_pattern, copy_len);
-                        RR_INFO("🔧 FUZZ_AUX: Injected path traversal");
+                        RR_INFO("FUZZ_AUX: Injected path traversal");
                         break;
                     }
                     case 6: {
-                        // 命令注入模式
+                        // Command injection pattern
                         const char *cmd_pattern = "$(id)";
                         size_t pattern_len = strlen(cmd_pattern);
                         size_t copy_len = (pattern_len < aux->size) ? pattern_len : aux->size;
                         memcpy(aux->data, cmd_pattern, copy_len);
-                        RR_INFO("🔧 FUZZ_AUX: Injected command injection");
+                        RR_INFO("FUZZ_AUX: Injected command injection");
                         break;
                     }
                     default: {
-                        // 通用魔数注入
+                        // Generic magic byte injection
                         if (instr->data_len >= 4) {
                             memcpy(aux->data, instr->data + 1, (instr->data_len - 1 < aux->size) ? instr->data_len - 1 : aux->size);
-                            RR_INFO("🔧 FUZZ_AUX: Injected custom magic bytes");
+                            RR_INFO("FUZZ_AUX: Injected custom magic bytes");
                         } else {
                             memset(aux->data, 0xFF, aux->size);
-                            RR_INFO("🔧 FUZZ_AUX: Injected default 0xFF pattern");
+                            RR_INFO("FUZZ_AUX: Injected default 0xFF pattern");
                         }
                         break;
                     }
                 }
             } else {
-                // 回退到原有逻辑
+                // Fallback to original logic
                 memset(aux->data, 0xFF, aux->size);
-                RR_INFO("🔧 FUZZ_AUX: Injected 0xFF pattern (fallback)");
+                RR_INFO("FUZZ_AUX: Injected 0xFF pattern (fallback)");
             }
             break;
         }
         
         default:
-            // 其他系统调用：注入 0xFF 模式
+            // Other syscalls: Inject 0xFF pattern
             memset(aux->data, 0xFF, aux->size);
-            RR_INFO("🔧 FUZZ_AUX: Injected 0xFF pattern (default)");
+            RR_INFO("FUZZ_AUX: Injected 0xFF pattern (default)");
             break;
     }
     
     g_fuzz_stats.arg_mutations++;
 }
 
-/* ==================== 主函数 ==================== */
+/* Main Functions */
 
 /**
- * 变异 aux_data 中的数据
+ * Mutate data in aux_data.
  * 
- * 此函数遍历所有 Fuzz 指令，对匹配的 aux_data 进行变异
+ * This function traverses all Fuzz instructions and mutates the matching aux_data.
  */
 /**
- * @brief 执行 Aux Data 变异 (入口函数)
+ * @brief Execute Aux Data Mutation (Entry Function).
  * 
- * 在 Replay 过程中，当遇到带有 aux_data 的系统调用（如 read/getrandom）时被调用。
- * 遍历当前的 Fuzz 指令，如果找到针对该 syscall 的 aux 变异指令，则修改 aux_data 的内容。
+ * Called during replay when a system call with aux_data (e.g., read/getrandom) is encountered.
+ * Traverses current Fuzz instructions; if an aux mutation instruction for the syscall is found,
+ * it modifies the content of the aux_data.
  * 
- * **流程**:
- * 1. 检查是否在 Fuzzing 模式且有指令。
- * 2. 遍历指令集，匹配 syscall_index。
- * 3. 查找对应的 aux_data 节点 (基于 arg_index)。
- * 4. 调用具体的变异策略函数 (`mutate_aux_buffer`, `flip_bits`, `extend_data` 等)。
+ * **Workflow**:
+ * 1. Check if in Fuzzing mode and whether instructions exist.
+ * 2. Traverse instructions, matching by syscall_index.
+ * 3. Locate the corresponding aux_data node (based on arg_index).
+ * 4. Invoke the specific mutation strategy function (e.g., mutate_aux_buffer, flip_bits, extend_data).
  * 
- * @param env CPU 环境
- * @param record syscall 记录
- * @param args 参数
- * @param syscall_nr 系统调用号
+ * @param env CPU environment
+ * @param record syscall record
+ * @param args arguments
+ * @param syscall_nr syscall number
  */
 void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
                               abi_long *args, int syscall_nr) {
@@ -444,7 +446,7 @@ void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
             continue;
         }
         
-        // 查找对应的 aux_data（将 arg_index 转为 arg_mask）
+        // Locate the corresponding aux_data (convert arg_index to arg_mask)
         uint8_t arg_mask = (1 << instr->arg_index);
         rr_aux_data_t *aux = find_aux_data_by_arg_mask(record->aux_data, arg_mask);
         if (!aux) {

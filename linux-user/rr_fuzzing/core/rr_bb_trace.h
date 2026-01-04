@@ -1,12 +1,12 @@
 /**
  * RR-Fuzz Basic Block Trace Module
  * 
- * 用于记录程序执行时的基本块(BB)轨迹
+ * Records the Basic Block (BB) trace during program execution.
  * 
- * 设计目标：
- * 1. 高效记录每个翻译块(TB)的PC地址
- * 2. 与syscall trace关联，提供精确的执行序列
- * 3. 支持离线静态分析（angr CFG匹配）
+ * Design Goals:
+ * 1. Efficiently record the PC address of each Translation Block (TB).
+ * 2. Associate BB trace with the syscall trace for accurate execution sequencing.
+ * 3. Support offline static analysis (e.g., angr CFG matching).
  */
 
 #ifndef RR_BB_TRACE_H
@@ -15,101 +15,101 @@
 #include "qemu/osdep.h"
 #include "user/abitypes.h"
 
-/* ================= 配置常量 ================= */
+/* Configuration Constants */
 
-#define RR_BB_TRACE_BUFFER_SIZE (1024 * 1024)  // 1MB缓冲区
-#define RR_BB_TRACE_SUFFIX ".bbl"              // BB trace文件后缀
+#define RR_BB_TRACE_BUFFER_SIZE (1024 * 1024)  // 1MB buffer
+#define RR_BB_TRACE_SUFFIX ".bbl"              // BB trace file suffix
 
-/* ================= 数据结构 ================= */
+/* Data Structures */
 
 /**
- * BB Trace记录项
- * 每个TB执行时记录一条
+ * BB Trace Entry
+ * One entry recorded for each TB execution.
  */
 typedef struct {
-    uint64_t pc;           // 程序计数器（TB起始地址）
-    uint32_t syscall_idx;  // 关联的syscall索引（0表示syscall前，N表示第N个syscall后）
-    uint32_t flags;        // 保留标志位
+    uint64_t pc;           // Program Counter (TB start address)
+    uint32_t syscall_idx;  // Associated syscall index (0: pre-syscall, N: after Nth syscall)
+    uint32_t flags;        // Reserved flags
 } rr_bb_entry_t;
 
 /**
- * BB Trace上下文
+ * BB Trace Context
  */
 typedef struct {
-    bool enabled;                          // 是否启用BB跟踪
-    char *trace_file;                      // BB trace文件路径
-    int fd;                                // 文件描述符
+    bool enabled;                          // Whether BB tracing is enabled
+    char *trace_file;                      // Path to BB trace file
+    int fd;                                // File descriptor
     
-    /* 缓冲区 */
-    rr_bb_entry_t *buffer;                 // 内存缓冲区
-    size_t buffer_size;                    // 缓冲区大小（条目数）
-    size_t buffer_pos;                     // 当前缓冲区位置
+    /* Buffer */
+    rr_bb_entry_t *buffer;                 // Memory buffer
+    size_t buffer_size;                    // Buffer size (number of entries)
+    size_t buffer_pos;                     // Current buffer position
     
-    /* 统计信息 */
-    uint64_t total_bbs;                    // 总BB数
-    uint64_t total_flushes;                // 总刷新次数
-    uint32_t current_syscall_idx;          // 当前syscall索引
+    /* Statistics */
+    uint64_t total_bbs;                    // Total BBs
+    uint64_t total_flushes;                // Total flushes
+    uint32_t current_syscall_idx;          // Current syscall index
     
-    /* 地址过滤（只记录主程序BB） */
-    bool filter_enabled;                   // 是否启用地址过滤
-    uint64_t main_start;                   // 主程序起始地址
-    uint64_t main_end;                     // 主程序结束地址
-    uint64_t filtered_bbs;                 // 被过滤的BB数（统计）
+    /* Address Filtering (Only record main program BBs) */
+    bool filter_enabled;                   // Whether address filtering is enabled
+    uint64_t main_start;                   // Start address of main program
+    uint64_t main_end;                     // End address of main program
+    uint64_t filtered_bbs;                 // Number of filtered BBs (stats)
 } rr_bb_trace_t;
 
-/* ================= 全局变量 ================= */
+/* Global Variables */
 
 extern rr_bb_trace_t *g_bb_trace;
 
-/* ================= 核心函数 ================= */
+/* Core Functions */
 
 /**
- * 初始化BB trace模块
+ * Initialize BB trace module.
  * 
- * @param trace_file syscall trace文件路径（将自动添加.bbl后缀）
- * @return 0成功，-1失败
+ * @param trace_file Path to syscall trace file (.bbl suffix will be added).
+ * @return 0 on success, -1 on failure.
  */
 int rr_bb_trace_init(const char *trace_file);
 
 /**
- * 清理BB trace模块
+ * Cleanup BB trace module.
  */
 void rr_bb_trace_cleanup(void);
 
 /**
- * 记录一个基本块执行
+ * Log a basic block execution.
  * 
- * 这是最核心的函数，会在每个TB执行时被调用
+ * Core function called during each TB execution.
  * 
- * @param pc 程序计数器（TB起始地址）
+ * @param pc Program Counter (TB start address).
  */
 void rr_bb_trace_log(uint64_t pc);
 
 /**
- * 刷新缓冲区到磁盘
+ * Flush buffer to disk.
  */
 void rr_bb_trace_flush(void);
 
 /**
- * 更新当前syscall索引
+ * Update current syscall index.
  * 
- * 每当一个syscall被记录时，rr_record模块应调用此函数
+ * Should be called by the rr_record module whenever a syscall is recorded.
  * 
- * @param syscall_idx syscall索引
+ * @param syscall_idx Syscall index.
  */
 void rr_bb_trace_update_syscall_idx(uint32_t syscall_idx);
 
 /**
- * 启用/禁用BB跟踪
+ * Enable/Disable BB tracking.
  * 
- * @param enabled 是否启用
+ * @param enabled Whether to enable.
  */
 void rr_bb_trace_set_enabled(bool enabled);
 
 /**
- * 检查BB跟踪是否启用（内联版本）
+ * Check if BB tracking is enabled (inline version).
  * 
- * @return true启用，false禁用
+ * @return true if enabled, false otherwise.
  */
 static inline bool rr_bb_trace_is_enabled(void)
 {
@@ -117,37 +117,37 @@ static inline bool rr_bb_trace_is_enabled(void)
 }
 
 /**
- * 检查BB跟踪是否启用（非内联版本，供cpu-exec.c使用）
+ * Check if BB tracking is enabled (non-inline version, for cpu-exec.c).
  * 
- * @return true启用，false禁用
+ * @return true if enabled, false otherwise.
  */
 bool rr_bb_trace_is_enabled_check(void);
 
 /**
- * 获取BB trace统计信息
+ * Get BB trace statistics.
  * 
- * @param total_bbs 输出：总BB数
- * @param total_flushes 输出：总刷新次数
+ * @param total_bbs Output: Total BBs.
+ * @param total_flushes Output: Total flushes.
  */
 void rr_bb_trace_get_stats(uint64_t *total_bbs, uint64_t *total_flushes);
 
 /**
- * 打印BB trace统计信息
+ * Print BB trace statistics.
  */
 void rr_bb_trace_print_stats(void);
 
 /**
- * 设置主程序地址范围（用于过滤库函数BB）
+ * Set main program address range (for filtering library BBs).
  * 
- * @param start_code 主程序代码段起始地址
- * @param end_code 主程序代码段结束地址
+ * @param start_code Start address of main program code segment.
+ * @param end_code End address of main program code segment.
  */
 void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code);
 
 /**
- * 启用/禁用地址过滤
+ * Enable/Disable address filtering.
  * 
- * @param enabled 是否启用过滤
+ * @param enabled Whether to enable filtering.
  */
 void rr_bb_trace_set_filter(bool enabled);
 

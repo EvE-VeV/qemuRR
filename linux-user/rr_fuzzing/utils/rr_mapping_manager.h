@@ -1,5 +1,5 @@
 /**
- * 映射管理器 - 优化FD和地址映射的数据结构和算法
+ * Mapping Manager - Optimized data structures and algorithms for FD and address mapping.
  */
 
 #ifndef RR_MAPPING_MANAGER_H
@@ -9,12 +9,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ==================== FD映射管理 ==================== */
+/* ==================== FD Mapping Management ==================== */
 
 typedef struct rr_fd_mapping {
     int recorded_fd;
     int actual_fd;
-    uint64_t timestamp;  // 用于LRU淘汰
+    uint64_t timestamp;  // For LRU eviction
     struct rr_fd_mapping *next;
 } rr_fd_mapping_t;
 
@@ -25,7 +25,7 @@ typedef struct {
     uint64_t access_counter;
 } rr_fd_mapping_table_t;
 
-/* ==================== 地址映射管理 ==================== */
+/* ==================== Address Mapping Management ==================== */
 
 typedef struct rr_addr_mapping {
     target_ulong recorded_addr;
@@ -42,7 +42,7 @@ typedef struct {
     uint64_t access_counter;
 } rr_addr_mapping_table_t;
 
-/* ==================== 统计信息 ==================== */
+/* ==================== Statistics ==================== */
 
 typedef struct {
     uint64_t fd_lookups;
@@ -55,29 +55,29 @@ typedef struct {
     double avg_chain_length;
 } rr_mapping_stats_t;
 
-/* ==================== 公共接口 ==================== */
+/* ==================== Public Interface ==================== */
 
-/* 注意: 核心接口已在 rr_framework.h 中声明，此处仅声明扩展功能 */
+/* Note: Core interfaces are declared in rr_framework.h; only extensions here. */
 
-/* 扩展FD映射操作 */
+/* Extended FD mapping operations */
 bool rr_fd_mapping_exists(int recorded_fd);
 
-/* 扩展地址映射操作 */
+/* Extended address mapping operations */
 bool rr_addr_mapping_exists(target_ulong recorded_addr);
 
-/* 批量操作 */
+/* Batch operations */
 int rr_fd_mapping_add_batch(const int *recorded_fds, const int *actual_fds, size_t count);
 int rr_addr_mapping_add_batch(const target_ulong *recorded_addrs, 
                              const target_ulong *actual_addrs, 
                              const size_t *sizes, size_t count);
 
-/* 统计和调试 */
+/* Statistics and debugging */
 void rr_mapping_get_stats(rr_mapping_stats_t *stats);
 void rr_mapping_print_stats(void);
 void rr_mapping_reset_stats(void);
 
-/* 内存管理优化 */
-void rr_mapping_gc(void);  // 垃圾回收
-void rr_mapping_rehash(void);  // 重新哈希
+/* Memory management optimization */
+void rr_mapping_gc(void);  // Garbage collection
+void rr_mapping_rehash(void);  // Rehash functionality
 
 #endif /* RR_MAPPING_MANAGER_H */

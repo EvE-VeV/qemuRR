@@ -394,34 +394,67 @@ class CrashAnalyzer:
         """
         stats = self.get_statistics()
         
-        print(f"\n{'='*80}")
-        print(f"Crash Analysis Summary")
-        print(f"{'='*80}")
+        # print(f"\n{'='*80}")
+        # print(f"Crash Analysis Summary")
+        # print(f"{'='*80}")
         
-        print(f"\n📊 总体统计:")
-        print(f"  唯一crashes:    {stats['unique_crashes']}")
-        print(f"  总crashes:      {stats['total_crashes']}")
-        print(f"  去重率:         {stats['dedup_rate']:.1f}%")
+        print("-" * 70)
+        print(f"{'📊 Crash Analysis Report':^70}")
+        print("-" * 70)
         
-        print(f"\n🎯 优先级分布:")
-        for priority, count in stats['priority_distribution'].items():
-            pct = count / stats['unique_crashes'] * 100 if stats['unique_crashes'] > 0 else 0
-            print(f"  {priority:8s}: {count:3d} ({pct:5.1f}%)")
+        # Row 1: General & Signal
+        print(f" │ {'📉 Statistic Overview':<32} │ {'🔍 Top Signals':<32} │")
+        print(f" │ {'─'*32} │ {'─'*32} │")
         
-        print(f"\n💥 可利用性分布:")
-        for exploit, count in stats['exploitability_distribution'].items():
-            pct = count / stats['unique_crashes'] * 100 if stats['unique_crashes'] > 0 else 0
-            print(f"  {exploit:28s}: {count:3d} ({pct:5.1f}%)")
+        # General Stats
+        dedup_rate = f"{stats['dedup_rate']:.1f}%"
+        print(f" │ Unique Crashes: {stats['unique_crashes']:<16} │ {self._fmt_signal(stats, 0):<30} │")
+        print(f" │ Total Crashes : {stats['total_crashes']:<16} │ {self._fmt_signal(stats, 1):<30} │")
+        print(f" │ Dedup Rate    : {dedup_rate:<16} │ {self._fmt_signal(stats, 2):<30} │")
+        print(" " + "─"*70)
         
-        print(f"\n🔍 信号分布:")
-        for signal, count in sorted(stats['signal_distribution'].items(), 
-                                    key=lambda x: x[1], reverse=True)[:5]:
-            print(f"  {signal:12s}: {count:3d}")
+        # Row 2: Distributions
+        print(f" │ {'🎯 Priority Distribution':<32} │ {'💥 Exploitability':<32} │")
+        print(f" │ {'─'*32} │ {'─'*32} │")
+        
+        # Format Priority (Top 3)
+        p_keys = list(stats['priority_distribution'].keys())
+        e_keys = list(stats['exploitability_distribution'].keys())
+        
+        for i in range(max(len(p_keys), len(e_keys), 3)):
+            if i >= 3: break # Limit to 3 rows
+            
+            p_str = ""
+            if i < len(p_keys):
+                k = p_keys[i]
+                v = stats['priority_distribution'][k]
+                pct = v / stats['unique_crashes'] * 100 if stats['unique_crashes'] > 0 else 0
+                p_str = f"{k:<6}: {v} ({pct:.0f}%)"
+            
+            e_str = ""
+            if i < len(e_keys):
+                k = e_keys[i]
+                v = stats['exploitability_distribution'][k]
+                pct = v / stats['unique_crashes'] * 100 if stats['unique_crashes'] > 0 else 0
+                # Abbreviate long names
+                short_k = k.replace('PROBABLY_', 'P.').replace('EXPLOITABLE', 'EXP')
+                e_str = f"{short_k:<12}: {v} ({pct:.0f}%)"
+                
+            print(f" │ {p_str:<32} │ {e_str:<32} │")
+            
+        print("-" * 70)
+
+    def _fmt_signal(self, stats, idx):
+        sorted_sigs = sorted(stats['signal_distribution'].items(), key=lambda x: x[1], reverse=True)
+        if idx < len(sorted_sigs):
+            sig, count = sorted_sigs[idx]
+            return f"{sig}: {count}"
+        return ""
         
         if stats['unique_crashes'] > 0:
             print(f"\n🏆 Top {min(top_n, stats['unique_crashes'])} Unique Crashes:")
             print(f"{'#':<4} {'Priority':<8} {'Exploit':<28} {'Signal':<10} {'PC':>18} {'Count':>6}")
-            print("-"*80)
+            print("-" * 60)
             
             for i, crash_data in enumerate(self.get_unique_crashes()[:top_n], 1):
                 info = crash_data['info']
@@ -441,7 +474,7 @@ class CrashAnalyzer:
                         print(f"     Backtrace: {info['backtrace'][:2]}")
                     print()
         
-        print(f"{'='*80}\n")
+        # print(f"{'='*80}\n")
     
     def export_to_file(self, output_file: Path, format: str = 'json'):
         """

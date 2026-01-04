@@ -11,14 +11,14 @@
 #include <fcntl.h>
 #include <errno.h>
 
-/* ================= 全局变量 ================= */
+/* ================= Global Variables ================= */
 
 rr_bb_trace_t *g_bb_trace = NULL;
 
-/* ================= 内部辅助函数 ================= */
+/* ================= Internal Helper Functions ================= */
 
 /**
- * 构造BB trace文件路径
+ * Constructs the BB trace file path.
  */
 static char *construct_bb_trace_path(const char *trace_file)
 {
@@ -37,7 +37,7 @@ static char *construct_bb_trace_path(const char *trace_file)
     return bb_path;
 }
 
-/* ================= 核心函数实现 ================= */
+/* ================= Core Function Implementation ================= */
 
 int rr_bb_trace_init(const char *trace_file)
 {
@@ -46,14 +46,14 @@ int rr_bb_trace_init(const char *trace_file)
         return -1;
     }
     
-    /* 分配上下文 */
+    /* Allocate context */
     g_bb_trace = calloc(1, sizeof(rr_bb_trace_t));
     if (!g_bb_trace) {
         RR_ERROR("Failed to allocate BB trace context");
         return -1;
     }
     
-    /* 构造BB trace文件路径 */
+    /* Construct BB trace file path */
     g_bb_trace->trace_file = construct_bb_trace_path(trace_file);
     if (!g_bb_trace->trace_file) {
         free(g_bb_trace);
@@ -61,7 +61,7 @@ int rr_bb_trace_init(const char *trace_file)
         return -1;
     }
     
-    /* 打开文件 */
+    /* Open file */
     g_bb_trace->fd = open(g_bb_trace->trace_file, 
                           O_WRONLY | O_CREAT | O_TRUNC, 
                           0644);
@@ -74,7 +74,7 @@ int rr_bb_trace_init(const char *trace_file)
         return -1;
     }
     
-    /* 分配缓冲区 */
+    /* Allocate buffer */
     g_bb_trace->buffer_size = RR_BB_TRACE_BUFFER_SIZE / sizeof(rr_bb_entry_t);
     g_bb_trace->buffer = malloc(RR_BB_TRACE_BUFFER_SIZE);
     if (!g_bb_trace->buffer) {
@@ -86,7 +86,7 @@ int rr_bb_trace_init(const char *trace_file)
         return -1;
     }
     
-    /* 初始化状态 */
+    /* Initialize status */
     g_bb_trace->buffer_pos = 0;
     g_bb_trace->total_bbs = 0;
     g_bb_trace->total_flushes = 0;
@@ -105,20 +105,20 @@ void rr_bb_trace_cleanup(void)
         return;
     }
     
-    /* 刷新剩余数据 */
+    /* Flush remaining data */
     if (g_bb_trace->buffer_pos > 0) {
         rr_bb_trace_flush();
     }
     
-    /* 打印统计信息 */
+    /* Print statistics */
     rr_bb_trace_print_stats();
     
-    /* 关闭文件 */
+    /* Close file */
     if (g_bb_trace->fd >= 0) {
         close(g_bb_trace->fd);
     }
     
-    /* 释放资源 */
+    /* Free resources */
     if (g_bb_trace->buffer) {
         free(g_bb_trace->buffer);
     }
@@ -139,19 +139,17 @@ void rr_bb_trace_log(uint64_t pc)
     }
     
     if (g_bb_trace->filter_enabled) {
-        if (pc < g_bb_trace->main_start || pc >= g_bb_trace->main_end) {
-            /* 这是库函数BB，跳过 */
-            g_bb_trace->filtered_bbs++;
-            return;
-        }
+        /* Skip library function basic blocks */
+        g_bb_trace->filtered_bbs++;
+        return;
     }
     
-    /* 检查缓冲区是否已满 */
+    /* Check if buffer is full */
     if (g_bb_trace->buffer_pos >= g_bb_trace->buffer_size) {
         rr_bb_trace_flush();
     }
     
-    /* 记录BB */
+    /* Record basic block */
     rr_bb_entry_t *entry = &g_bb_trace->buffer[g_bb_trace->buffer_pos];
     entry->pc = pc;
     entry->syscall_idx = g_bb_trace->current_syscall_idx;
@@ -199,7 +197,7 @@ void rr_bb_trace_set_enabled(bool enabled)
     }
 }
 
-/* 非内联版本供cpu-exec.c使用 */
+/* Non-inline version for cpu-exec.c */
 bool rr_bb_trace_is_enabled_check(void)
 {
     return g_bb_trace && g_bb_trace->enabled;

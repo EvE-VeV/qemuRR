@@ -25,7 +25,7 @@ class TraceMetadata:
     exec_count: int = 0
     new_coverage_count: int = 0
 
-
+# Trace Object representing a recorded execution.
 @dataclass
 class Trace:
     """
@@ -53,7 +53,7 @@ class TraceManager:
     2. Track coverage information per trace
     3. Implement AFL-style energy-based selection
     4. Maintain active traces (high-energy subset)
-    5. 新增：收集syscall级别的执行统计
+        # 5. Collect syscall-level execution statistics
     
     Architecture: DETAILED_ARCHITECTURE.md Line 18-51
     """
@@ -76,11 +76,11 @@ class TraceManager:
         # Selection parameters
         self.exploit_probability = 0.8  # 80% exploit, 20% explore
         
-        # ✅ 新增：Syscall级别的执行统计
-        # 格式: {trace_id: {syscall_index: {exec_count, fork_count, mutations, ...}}}
+        # Syscall-level execution statistical tracking
+        # Format: {trace_id: {syscall_index: {exec_count, ...}}}
         self.syscall_stats: Dict[str, Dict[int, Dict]] = {}
         
-        # ✅ P0 FIX: 多样性追踪 - 记住上次选择的trace
+        # Diversity tracking state
         self._last_selected_id: Optional[str] = None
         
         # Add initial trace if provided
@@ -93,7 +93,7 @@ class TraceManager:
         metadata = TraceMetadata(
             creation_time=time.time(),
             parent_trace_id=None,
-            energy=3.0  # ✅ P0 FIX: 降低initial trace energy (10.0→3.0) 提高多样性
+            energy=3.0  # Normalized initial energy for diversity
         )
         
         trace = Trace(
@@ -156,25 +156,18 @@ class TraceManager:
     
     def select_trace(self) -> Optional[Trace]:
         """
-        ✅ 改进的trace选择策略 - 增加diversity，减少重复
+        Selects a trace from the pool based on energy and execution count.
         
-        Strategy:
-        - 60% probability: Select from active_traces (exploitation) - 降低从80%
-        - 40% probability: Select from entire trace_pool (exploration) - 提高从20%
-        - 使用更激进的权重衰减 (1.5→2.0)
-        - 添加多样性惩罚 (避免连续选择同一trace)
-        - 对新发现的trace给予更高权重
-        
-        Returns:
-            Trace: Selected trace or None if pool is empty
+        Uses an improved selection policy that balances exploration and exploitation 
+        while incorporating diversity metrics to avoid repeated selection of the same trace.
         """
         if not self.trace_pool:
             return None
         
-        # ✅ 改进1: 降低exploitation比例，提高exploration
-        exploit_prob = 0.60  # 从0.8降低到0.6
+        # Probability of selecting high-energy 'active' traces
+        exploit_prob = 0.60 
         
-        # Decide: Exploit or Explore
+        # Selection logic
         if random.random() < exploit_prob and self.active_traces:
             # Exploit: Select from high-energy traces
             pool = self.active_traces
@@ -184,27 +177,26 @@ class TraceManager:
             pool = self.trace_pool
             source = "all"
         
-        # ✅ 改进2: 更激进的权重衰减 + 多样性惩罚
+        # Weighted selection logic incorporating decay and diversity
         weights = []
         for trace in pool:
-            # 基础energy
+            # Base energy
             base_energy = trace.metadata.energy
             
-            # ✅ 对新trace给予3倍权重boost
+            # Priority boost for traces that recently discovered new coverage
             if trace.metadata.new_coverage_count > 0:
                 base_energy *= 3.0
             
-            # ✅ P0 FIX: 更激进的衰减：1.5 → 2.0
-            # 这样高exec_count的trace权重会快速下降
+            # Energy decay based on execution count to prevent over-fuzzing
             exec_penalty = (1 + trace.metadata.exec_count) ** 2.0
             
-            # ✅ P0 FIX: 多样性惩罚 - 避免连续选择同一个trace
+            # diversity penalty to avoid sticking to a single trace
             diversity_penalty = 1.0
             if trace.id == self._last_selected_id:
-                diversity_penalty = 0.1  # ✅ 加强惩罚: 0.3→0.1 (权重降到10%)
+                diversity_penalty = 0.1  # Significant penalty for repeat selection
             
             energy = (base_energy / exec_penalty) * diversity_penalty
-            weights.append(max(energy, 0.01))  # 确保最小权重
+            weights.append(max(energy, 0.01))  # Ensure minimum weight
         
         # Select trace
         if sum(weights) == 0:
@@ -216,7 +208,7 @@ class TraceManager:
         # Update exec count
         selected.metadata.exec_count += 1
         
-        # ✅ P0 FIX: 记住这次选择，用于下次的多样性惩罚
+        # Record selection for future diversity calculations
         self._last_selected_id = selected.id
         
         print(f"[TraceManager] Selected trace: {selected.id} from {source} pool "
@@ -265,11 +257,11 @@ class TraceManager:
     def record_execution(self, trace_id: str, trace_file: str, mutations: list, 
                          has_new_coverage: bool = False):
         """
-        ✅ P0 FIX: 记录一次trace执行（包括所有syscall的统计，不仅仅是被mutate的）
+        Record execution statistics for all syscalls in the given trace.
         
         Args:
             trace_id: Trace ID
-            trace_file: Trace文件路径（用于解析所有syscalls）
+            trace_file: Path to the trace file (used for parsing all syscalls)
             mutations: List of FuzzInstructions applied
             has_new_coverage: Whether new coverage was found
         """
@@ -277,8 +269,7 @@ class TraceManager:
         if trace_id not in self.syscall_stats:
             self.syscall_stats[trace_id] = {}
         
-        # ✅ NEW: 解析trace文件，获取所有syscalls
-        # 这样可以记录所有执行的syscalls，不仅仅是被mutate的
+        # Parse trace file to retrieve full syscall sequence
         try:
             import sys
             from pathlib import Path
@@ -289,7 +280,7 @@ class TraceManager:
             from trace_analyzer import TraceAnalyzer
             analyzer = TraceAnalyzer(trace_file)
             
-            # ✅ 记录所有syscalls的基础执行统计
+            # Collect basic execution counts for all syscalls
             for i, sc in enumerate(analyzer.syscalls):
                 if i not in self.syscall_stats[trace_id]:
                     self.syscall_stats[trace_id][i] = {
@@ -300,7 +291,7 @@ class TraceManager:
                         'arg_modifications': {},
                         'new_coverage': 0,
                         'syscall_name': sc.name,
-                        'syscall_nr': sc.syscall_nr  # ✅ FIX: 使用syscall_nr而不是nr
+                        'syscall_nr': sc.syscall_nr 
                     }
                 
                 # 增加执行计数（每个syscall都被记录）
@@ -310,7 +301,7 @@ class TraceManager:
             # 如果解析失败，回退到只记录mutations
             print(f"[TraceManager] ⚠️  Failed to parse trace for full stats: {e}")
         
-        # ✅ 更新受mutation影响的syscall统计（额外的mutation信息）
+        # Update statistics for syscalls influenced by mutations
         for mutation in mutations:
             syscall_idx = mutation.syscall_index
             
@@ -412,7 +403,6 @@ class TraceManager:
                     'exec_count': trace.metadata.exec_count,
                     'new_coverage_count': trace.metadata.new_coverage_count,
                     'coverage_info': self.coverage_map.get(trace.id, {}),
-                    # ✅ 保存syscall统计信息
                     'syscall_stats': self.syscall_stats.get(trace.id, {})
                 }, f, indent=2)
         

@@ -22,6 +22,9 @@
 /* RR-Fuzz: Universal Range Filtering Declaration */
 extern void rr_set_target_range(uint64_t start, uint64_t end);
 
+/* RR-Fuzz: TB Flush for coverage instrumentation */
+#include "exec/tb-flush.h"
+
 #include "disas/disas.h"
 #include "qemu/bitops.h"
 #include "qemu/path.h"
@@ -1894,6 +1897,9 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
     /* Capture the main binary's code range immediately after loading */
     {
         rr_set_target_range(info->start_code, info->end_code);
+        /* Note: Cannot call tb_flush here as it requires exclusive CPU context.
+         * The instrumentation in translator.c now filters at BOTH translation time
+         * AND runtime to handle this correctly. */
     }
 
     /* Do this so that we can load the interpreter, if need be.  We will

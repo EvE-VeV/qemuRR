@@ -154,11 +154,17 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     icount_start_insn = gen_tb_start(db, cflags);
     
 #ifdef CONFIG_USER_ONLY
-    /* RR-Fuzz: Instrument Basic Block for Coverage */
-    /* Universal Filter: Check if PC is within the loaded main binary range */
-    if (rr_in_target_range(pc)) {
-        gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
-    }
+    /* RR-Fuzz: Instrument Basic Block for Coverage
+     * 
+     * IMPORTANT: We ALWAYS insert the hook here (no compile-time filtering).
+     * The range check is performed at RUNTIME inside rr_coverage_trace_edge().
+     * 
+     * This is necessary because:
+     * 1. Target range is set AFTER ELF loading, by which time many TBs are already translated
+     * 2. We cannot call tb_flush during ELF loading (requires exclusive CPU context)
+     * 3. Runtime filtering has negligible overhead since the hook is a simple range check
+     */
+    gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
 #endif
 
     ops->tb_start(db, cpu);

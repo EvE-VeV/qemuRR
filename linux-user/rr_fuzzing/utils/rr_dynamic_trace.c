@@ -1,14 +1,14 @@
 /*
- * RR-Fuzz 动态跟踪实现
- * 实时向Python发送系统调用和Fork事件用于树可视化
+ * RR-Fuzz Dynamic Trace Implementation
+ * Sends real-time syscall and Fork events to Python for tree visualization.
  */
 
-/* 必须在include之前定义RR_DEBUG */
+/* RR_DEBUG must be defined before includes */
 #ifndef RR_DEBUG
 #define RR_DEBUG 1
 #endif
 
-#include "qemu/osdep.h"  // 必须首先include
+#include "qemu/osdep.h"  // Must be included first
 #include "rr_dynamic_trace.h"
 #include "../core/rr_framework.h"
 #include "rr_syscall_dispatch.h"  /* for rr_get_syscall_name_fast */
@@ -17,21 +17,21 @@
 #include <string.h>
 #include <unistd.h>
 
-/* 全局跟踪管道 */
-int g_dynamic_trace_pipe_fd = -1;  // 改为非static，让其他文件可以访问
-bool g_dynamic_trace_enabled = false;  // 改为非static，让其他文件可以访问
+/* Global trace pipe */
+int g_dynamic_trace_pipe_fd = -1;  // Visible to other files
+bool g_dynamic_trace_enabled = false;  // Visible to other files
 
 /**
- * @brief 初始化动态追踪系统
+ * @brief Initialize the dynamic trace system.
  * 
- * 建立与 Python 端 (Tree Visualizer) 的通信管道。
+ * Establishes a communication pipe with the Python side (Tree Visualizer).
  * 
- * **特性**:
- * 1. 自动调整管道缓冲区大小至 1MB (防止高频消息阻塞)。
- * 2. 设置 SIGPIPE 忽略 (防止 Reader 断开导致进程退出)。
- * 3. 发送 INIT 握手消息。
+ * **Features**:
+ * 1. Automatically adjusts pipe buffer size to 1MB to prevent blocking on high-frequency messages.
+ * 2. Sets SIGPIPE to be ignored to prevent process exit if the reader disconnects.
+ * 3. Sends an INIT handshake message.
  * 
- * @param write_fd 写入端的文件描述符
+ * @param write_fd File descriptor of the write end of the pipe.
  */
 void rr_dynamic_trace_init(int write_fd) {
     RR_INFO("=== Dynamic Trace Init START ===");
@@ -40,7 +40,7 @@ void rr_dynamic_trace_init(int write_fd) {
     g_dynamic_trace_pipe_fd = write_fd;
     g_dynamic_trace_enabled = (write_fd >= 0);
     
-    // 🔧 P0 修复：增加管道缓冲区到 1MB（从默认的 ~64KB）
+    // P0 Fix: Increase pipe buffer to 1MB (from default ~64KB)
     if (g_dynamic_trace_enabled) {
         int pipe_size = 1024 * 1024;  // 1MB
         if (fcntl(write_fd, F_SETPIPE_SZ, pipe_size) < 0) {
@@ -51,7 +51,7 @@ void rr_dynamic_trace_init(int write_fd) {
             RR_INFO("  Pipe buffer size: %d bytes (requested %d)", actual_size, pipe_size);
         }
         
-        // 🔧 P0 修复：忽略 SIGPIPE（防止 Visualizer 断开时进程被杀）
+        // P0 Fix: Ignore SIGPIPE (prevent process from being killed if Visualizer disconnects)
         signal(SIGPIPE, SIG_IGN);
         RR_INFO("  SIGPIPE handler set to SIG_IGN");
     }
@@ -59,7 +59,7 @@ void rr_dynamic_trace_init(int write_fd) {
     RR_INFO("  g_dynamic_trace_enabled = %d", g_dynamic_trace_enabled);
     
     if (g_dynamic_trace_enabled) {
-        /* 发送初始化消息 */
+        /* Send initialization message */
         rr_dynamic_trace_msg_t msg = {
             .type = RR_DYN_MSG_INIT,
             .pid = getpid(),
@@ -89,7 +89,7 @@ void rr_dynamic_trace_init(int write_fd) {
 void rr_dynamic_trace_cleanup(void) {
     if (!g_dynamic_trace_enabled) return;
     
-    /* 发送清理消息 */
+    /* Send cleanup message */
     rr_dynamic_trace_msg_t msg = {
         .type = RR_DYN_MSG_CLEANUP,
         .pid = getpid(),
@@ -117,26 +117,26 @@ static inline void send_trace_msg(rr_dynamic_trace_msg_t *msg) {
     errno = 0;
     ssize_t written = write(g_dynamic_trace_pipe_fd, msg, sizeof(rr_dynamic_trace_msg_t));
     if (written != sizeof(rr_dynamic_trace_msg_t)) {
-        // 🔧 P0 修复：不要永久禁用，根据错误类型处理
+        // P0 Fix: Handle error types instead of permanently disabling trace.
         if (written < 0) {
-            // write() 返回 -1，检查 errno
+            // write() returned -1, check errno
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // 管道满，丢弃这条消息（不禁用，继续尝试）
+                // Pipe full, drop this message (do not disable, continue trying)
                 RR_VERBOSE("Dynamic trace pipe full (EAGAIN), message dropped (type=%u)", msg->type);
             } else if (errno == EPIPE) {
-                // Visualizer 断开，禁用 trace
+                // Visualizer disconnected; disable trace.
                 RR_WARN("Dynamic trace pipe broken (EPIPE), disabling trace");
                 g_dynamic_trace_enabled = false;
             } else {
-                // 其他错误，记录但继续
+                // Other error; log and continue.
                 RR_WARN("Dynamic trace write failed: errno=%d (%s), continuing anyway", 
                         errno, strerror(errno));
             }
         } else {
-            // 部分写入（written > 0 但 < sizeof），这很罕见
+            // Partial write (written > 0 but < sizeof); rare for pipes.
             RR_WARN("Dynamic trace partial write: %zd/%zu bytes, message may be corrupted", 
                     written, sizeof(rr_dynamic_trace_msg_t));
-            // 不禁用，继续尝试
+            // Do not disable, continue trying
         }
     } else {
         RR_VERBOSE("send_trace_msg: wrote %zd bytes (type=%u)", written, msg->type);
@@ -144,21 +144,21 @@ static inline void send_trace_msg(rr_dynamic_trace_msg_t *msg) {
 }
 
 /**
- * @brief 发送系统调用进入事件
+ * @brief Send syscall entry event.
  * 
- * 当 QEMU 即将执行系统调用时调用。
+ * Called when QEMU is about to execute a syscall.
  * 
- * **发送数据**:
+ * **Sent Data**:
  * - Syscall Number & Name
  * - Arguments (Raw values)
- * - Trace Index (关联到 trace 文件)
- * - Fuzzing Status (是否被变异)
+ * - Trace Index (Associated with the trace file)
+ * - Fuzzing Status (Whether mutated)
  * 
- * @param env CPU 环境
- * @param num 系统调用号
- * @param args 参数数组
- * @param trace_index Trace 中的索引
- * @param is_fuzzed 是否被 Fuzz Engine 修改过
+ * @param env CPU environment
+ * @param num Syscall number
+ * @param args Argument array
+ * @param trace_index Index in the trace
+ * @param is_fuzzed Whether modified by the Fuzz Engine
  */
 void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
                                      uint32_t trace_index, uint8_t is_fuzzed) {
@@ -169,7 +169,7 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
     
     RR_VERBOSE("Dynamic trace syscall_enter: num=%d, index=%u", num, trace_index);
     
-    /* 显式初始化整个结构为0 */
+    /* Explicitly initialize entire structure to 0 */
     rr_dynamic_trace_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     
@@ -183,17 +183,17 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
     msg.syscall_info.is_entry = 1;
     msg.syscall_info.pid = getpid();
     
-    /* 复制参数 */
+    /* Copy arguments */
     if (args) {
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             msg.syscall_info.args[i] = args[i];
         }
     }
     
-    /* 获取系统调用名 - 先尝试从 dispatch，失败则用内置表 */
+    /* Get syscall name - try dispatch first, then built-in table on failure */
     const char *name = rr_get_syscall_name_fast(num);
     if (!name) {
-        /* 内置常用 syscall 名称表（与 rr_main.c 保持一致） */
+        /* Built-in common syscall name table (consistency with rr_main.c) */
         switch(num) {
             case 0: name = "read"; break;
             case 1: name = "write"; break;
@@ -231,7 +231,7 @@ void rr_dynamic_trace_syscall_enter(CPUArchState *env, int num, uint64_t *args,
         snprintf(msg.syscall_info.name, sizeof(msg.syscall_info.name), "syscall_%d", num);
     }
     
-    /* Debug: 验证消息数据 */
+    /* Debug: Validate message data */
     RR_INFO("ENTER msg: type=%u, pid=%u, index=%u, nr=%d, name='%s'",
             msg.type, msg.pid, msg.syscall_info.index, msg.syscall_info.syscall_nr, msg.syscall_info.name);
     
@@ -242,7 +242,7 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
                                     int32_t ret, uint32_t trace_index, uint8_t is_fuzzed) {
     if (!g_dynamic_trace_enabled) return;
     
-    /* 显式初始化整个结构为0 */
+    /* Explicitly initialize entire structure to 0 */
     rr_dynamic_trace_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     
@@ -257,17 +257,17 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
     msg.syscall_info.is_entry = 0;
     msg.syscall_info.pid = getpid();
     
-    /* 复制参数 */
+    /* Copy arguments */
     if (args) {
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             msg.syscall_info.args[i] = args[i];
         }
     }
     
-    /* 获取系统调用名 - 先尝试从 dispatch，失败则用内置表 */
+    /* Get syscall name - try dispatch first, then built-in table on failure */
     const char *name = rr_get_syscall_name_fast(num);
     if (!name) {
-        /* 内置常用 syscall 名称表（与 syscall_enter 保持一致） */
+        /* Built-in common syscall name table (consistency with syscall_enter) */
         switch(num) {
             case 0: name = "read"; break;
             case 1: name = "write"; break;
@@ -309,13 +309,13 @@ void rr_dynamic_trace_syscall_exit(CPUArchState *env, int num, uint64_t *args,
 }
 
 /**
- * @brief 发送 Fork 事件
+ * @brief Send Fork event.
  * 
- * 当 Fork Server 创建新进程时调用，用于构建进程树可视化。
+ * Called when Fork Server creates a new process for process tree visualization.
  * 
- * @param parent_pid 父进程 PID
- * @param child_pid 子进程 PID
- * @param fork_syscall_index 触发 Fork 的系统调用索引
+ * @param parent_pid Parent process PID
+ * @param child_pid Child process PID
+ * @param fork_syscall_index Syscall index triggering the Fork
  */
 void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t fork_syscall_index) {
     if (!g_dynamic_trace_enabled) {
@@ -339,7 +339,7 @@ void rr_dynamic_trace_fork(uint32_t parent_pid, uint32_t child_pid, uint32_t for
     RR_VERBOSE("Dynamic trace: fork %u -> %u @ syscall[%u]", parent_pid, child_pid, fork_syscall_index);
 }
 
-/* ✅ 新增：发送iteration开始事件 */
+/* Send iteration start event */
 void rr_dynamic_trace_iteration(uint32_t iteration_id, uint32_t pid) {
     if (!g_dynamic_trace_enabled) return;
     
@@ -349,7 +349,7 @@ void rr_dynamic_trace_iteration(uint32_t iteration_id, uint32_t pid) {
         .parent_pid = 0
     };
     
-    /* 使用syscall_info.index来传递iteration_id */
+    /* Use syscall_info.index to pass iteration_id */
     msg.syscall_info.index = iteration_id;
     
     send_trace_msg(&msg);
@@ -383,9 +383,8 @@ void rr_dynamic_trace_exit(uint32_t pid, int exit_code) {
     send_trace_msg(&msg);
 }
 
-/* 在fork子进程中重新启用dynamic trace
- * fork()后子进程继承父进程的FD，所以trace pipe FD仍然有效
- * 只需要确保g_dynamic_trace_enabled=true
+/* Re-enable dynamic trace in forked child
+ * Child process inherits pipe FD; ensure g_dynamic_trace_enabled is true.
  */
 void rr_dynamic_trace_enable_in_child(void) {
     RR_INFO("[CHILD-TRACE] enable_in_child called: PID=%d, current_fd=%d, current_enabled=%d", 

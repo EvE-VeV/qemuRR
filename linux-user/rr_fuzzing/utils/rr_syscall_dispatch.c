@@ -1,6 +1,6 @@
 /**
- * 系统调用分发优化实现
- * 使用函数指针表和哈希表优化系统调用处理性能
+ * Syscall Dispatch Optimization Implementation
+ * Uses function pointer tables and hash tables to optimize syscall processing performance.
  */
 
 #include "rr_syscall_dispatch.h"
@@ -10,22 +10,22 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
-/* ==================== 具体的处理函数实现 ==================== */
+/* ==================== Concrete Handler Implementations ==================== */
 
-/* ==================== 具体的处理函数实现 ==================== */
+/* ==================== Concrete Handler Implementations ==================== */
 
 /**
- * @brief 文件 I/O 类系统调用的参数应用函数
+ * @brief Argument application function for file I/O syscalls.
  * 
- * 在重放 (Replay) 模式下，将 trace 记录中的参数值应用到当前的系统调用参数中。
- * 主要处理：
+ * In Replay mode, applies argument values from the trace record to the current syscall arguments.
+ * Handles:
  * - openat/open: flags, mode
  * - read/write: count
  * - pread64: count, offset
  * - ioctl: request
  * 
- * @param record Trace 记录
- * @param args 当前系统调用的参数数组 (将被修改)
+ * @param record Trace record
+ * @param args Current syscall argument array (modified in-place).
  */
 static void apply_file_io_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
@@ -51,15 +51,15 @@ static void apply_file_io_args(rr_strace_record_t *record, abi_long *args) {
 }
 
 /**
- * @brief 文件 I/O 类系统调用的 FD 映射应用
+ * @brief FD mapping application for file I/O syscalls.
  * 
- * 将参数中的 recorded_fd 替换为 actual_fd。
- * 适用于：read, write, close, fstat, ioctl, getdents64 等。
+ * Replaces `recorded_fd` in arguments with `actual_fd`.
+ * Applicable to: read, write, close, fstat, ioctl, getdents64, etc.
  * 
- * @param syscall_name 系统调用名称
- * @param args 系统调用参数数组 (args[0] 通常是 fd，将被修改)
+ * @param syscall_name Syscall name
+ * @param args Syscall argument array (args[0] is typically the fd; modified in-place).
  * 
- * @note 对于 openat/newfstatat，args[0] 是 dirfd，也需要映射 (除非是 AT_FDCWD)
+ * @note For openat/newfstatat, args[0] is dirfd and also requires mapping (unless AT_FDCWD).
  */
 static void apply_file_io_fd_mapping(const char *syscall_name, abi_long *args) {
     if (strcmp(syscall_name, "read") == 0 || 
@@ -80,34 +80,30 @@ static void apply_file_io_fd_mapping(const char *syscall_name, abi_long *args) {
 }
 
 /**
- * @brief 文件 I/O 类系统调用的 Post Hook
+ * @brief Post Hook for file I/O syscalls.
  * 
- * 在系统调用执行后调用，主要用于**建立和维护 FD 映射**。
+ * Called after syscall execution to establish and maintain FD mappings.
  * 
- * - open/openat/dup: 成功后建立 recorded_fd -> actual_fd 的映射
- * - close: 成功后移除映射
+ * - open/openat/dup: Establish recorded_fd -> actual_fd mapping on success.
+ * - close: Remove mapping on success.
  * 
- * @param record Trace 记录 (包含 recorded_fd / ret_value)
- * @param ret 实际返回值 (actual_fd)
- * @param args 系统调用参数
+ * @param record Trace record (contains recorded_fd / ret_value).
+ * @param ret Actual return value (actual_fd).
+ * @param args Syscall arguments.
  */
 static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
     
-    // openat/open 成功后，建立FD映射: recorded_fd → actual_fd
-    if ((strcmp(record->syscall_name, "openat") == 0 || 
-         strcmp(record->syscall_name, "open") == 0) && ret >= 0) {
-        
-        abi_long recorded_fd = record->ret_value;  // trace中的FD值
-        abi_long actual_fd = ret;                   // 真实返回的FD值
-        
-        // ✅ 建立映射: recorded_fd → actual_fd
+    if ((strcmp(record->syscall_name, "open") == 0 || strcmp(record->syscall_name, "openat") == 0) && ret >= 0) {
+        abi_long recorded_fd = record->ret_value;
+        abi_long actual_fd = ret;
+        // Establish mapping: recorded_fd → actual_fd
         rr_fd_mapping_add(recorded_fd, actual_fd);
         
         fprintf(stderr, "[FD-MAPPING] %s: recorded_fd=%ld -> actual_fd=%ld\n", 
                 record->syscall_name, (long)recorded_fd, (long)actual_fd);
-    } 
-    // dup/dup2 也需要处理
+    }
+    // Handle dup/dup2 as well
     else if (strcmp(record->syscall_name, "dup") == 0 && ret >= 0) {
         abi_long recorded_fd = record->ret_value;
         abi_long actual_fd = ret;
@@ -115,7 +111,7 @@ static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
         fprintf(stderr, "[FD-MAPPING] dup: recorded_fd=%ld -> actual_fd=%ld\n", 
                 (long)recorded_fd, (long)actual_fd);
     }
-    // close 时移除映射
+    // Remove mapping on close
     else if (strcmp(record->syscall_name, "close") == 0 && ret == 0) {
         abi_long recorded_fd = record->args[0].value;
         rr_fd_mapping_remove((int)recorded_fd);
@@ -124,22 +120,22 @@ static void file_io_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
 }
 
 /**
- * @brief 内存管理类系统调用的参数应用
+ * @brief Argument application for memory management syscalls.
  * 
- * 处理 mmap, munmap, mprotect, brk 等。
- * 关键功能是**应用地址映射**: 将 trace 中的 recorded_addr 转换为 actual_addr。
+ * Handles mmap, munmap, mprotect, brk, etc.
+ * Key function is applying address mapping: Converting recorded_addr from trace to actual_addr.
  * 
- * @param record Trace 记录
- * @param args 系统调用参数数组 (地址参数 args[0] 将被修改)
+ * @param record Trace record.
+ * @param args Syscall argument array (address parameter args[0] modified in-place).
  * 
- * @note mmap 的 args[0] 是建议地址，通常被视为 hint
- * @note munmap/mprotect 的 args[0] 是必须精确匹配的地址
+ * @note mmap's args[0] is a suggested address (hint).
+ * @note munmap/mprotect's args[0] must be an exact match.
  */
 static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
     if (strcmp(record->syscall_name, "mmap") == 0) {
-        // ✅ 修复：应用地址映射
+        // Apply address mapping
         if (record->arg_count > 0) {
             target_ulong recorded_addr = (target_ulong)record->args[0].value;
             target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
@@ -150,21 +146,21 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
                         (unsigned long)recorded_addr, (unsigned long)mapped_addr);
             }
         }
-        if (record->arg_count > 4) args[4] = record->args[4].value; // fd (将在apply_memory_fd_mapping中映射)
+        if (record->arg_count > 4) args[4] = record->args[4].value; // fd (mapped in apply_memory_fd_mapping)
     } else if (strcmp(record->syscall_name, "mprotect") == 0) {
-        // ✅ 修复：mprotect也需要地址映射
+        // mprotect also requires address mapping
         if (record->arg_count > 0) {
             target_ulong recorded_addr = (target_ulong)record->args[0].value;
             target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
             
-            // 🔧 关键修复：如果找不到映射，不要强制使用trace中的地址
-            // 对于无法映射的地址（如VDSO、动态链接器区域），直接跳过不修改参数
+            // Critical Fix: If mapping not found, do not force use of trace address.
+            // For unmappable addresses (like VDSO, dynamic linker regions), skip modification.
             if (recorded_addr != 0 && mapped_addr != recorded_addr) {
                 args[0] = (abi_long)mapped_addr;
                 fprintf(stderr, "[ADDR-MAPPING] mprotect: recorded_addr=0x%lx -> mapped_addr=0x%lx\n",
                         (unsigned long)recorded_addr, (unsigned long)mapped_addr);
             } else {
-                // 找不到映射，保持当前参数不变（让syscall自然执行）
+                // Mapping not found, keep current parameter (let syscall execute naturally)
                 fprintf(stderr, "[ADDR-MAPPING-SKIP] mprotect: addr=0x%lx not in mapping table, using current value\n",
                         (unsigned long)recorded_addr);
             }
@@ -172,7 +168,7 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
         if (record->arg_count > 1) args[1] = record->args[1].value; // len
         if (record->arg_count > 2) args[2] = record->args[2].value; // prot
     } else if (strcmp(record->syscall_name, "munmap") == 0) {
-        // ✅ 新增：munmap也需要地址映射  
+        // munmap also requires address mapping
         if (record->arg_count > 0) {
             target_ulong recorded_addr = (target_ulong)record->args[0].value;
             target_ulong mapped_addr = rr_addr_mapping_get(recorded_addr);
@@ -182,48 +178,48 @@ static void apply_memory_args(rr_strace_record_t *record, abi_long *args) {
 }
 
 /**
- * @brief 内存管理类系统调用的 FD 映射应用
+ * @brief FD mapping application for memory management syscalls.
  * 
- * 专门处理 mmap 的 fd 参数 (args[4])。
- * 如果不是匿名映射 (fd != -1)，需要应用 FD 映射。
+ * Specifically handles the fd parameter (args[4]) for mmap.
+ * If not an anonymous mapping (fd != -1), applies FD mapping.
  * 
- * @param syscall_name 系统调用名称
- * @param args 系统调用参数数组
+ * @param syscall_name Syscall name.
+ * @param args Syscall argument array.
  */
 static void apply_memory_fd_mapping(const char *syscall_name, abi_long *args) {
     if (strcmp(syscall_name, "mmap") == 0) {
-        // mmap的参数4是FD (-1表示匿名映射)
+        // mmap's parameter 4 is FD (-1 for anonymous mapping)
         if (args[4] != (abi_long)-1) {
-            abi_long recorded_fd = args[4];  // trace中记录的FD
+            abi_long recorded_fd = args[4];  // FD recorded in trace
             
-            // ✅ 查询映射表: recorded_fd → actual_fd
+            // Query mapping table: recorded_fd → actual_fd
             abi_long actual_fd = rr_fd_mapping_get(recorded_fd);
             
             if (actual_fd != -1) {
-                args[4] = actual_fd;  // 使用实际的FD
+                args[4] = actual_fd;  // Use actual FD
                 fprintf(stderr, "[FD-MAPPING] mmap: recorded_fd=%ld -> actual_fd=%ld\n", 
                         (long)recorded_fd, (long)actual_fd);
             } else {
                 fprintf(stderr, "[FD-MAPPING-WARN] mmap: No mapping for recorded_fd=%ld, using as-is\n", 
                         (long)recorded_fd);
-                // 保持原值，让syscall尝试执行
+                // Keep original value and let syscall attempt execution
             }
         }
     }
 }
 
 /**
- * @brief 内存管理类系统调用的 Post Hook
+ * @brief Post Hook for memory management syscalls.
  * 
- * 核心功能：**维护地址映射表 (Address Mapping)**。
- * 由于 ASLR，Replay 时的 mmap 地址通常与 Record 时不同。
+ * Core function: Maintain Address Mapping table.
+ * Due to ASLR, mmap addresses during replay typically differ from those during recording.
  * 
- * - mmap 成功后: 建立 recorded_addr -> actual_addr 的映射
- * - munmap 成功后: 移除映射
+ * - mmap success: Establish recorded_addr -> actual_addr mapping.
+ * - munmap success: Remove mapping.
  * 
- * @param record Trace 记录 (包含 recorded_addr)
- * @param ret 实际返回值 (actual_addr)
- * @param args 参数
+ * @param record Trace record (contains recorded_addr).
+ * @param ret Actual return value (actual_addr).
+ * @param args Arguments.
  */
 static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
@@ -254,24 +250,24 @@ static void memory_post_hook(rr_strace_record_t *record, abi_long ret, abi_long 
     }
 }
 
-/* 网络类系统调用处理 */
+/* Network-related syscall handling */
 
 /**
- * @brief 网络类系统调用的参数应用
+ * @brief Argument application for network syscalls.
  * 
- * 处理 socket, connect, bind 等。
- * 网络相关的参数结构通常比较复杂，目前主要处理：
- * - socket: 保持协议族/类型/协议参数一致
- * - bind/connect: 传递 addrlen
+ * Handles socket, connect, bind, etc.
+ * Complex network structures are partially handled:
+ * - socket: Ensures protocol family/type/protocol consistency.
+ * - bind/connect: Passes `addrlen`.
  * 
- * @param record Trace 记录
- * @param args 系统调用参数
+ * @param record Trace record.
+ * @param args Syscall arguments.
  */
 static void apply_network_args(rr_strace_record_t *record, abi_long *args) {
     if (!record || !record->syscall_name) return;
     
     if (strcmp(record->syscall_name, "socket") == 0) {
-        // 所有参数都是数值，使用记录值
+        // All arguments are numeric; use recorded values.
         for (int i = 0; i < record->arg_count && i < 3; i++) {
             args[i] = record->args[i].value;
         }
@@ -282,14 +278,14 @@ static void apply_network_args(rr_strace_record_t *record, abi_long *args) {
 }
 
 /**
- * @brief 网络类系统调用的 Post Hook
+ * @brief Post Hook for network syscalls.
  * 
- * 主要功能：**维护 Socket FD 映射**。
- * 当 socket/accept 创建新的 Socket FD 时，记录 recorded_fd -> actual_fd 的映射。
+ * Core function: Maintain Socket FD mapping.
+ * When socket/accept creates a new Socket FD, records recorded_fd -> actual_fd mapping.
  * 
- * @param record Trace 记录
- * @param ret 实际返回值 (Socket FD)
- * @param args 参数
+ * @param record Trace record.
+ * @param ret Actual return value (Socket FD).
+ * @param args Arguments.
  */
 static void network_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
     if (!record) return;
@@ -303,24 +299,24 @@ static void network_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
     }
 }
 
-/* 通用处理函数 */
+/* Generic handler functions */
 static void apply_generic_args(rr_strace_record_t *record, abi_long *args) {
     if (!record) return;
     
-    // 特殊处理：某些系统调用不应该修改参数
-    // 这些调用的参数高度依赖于当前执行环境
+    // Special case: Certain syscalls should not modify arguments.
+    // These calls depend heavily on the current execution environment.
     if (record->syscall_name) {
         if (strcmp(record->syscall_name, "arch_prctl") == 0 ||
             strcmp(record->syscall_name, "brk") == 0 ||
             strcmp(record->syscall_name, "set_tid_address") == 0 ||
             strcmp(record->syscall_name, "set_robust_list") == 0) {
-            // 这些系统调用的参数不应该被重放
-            // 它们需要使用当前进程的实际地址
+            // These syscall parameters should not be replayed.
+            // They need to use actual addresses from the current process.
             return;
         }
     }
     
-    // 通用策略：对于数值参数使用记录值，对于指针参数保持原值
+    // Generic strategy: Use recorded values for numeric arguments, maintain original values for pointers.
     for (int i = 0; i < record->arg_count && i < RR_MAX_SYSCALL_ARGS; i++) {
         if (record->args[i].type == RR_STRACE_ARG_TYPE_INT) {
             args[i] = record->args[i].value;
@@ -329,16 +325,16 @@ static void apply_generic_args(rr_strace_record_t *record, abi_long *args) {
 }
 
 static void generic_post_hook(rr_strace_record_t *record, abi_long ret, abi_long *args) {
-    // 默认不做特殊处理
+    // Default: No special processing
     (void)record;
     (void)ret;
     (void)args;
 }
 
-/* ==================== 系统调用处理表定义 ==================== */
+/* ==================== Syscall Handler Table Definition ==================== */
 
 static rr_syscall_handler_t syscall_handlers[] = {
-    /* 文件I/O类 */
+    /* File I/O Class */
     {"read", 0, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL, 
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
     {"write", 1, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
@@ -360,7 +356,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"newfstatat", 262, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
     
-    /* 内存管理类 */
+    /* Memory Management Class */
     {"mmap", 9, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_CRITICAL,
      apply_memory_args, apply_memory_fd_mapping, memory_post_hook, true, true, true},
     {"munmap", 11, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
@@ -370,7 +366,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"brk", 12, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_memory_args, NULL, memory_post_hook, false, true, false},
     
-    /* 网络类 */
+    /* Network Class */
     {"socket", 41, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
     {"bind", 49, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
@@ -406,7 +402,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"shutdown", 48, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
     
-    /* 系统信息类 */
+    /* System Information Class */
     {"getpid", 39, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
     {"getuid", 102, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
@@ -434,7 +430,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"fstat", 5, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
     
-    /* 进程管理类 */
+    /* Process Management Class */
     {"clone", 56, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
     {"fork", 57, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
@@ -442,7 +438,7 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"exit_group", 231, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_CRITICAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
     
-    /* 其他常用系统调用 */
+    /* Other Common Syscalls */
     {"access", 21, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
     {"newfstatat", 262, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
@@ -450,37 +446,36 @@ static rr_syscall_handler_t syscall_handlers[] = {
     {"arch_prctl", 158, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
     
-    /* 结束标记 */
     {NULL, -1, SYSCALL_TYPE_UNKNOWN, SYSCALL_IMPORTANCE_ENVIRONMENT, NULL, NULL, NULL, false, false, false}
 };
 
-/* ==================== 快速查找表 ==================== */
+/* ==================== Fast Lookup Table ==================== */
 
 #define MAX_SYSCALL_NR 512
 static rr_syscall_handler_t* syscall_lookup_table[MAX_SYSCALL_NR];
 static bool dispatch_initialized = false;
 
-/* ==================== 公共接口实现 ==================== */
+/* ==================== Public Interface Implementation ==================== */
 
-/* ==================== 公共接口实现 ==================== */
+/* ==================== Public Interface Implementation ==================== */
 
 /**
- * @brief 初始化系统调用分发系统
+ * @brief Initialize Syscall Dispatch system.
  * 
- * 构建系统调用快速查找表 (Lookup Table)，将线性扫描转换为 O(1) 的数组索引查找。
- * 这是一个关键的性能优化。
+ * Builds the fast syscall lookup table, converting linear scans to O(1) array index lookups.
+ * This is a critical performance optimization.
  * 
- * @return int 0 成功
+ * @return int 0 on success.
  */
 int rr_syscall_dispatch_init(void) {
     if (dispatch_initialized) {
         return 0;
     }
     
-    // 初始化查找表
+    // Initialize lookup table
     memset(syscall_lookup_table, 0, sizeof(syscall_lookup_table));
     
-    // 填充查找表
+    // Populate lookup table
     for (int i = 0; syscall_handlers[i].name != NULL; i++) {
         int nr = syscall_handlers[i].syscall_nr;
         if (nr >= 0 && nr < MAX_SYSCALL_NR) {
@@ -498,12 +493,12 @@ void rr_syscall_dispatch_cleanup(void) {
 }
 
 /**
- * @brief 获取系统调用处理程序 (O(1) 查找)
+ * @brief Get syscall handler (O(1) lookup).
  * 
- * 根据 syscall_nr 快速获取对应的处理函数集 (handler)。
+ * Quickly retrieves the handler set for a given `syscall_nr`.
  * 
- * @param syscall_nr 系统调用编号
- * @return rr_syscall_handler_t* 处理程序结构体指针，如果未注册则返回 NULL
+ * @param syscall_nr Syscall number.
+ * @return rr_syscall_handler_t* Handler pointer, or NULL if not registered.
  */
 rr_syscall_handler_t* rr_get_syscall_handler(int syscall_nr) {
     if (!dispatch_initialized) {
@@ -544,18 +539,18 @@ syscall_importance_t rr_get_syscall_importance(int syscall_nr) {
     return handler ? handler->importance : SYSCALL_IMPORTANCE_ENVIRONMENT;
 }
 
-/* ==================== 优化的处理函数 ==================== */
+/* ==================== Optimized Handler Functions ==================== */
 
-/* ==================== 优化的处理函数 ==================== */
+/* ==================== Optimized Handler Functions ==================== */
 
 /**
- * @brief 优化的参数应用入口
+ * @brief Optimized parameter application entry point.
  * 
- * 替代原始的 switch-case 结构，使用 handler 表进行分发。
- * 如果找到 handler，调用其 apply_args 函数；否则回退到 apply_generic_args。
+ * Replaces the original switch-case structure with handler table dispatch.
+ * If a handler is found, its `apply_args` function is called; otherwise falls back to `apply_generic_args`.
  * 
- * @param record Trace 记录
- * @param args 参数数组
+ * @param record Trace record.
+ * @param args Argument array.
  */
 void rr_apply_syscall_args_optimized(rr_strace_record_t *record, abi_long *args) {
     if (!record || !args) return;
@@ -564,7 +559,7 @@ void rr_apply_syscall_args_optimized(rr_strace_record_t *record, abi_long *args)
     if (handler && handler->apply_args) {
         handler->apply_args(record, args);
     } else {
-        // 回退到通用处理
+        // Fallback to generic handling
         apply_generic_args(record, args);
     }
 }
@@ -579,19 +574,19 @@ void rr_apply_fd_mapping_optimized(int syscall_nr, abi_long *args) {
 }
 
 /**
- * @brief 优化的 Post Hook 入口
+ * @brief Optimized Post Hook entry point.
  * 
- * 根据 syscall_nr 分发到具体的 post_hook (如 memory_post_hook 维护地址映射)。
- * 这种设计解耦了 rr_main.c 中的逻辑。
+ * Dispatches to specific post_hooks (e.g., `memory_post_hook` for address mapping) based on `syscall_nr`.
+ * This design decouples logic from `rr_main.c`.
  * 
- * @param syscall_nr 系统调用编号
- * @param record Trace 记录
- * @param ret 返回值
- * @param args 参数
+ * @param syscall_nr Syscall number.
+ * @param record Trace record.
+ * @param ret Return value.
+ * @param args Arguments.
  */
 void rr_syscall_post_hook_optimized(int syscall_nr, rr_strace_record_t *record, 
                                   abi_long ret, abi_long *args) {
-    /* 🔥 修复：删除了所有冗余的 stderr 输出 */
+    /* Removed redundant output for performance */
     
     if (!record || !args) {
         return;

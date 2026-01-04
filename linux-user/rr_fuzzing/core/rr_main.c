@@ -1,9 +1,8 @@
 /**
- * RR-Fuzz主控模块 - 框架初始化和核心逻辑
- * 对应design.md中的rr_main.c
+ * RR-Fuzz Main Module - Framework initialization and core logic
  */
 
-/* 确保RR_DEBUG被定义 */
+/* Ensure RR_DEBUG is defined */
 #ifndef RR_DEBUG
 #define RR_DEBUG 1
 #endif
@@ -13,37 +12,39 @@
 #include "../record/rr_aux_data.h"
 #include "../utils/rr_dynamic_trace.h"
 #include "../fuzzing/qemu_integration/rr_coverage.h"
-#include "../utils/rr_syscall_tree.h"  // ✅ C-Tree-P2: syscall tree tracking
+#include "../utils/rr_syscall_tree.h"  // Syscall tree tracking
 #include "rr_constants.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
 
-/* 全局框架状态 */
+/* Global framework state */
 rr_framework_t *g_rr_framework = NULL;
 
-/* 用于mmap地址映射的临时存储 */
+/* Temporary storage for mmap address mapping */
 target_ulong g_pending_mmap_recorded_addr = 0;
 target_ulong g_pending_mmap_length = 0;
 
 /**
- * @brief 将系统调用编号转换为可读的名称字符串
+ * @brief Converts a syscall number to a readable name string.
  * 
- * 该函数提供系统调用号到名称的映射，主要用于日志和调试输出。
- * 对于已知的常用系统调用，返回其标准名称（如 "read", "write"）。
- * 对于未识别的系统调用，返回 "unknown"。
+ * This function provides a mapping from syscall numbers to names, primarily used for logging 
+ * and debug output. For known commonly used syscalls, it returns their standard names 
+ * (e.g., "read", "write"). For unidentified syscalls, it returns "unknown".
  * 
- * @param syscall_nr 系统调用编号（如 TARGET_NR_read, TARGET_NR_write）
- * @return 系统调用名称的常量字符串指针。
- *         - 对于已知调用：返回标准名称字符串（如 "read", "mmap"）
- *         - 对于未知调用：返回 "unknown"
+ * @param syscall_nr Syscall number (e.g., TARGET_NR_read, TARGET_NR_write)
+ * @return Constant string pointer to the syscall name.
+ *         - For known calls: returns the standard name string (e.g., "read", "mmap")
+ *         - For unknown calls: returns "unknown"
  * 
- * @note 当前实现仅包含约 30 个常用系统调用的映射，未覆盖所有系统调用。
- * @note 返回的字符串指针指向静态常量区域，调用者无需释放内存。
- * @warning 对于未映射的系统调用返回 "unknown"，调用者应注意处理。
+ * @note The current implementation only includes mappings for about 30 common syscalls 
+ *        and does not cover all syscalls.
+ * @note The returned string pointer points to a static constant area; the caller 
+ *       does not need to free the memory.
+ * @warning Returns "unknown" for unmapped syscalls; callers should handle this accordingly.
  * 
- * @see rr_syscall_post_hook() 主要使用该函数进行日志输出
+ * @see rr_syscall_post_hook() primarily uses this function for log output.
  */
 static const char* get_syscall_name(int syscall_nr) {
     switch (syscall_nr) {
@@ -91,32 +92,33 @@ static const char* get_syscall_name(int syscall_nr) {
 }
 
 /**
- * @brief 判断系统调用返回值的偏离是否属于预期范围
+ * @brief Determines if the deviation of a syscall return value is within the expected range.
  * 
- * 在确定性重放 (deterministic replay) 过程中，某些系统调用的返回值会因为
- * 操作系统的 ASLR (地址空间布局随机化)、PID 分配等机制而在 record 和 replay
- * 阶段产生差异。此函数用于判断这种偏离是否在预期范围内（即是否为已知的
- * 不确定性来源），从而决定是否应该触发不一致警告。
+ * During deterministic replay, the return values of certain syscalls may differ between the 
+ * record and replay stages due to mechanisms such as ASLR (Address Space Layout Randomization) 
+ * or PID allocation by the operating system. This function is used to judge whether such 
+ * deviation is within the expected range (i.e., whether it originates from a known source 
+ * of non-determinism), thereby deciding if an inconsistency warning should be triggered.
  * 
- * @param syscall_nr 系统调用编号（如 TARGET_NR_mmap, TARGET_NR_brk）
- * @param recorded 记录 (record) 阶段该系统调用的返回值
- * @param actual 重放 (replay) 阶段该系统调用的实际返回值
+ * @param syscall_nr Syscall number (e.g., TARGET_NR_mmap, TARGET_NR_brk)
+ * @param recorded The return value of the syscall during the record stage
+ * @param actual The actual return value of the syscall during the replay stage
  * @return bool
- *         - true: 偏离属于预期范围（如地址类系统调用、PID/TID 相关调用）
- *         - false: 偏离异常，可能需要进一步检查或警告
+ *         - true: Deviation is within the expected range (e.g., address-related or PID/TID-related syscalls)
+ *         - false: Abnormal deviation, which may require further inspection or warning
  * 
- * @note 当前支持的预期偏离场景包括：
- *       - 内存管理: mmap, mmap2, brk, mremap (返回的地址受 ASLR 影响)
- *       - 进程标识: set_tid_address, gettid, getpid, getppid
- *       - 路径操作: readlink, readlinkat (路径长度可能变化)
+ * @note Currently supported expected deviation scenarios include:
+ *       - Memory management: mmap, mmap2, brk, mremap (returned addresses affected by ASLR)
+ *       - Process identification: set_tid_address, gettid, getpid, getppid
+ *       - Path operations: readlink, readlinkat (path length may change)
  * 
- * @warning 对于未列出的系统调用，该函数会返回 false，表示不接受任何偏离。
- *          在添加新的预期偏离场景时，需要仔细评估其合理性。
+ * @warning For syscalls not listed, this function returns false, indicating no deviation is accepted.
+ *          When adding new expected deviation scenarios, their rationality must be carefully evaluated.
  * 
- * @see rr_do_syscall() 在检测到返回值不一致时会调用此函数
+ * @see rr_do_syscall() calls this function when a return value inconsistency is detected.
  */
 static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long actual) {
-    /* mmap 地址偏离是预期的 (ASLR) */
+    /* mmap address deviation is expected (ASLR) */
 #ifdef TARGET_NR_mmap
     if (syscall_nr == TARGET_NR_mmap) {
         return true;
@@ -128,26 +130,26 @@ static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long ac
     }
 #endif
     
-    /* brk 地址偏离也是预期的 */
+    /* brk address deviation is also expected */
     if (syscall_nr == TARGET_NR_brk) {
         return true;
     }
     
-    /* mremap 地址偏离也是预期的 */
+    /* mremap address deviation is also expected */
 #ifdef TARGET_NR_mremap
     if (syscall_nr == TARGET_NR_mremap) {
         return true;
     }
 #endif
     
-    /* set_tid_address 返回线程ID,每次运行都会不同 */
+    /* set_tid_address returns thread ID, which differs every run */
 #ifdef TARGET_NR_set_tid_address
     if (syscall_nr == TARGET_NR_set_tid_address) {
         return true;
     }
 #endif
     
-    /* readlink 返回值可能因为路径长度变化 */
+    /* readlink return value may change due to path length variations */
 #ifdef TARGET_NR_readlink
     if (syscall_nr == TARGET_NR_readlink) {
         return true;
@@ -159,19 +161,19 @@ static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long ac
     }
 #endif
     
-    /* gettid 返回线程ID */
+    /* gettid returns thread ID */
 #ifdef TARGET_NR_gettid
     if (syscall_nr == TARGET_NR_gettid) {
         return true;
     }
 #endif
     
-    /* getpid/getppid 可能会变化 */
-    // 处理架构差异：某些架构使用不同的syscall名称
+    /* getpid/getppid may change */
+    // Handle architectural differences: some architectures use different syscall names
 #ifdef TARGET_NR_getpid
     if (syscall_nr == TARGET_NR_getpid) return true;
 #endif
-#ifdef TARGET_NR_getxpid  // alpha架构
+#ifdef TARGET_NR_getxpid  // alpha architecture
     if (syscall_nr == TARGET_NR_getxpid) return true;
 #endif
 #ifdef TARGET_NR_getppid
@@ -182,29 +184,30 @@ static bool is_expected_deviation(int syscall_nr, abi_long recorded, abi_long ac
 }
 
 /**
- * @brief 在重放模式下对齐文件描述符 (FD) 环境
+ * @brief Aligns the file descriptor (FD) environment in replay mode.
  * 
- * 为了确保确定性重放，guest 程序在 replay 阶段的 FD 分配应尽可能与
- * record 阶段保持一致。该函数在 replay/fuzzing 模式启动时被调用，
- * 尝试关闭一些由 QEMU 占用的 FD，使得 guest 程序的第一个 open() 调用
- * 能够获得与 record 阶段相同的 FD 编号（通常是 FD=3）。
+ * To ensure deterministic replay, the guest program's FD allocation during the replay 
+ * stage should be as consistent as possible with the record stage. This function is called 
+ * at the start of replay/fuzzing mode to attempt to close some FDs occupied by QEMU, so that 
+ * the guest program's first open() call can obtain the same FD number as in the record 
+ * stage (usually FD=3).
  * 
  * @return int
- *         - 0: 对齐操作完成（无论是否成功）
- *         - 负值: 保留用于未来错误处理扩展
+ *         - 0: Alignment operation completed (regardless of success)
+ *         - negative value: Reserved for future error handling extensions
  * 
- * @note FD 对齐策略:
- *       1. 跳过标准流 (stdin=0, stdout=1, stderr=2)
- *       2. 保护 IPC 通信管道 FD (fuzzing 模式必需)
- *       3. 仅关闭以只读模式打开的 FD，避免误关闭 trace 文件
+ * @note FD alignment strategy:
+ *       1. Skip standard streams (stdin=0, stdout=1, stderr=2)
+ *       2. Protect IPC communication pipe FDs (required for fuzzing mode)
+ *       3. Only close FDs opened in read-only mode to avoid accidentally closing the trace file
  * 
- * @note 如果无法完全对齐（如 QEMU 占用了多个 FD），系统会启用 FD 映射机制
- *       来处理 record 和 replay 之间的 FD 差异。
+ * @note If full alignment is not possible (e.g., QEMU occupies multiple FDs), the system 
+ *       enables an FD mapping mechanism to handle discrepancies between record and replay FDs.
  * 
- * @warning 在 multi-threaded 环境下可能存在竞态条件（当前 QEMU user-mode 是单线程）
+ * @warning Race conditions may exist in multi-threaded environments (currently QEMU user-mode is single-threaded)
  * 
- * @see rr_fd_mapping_add() FD 映射机制的实现
- * @see rr_framework_init() 在框架初始化时调用
+ * @see rr_fd_mapping_add() implementation of the FD mapping mechanism
+ * @see rr_framework_init() called during framework initialization
  */
 static int align_fd_state(void) {
     if (g_rr_config.mode != RR_MODE_REPLAY && g_rr_config.mode != RR_MODE_FUZZING) {
@@ -213,7 +216,7 @@ static int align_fd_state(void) {
     
     RR_INFO("Aligning FD state for replay/fuzzing mode...");
     
-    /* 获取 IPC FD，确保不会关闭它们 */
+    /* Get IPC FDs and ensure they are not closed */
     int ipc_cmd_fd = -1, ipc_status_fd = -1;
     const char *cmd_fd_str = getenv("RR_CMD_PIPE");
     const char *status_fd_str = getenv("RR_STATUS_PIPE");
@@ -226,11 +229,11 @@ static int align_fd_state(void) {
         RR_VERBOSE("Protecting IPC status FD %d from alignment", ipc_status_fd);
     }
     
-    /* 1. 查找最小的可用 FD (跳过 0,1,2 标准流) */
+    /* 1. Find the smallest available FD (skip standard streams 0,1,2) */
     int min_available_fd = -1;
     for (int fd = RR_FIRST_USER_FD; fd < RR_MAX_CHECKED_FD; fd++) {
         if (fcntl(fd, F_GETFD) == -1) {
-            /* FD 不存在,这是第一个可用的 */
+            /* FD does not exist, this is the first available one */
             min_available_fd = fd;
             break;
         }
@@ -239,34 +242,34 @@ static int align_fd_state(void) {
     if (min_available_fd == -1) {
         RR_WARN("No available FD found in range %d-%d, cannot align",
                 RR_FIRST_USER_FD, RR_MAX_CHECKED_FD);
-        return 0; /* 不阻塞初始化 */
+        return 0; /* Do not block initialization */
     }
     
     RR_INFO("First available FD: %d", min_available_fd);
     
-    /* 2. 如果第一个可用 FD > 3,说明有 FD 被 qemu 占用 */
-    /*    尝试关闭非关键的 FD (但要小心,避免关闭重要的 FD) */
+    /* 2. If the first available FD > 3, it means some FDs are occupied by QEMU */
+    /*    Try to close non-critical FDs (but be careful to avoid closing important ones) */
     if (min_available_fd > 3) {
         int closed_count = 0;
         for (int fd = 3; fd < min_available_fd; fd++) {
-            /* 尝试检查 FD 是否可关闭 */
-            /* 注意: 我们无法直接访问 g_trace_file (它在其他模块中) */
-            /*       所以采用保守策略: 只关闭可以确认不重要的 FD */
+            /* Try checking if an FD can be closed */
+            /* NOTE: We cannot directly access g_trace_file (it resides in another module) */
+            /*       So we adopt a conservative strategy: only close FDs that can be confirmed as non-critical */
             
-            /* 尝试获取 FD 状态 */
+            /* Try to get FD status */
             int flags = fcntl(fd, F_GETFL);
             if (flags == -1) {
-                continue; /* FD 已经不存在 */
+                continue; /* FD no longer exists */
             }
             
-            /* 跳过 IPC FD - 这些是fuzzing模式必需的 */
+            /* Skip IPC FD - these are required for fuzzing mode */
             if (fd == ipc_cmd_fd || fd == ipc_status_fd) {
                 RR_VERBOSE("Keeping FD %d (IPC pipe)", fd);
                 continue;
             }
             
-            /* 保守策略: 只关闭以读模式打开的 FD (更安全) */
-            /* 因为 trace 文件通常是写模式 */
+            /* Conservative strategy: Only close FDs opened in read mode (safer) */
+            /* Because trace files are usually in write mode */
             if ((flags & O_ACCMODE) == O_RDONLY) {
                 if (close(fd) == 0) {
                     closed_count++;
@@ -284,15 +287,15 @@ static int align_fd_state(void) {
         }
     }
     
-    /* 3. 重新检查第一个可用 FD */
+    /* 3. Re-check the first available FD */
     for (int fd = RR_FIRST_USER_FD; fd < RR_MAX_CHECKED_FD; fd++) {
         if (fcntl(fd, F_GETFD) == -1) {
             RR_INFO("After alignment, first available FD: %d", fd);
             
-            /* 如果还不是 fd=3,打开 dummy FDs */
+            /* If it's still not fd=3, open dummy FDs */
             if (fd > 3) {
                 RR_WARN("Cannot fully align FDs, guest's first open() will return fd=%d", fd);
-                /* 注意: 这会导致 FD 映射,但至少现在有映射机制来处理 */
+                /* NOTE: This will lead to FD mapping, but at least there's a mapping mechanism to handle it now */
             }
             return 0;
         }
@@ -301,94 +304,111 @@ static int align_fd_state(void) {
     return 0;
 }
 
-/**
- * @brief 初始化 RR-Fuzz 框架的所有子系统
+ /**
+ * @brief Initialize all subsystems of the RR-Fuzz framework.
  * 
- * 这是 RR-Fuzz 框架的主初始化函数，负责根据配置（record/replay/fuzzing 模式）
- * 启动相应的子系统。该函数通常在 QEMU 启动 guest 程序之前被调用一次。
+ * This is the main initialization function for the RR-Fuzz framework, responsible for starting 
+ * the appropriate subsystems based on the configuration (record/replay/fuzzing mode).
+ * This function is typically called once before QEMU starts the guest program.
  * 
- * 初始化流程:
- * 1. 加载并验证配置 (rr_config_init)
- * 2. 初始化调试日志系统
- * 3. 分配全局框架上下文 (g_rr_framework)
- * 4. 初始化 FD/地址映射管理器
- * 5. 执行 FD 环境对齐 (replay/fuzzing 模式)
- * 6. 初始化 IPC 通信管道 (fuzzing 模式)
- * 7. 初始化覆盖率追踪模块
- * 8. 初始化 Syscall Tree Builder
- * 9. 根据运行模式启动 record/replay/fuzzing 子系统
+ * Initialization flow:
+ * 1. Load and validate configuration (rr_config_init)
+ * 2. Initialize debug logging system
+ * 3. Allocate global framework context (g_rr_framework)
+ * 4. Initialize FD/address mapping manager
+ * 5. Execute FD environment alignment (replay/fuzzing mode)
+ * 6. Initialize IPC communication pipes (fuzzing mode)
+ * 7. Initialize coverage tracking module
+ * 8. Initialize Syscall Tree Builder
+ * 9. Start record/replay/fuzzing subsystem based on running mode
  * 
  * @return int
- *         - 0: 初始化成功
- *         - -1: 初始化失败（会打印错误日志）
+ *         - 0: Initialization successful
+ *         - -1: Initialization failed (error log will be printed)
  * 
- * @note 该函数应仅被调用一次。重复调用会导致资源泄漏。
- * @note 会自动注册 atexit 清理函数 rr_framework_cleanup()
+ * @note This function should be called only once. Repeated calls will result in resource leaks.
+ * @note Automatically registers atexit cleanup function rr_framework_cleanup()
  * 
- * @warning 如果初始化失败，部分子系统可能已经初始化完成。调用者应确保
- *          正确处理错误情况并退出程序，或调用 rr_framework_cleanup() 清理。
+ * @warning If initialization fails, some subsystems may have already completed initialization. 
+ *          The caller should ensure proper error handling and exit the program, or call 
+ *          rr_framework_cleanup() to clean up.
  * 
- * @see rr_framework_cleanup() 对应的清理函数
- * @see g_rr_config 全局配置对象
- * @see g_rr_framework 全局框架上下文
+ * @see rr_framework_cleanup() Corresponding cleanup function
+ * @see g_rr_config Global configuration object
+ * @see g_rr_framework Global framework context
  */
 int rr_framework_init(void)
 {
-    const char *strace_mode_env = NULL;  // 用于检测strace模式
+    const char *strace_mode_env = NULL;  // Used for detecting strace mode
     
-    /* 初始化配置系统 */
+    /* Initialize configuration system */
     if (rr_config_init() < 0) {
         error_report("RR-Fuzz: Failed to initialize configuration");
         return -1;
     }
 
-    /* 检查是否启用 */
+    /* Debug: Print configuration state */
+    fprintf(stderr, "[DEBUG-INIT] rr_config_init returned. enabled=%d, mode=%d\n", 
+            g_rr_config.enabled, g_rr_config.mode);
+    fflush(stderr);
+
+    /* Check if enabled */
     if (!g_rr_config.enabled) {
-        return 0; // 未启用，直接返回
+        fprintf(stderr, "[DEBUG-INIT] Framework disabled via g_rr_config.enabled=false\n");
+        return 0; // Not enabled, return directly
     }
 
-    /* 初始化调试系统 */
+    fprintf(stderr, "[DEBUG-INIT] Framework ENABLED! Proceeding to init debug system...\n");
+
+    /* Initialize debug system */
     rr_debug_init();
 
-    /* 打印配置信息 */
-    rr_config_print();
 
-    /* 分配全局上下文 */
+    /* Print configuration information */
+    rr_config_print();
+    fprintf(stderr, "[DEBUG-INIT] config_print done\n");
+
+    /* Allocate global context */
     g_rr_framework = g_malloc0(sizeof(rr_framework_t));
     if (!g_rr_framework) {
         RR_ERROR("Failed to allocate framework context");
         return -1;
     }
+    fprintf(stderr, "[DEBUG-INIT] g_malloc done\n");
 
-    /* 从配置获取运行模式 */
+    /* Get running mode from configuration */
     g_rr_framework->mode = g_rr_config.mode;
-    g_rr_framework->enabled = g_rr_config.enabled;  // 设置enabled标志
+    g_rr_framework->enabled = g_rr_config.enabled;  // Set enabled flag
 
-    /* 初始化映射管理器（FD/地址映射） */
+    /* Initialize mapping manager (FD/address mapping) */
     if (rr_mapping_manager_init(RR_FD_MAPPING_BUCKETS, RR_ADDR_MAPPING_BUCKETS) < 0) {
         RR_ERROR("Failed to initialize mapping manager");
         goto error;
     }
+    fprintf(stderr, "[DEBUG-INIT] mapping_manager_init done\n");
 
-    /* 任务3: FD 环境对齐 - 在 replay/fuzzing 模式下对齐 FD 状态 */
+    /* FD environment alignment for replay/fuzzing mode */
     if (align_fd_state() < 0) {
         RR_ERROR("Failed to align FD state");
         goto error;
     }
+    fprintf(stderr, "[DEBUG-INIT] align_fd_state done\n");
 
-    /* 注册退出清理函数 */
+    /* Register exit cleanup function */
     atexit(rr_framework_cleanup);
     RR_VERBOSE("Registered exit cleanup handler");
 
-    /* 初始化子系统 */
+    /* Initialize subsystems */
     if (rr_ipc_init() < 0) {
         RR_ERROR("Failed to initialize IPC");
         goto error;
     }
+    fprintf(stderr, "[DEBUG-INIT] ipc_init done\n");
     RR_INFO("IPC subsystem initialized");
     
-    /* 初始化Coverage模块 (始终初始化，用于所有模式) */
+    /* Initialize coverage tracking (Used for all execution modes) */
     RR_VERBOSE("Attempting to initialize coverage tracking...");
+    fprintf(stderr, "[DEBUG-INIT] calling rr_coverage_init...\n");
     int cov_ret = rr_coverage_init(NULL);
     RR_VERBOSE("rr_coverage_init() returned: %d", cov_ret);
     if (cov_ret < 0) {
@@ -397,15 +417,15 @@ int rr_framework_init(void)
         RR_INFO("Coverage tracking initialized successfully");
     }
 
-    /* ✅ C-Tree-P2: 初始化Syscall Tree Builder */
+    /* Initialize Syscall Tree Builder */
     rr_tree_init();
     RR_INFO("Syscall tree builder initialized");
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-    /* 初始化动态跟踪管道（用于树可视化） */
+    /* Initialize dynamic trace pipe (for tree visualization) */
     const char *trace_pipe_path = getenv("RR_TRACE_PIPE");
     if (trace_pipe_path) {
-        /* 使用阻塞模式打开，确保可视化器已经准备好 */
+        /* Open in blocking mode to ensure the visualizer is ready */
         int trace_fd = open(trace_pipe_path, O_WRONLY);
         if (trace_fd >= 0) {
             rr_dynamic_trace_init(trace_fd);
@@ -416,10 +436,10 @@ int rr_framework_init(void)
     }
 #endif
     
-    /* 重置 Fork Server 状态（每次新进程启动时） */
+    /* Reset Fork Server state on new process startup */
     rr_reset_fork_point();
 
-    /* 根据模式启动相应功能 */
+    /* Start functionality based on mode */
     switch (g_rr_framework->mode) {
         case RR_MODE_DISABLED:
             RR_INFO("RR-Fuzz mode is disabled, no initialization required");
@@ -433,7 +453,7 @@ int rr_framework_init(void)
             RR_INFO("Recording started successfully");
             break;
         case RR_MODE_REPLAY:
-            /* 检查是否启用strace重放模式 */
+            /* Check if strace replay mode is enabled */
             {
                 strace_mode_env = getenv("RR_STRACE_MODE");
                 RR_INFO("Starting replay mode, trace_file=%s", g_rr_config.trace_file);
@@ -457,10 +477,10 @@ int rr_framework_init(void)
             }
             break;
         case RR_MODE_FUZZING:
-            // Fuzzing模式需要先加载trace，然后启动fork server
+            // Fuzzing mode needs to load trace first, then start fork server
             RR_INFO("Starting fuzzing mode, trace_file=%s", g_rr_config.trace_file);
             
-            // 检查是否使用strace模式（与replay模式一致）
+            // Check if strace mode is used (consistent with replay mode)
             strace_mode_env = getenv("RR_STRACE_MODE");
             if (strace_mode_env) {
                 RR_INFO("Starting strace replay mode for fuzzing");
@@ -470,15 +490,17 @@ int rr_framework_init(void)
                 }
                 RR_INFO("Strace replay started successfully for fuzzing");
             } else {
-                // 使用原生replay
+                // Use native replay
                 if (rr_start_replay(g_rr_config.trace_file) < 0) {
                     RR_ERROR("Failed to load trace for fuzzing");
                     goto error;
                 }
             }
-            /* 在Fuzzing模式下启动Fork Server（自动检测模式） */
+            /* Start Fork Server in fuzzing mode (auto-detection) */
+            fprintf(stderr, "[DEBUG-INIT] Checking fork_server_enabled: %d\n", g_rr_config.fork_server_enabled);
             if (g_rr_config.fork_server_enabled) {
                 RR_INFO("Starting fork server in auto-detection mode");
+                fprintf(stderr, "[DEBUG-INIT] Calling rr_start_fork_server()...\n");
                        
                 if (rr_start_fork_server(NULL, NULL) < 0) {
                     RR_ERROR("Failed to start fork server");
@@ -506,29 +528,31 @@ error:
 }
 
 /**
- * @brief 清理 RR-Fuzz 框架并释放所有资源
+ * @brief Clean up RR-Fuzz framework and release all resources.
  * 
- * 该函数负责停止所有运行中的子系统并释放框架占用的内存资源。
- * 通常在程序退出时通过 atexit 机制自动调用，也可以手动调用。
+ * This function handles stopping all running subsystems and releasing memory
+ * occupied by the framework. It is automatically called via atexit but can 
+ * also be called manually.
  * 
- * 清理流程:
- * 1. 根据当前模式停止相应子系统 (recording/replay/fork-server)
- * 2. 导出 Syscall Tree 到 JSON 文件 (默认 /tmp/syscall_tree.json)
- * 3. 清理覆盖率追踪模块
- * 4. 清理 IPC 通信管道
- * 5. 清理动态跟踪管道 (如果启用)
- * 6. 清理 fuzzing、snapshot、调试、配置等子系统
- * 7. 清理 FD/地址映射管理器
- * 8. 释放 trace 记录链表
- * 9. 释放全局框架上下文
+ * Cleanup flow:
+ * 1. Stop active subsystem according to mode (recording/replay/fork-server).
+ * 2. Export Syscall Tree to JSON file (defaults to /tmp/syscall_tree.json).
+ * 3. Clean up coverage tracking module.
+ * 4. Clean up IPC communication pipes.
+ * 5. Clean up dynamic trace pipes (if enabled).
+ * 6. Clean up fuzzing, snapshot, debug, and config subsystems.
+ * 7. Clean up FD/address mapping managers.
+ * 8. Release trace record linked list.
+ * 9. Free global framework context.
  * 
- * @note 该函数可以安全地被多次调用（会检查 g_rr_framework 是否为 NULL）
- * @note 清理顺序很重要：先停止业务逻辑，再清理底层资源
+ * @note This function is safe to call multiple times (checks g_rr_framework == NULL).
+ * @note Cleanup order is important: stop business logic first, then clean up resources.
  * 
- * @warning 调用此函数后，g_rr_framework 会被设置为 NULL，后续不应再使用框架功能
+ * @warning After calling, g_rr_framework is set to NULL; framework functions 
+ *          should not be used thereafter.
  * 
- * @see rr_framework_init() 对应的初始化函数
- * @see g_rr_framework 全局框架上下文
+ * @see rr_framework_init() Initialization function.
+ * @see g_rr_framework Global framework context.
  */
 void rr_framework_cleanup(void)
 {
@@ -538,10 +562,10 @@ void rr_framework_cleanup(void)
 
     RR_INFO("Starting RR-Fuzz framework cleanup");
 
-    /* 停止当前模式 */
+    /* Stop current mode */
     switch (g_rr_framework->mode) {
         case RR_MODE_DISABLED:
-            // 无需清理操作
+            // No cleanup needed
             break;
         case RR_MODE_RECORD:
             rr_stop_recording();
@@ -555,7 +579,7 @@ void rr_framework_cleanup(void)
             break;
         case RR_MODE_FUZZING:
             rr_stop_fork_server();
-            // Fuzzing模式也需要停止replay，检查是否使用strace模式
+            // Fuzzing mode also needs to stop replay; check if strace mode is used
             if (rr_strace_replay_enabled()) {
                 rr_strace_replay_cleanup();
             } else {
@@ -566,30 +590,29 @@ void rr_framework_cleanup(void)
             break;
     }
 
-    /* 清理子系统 */
+    /* Clean up subsystems */
     RR_VERBOSE("Cleaning up subsystems");
 
-    /* ✅ C-Tree-P2: 导出Syscall Tree为JSON（仅在记录模式下） */
-    if (g_rr_framework->mode == RR_MODE_RECORD) {
+    /* Export Syscall Tree as HTML (Record and Fuzzing modes) */
+    if (g_rr_framework->mode == RR_MODE_RECORD || 
+        g_rr_framework->mode == RR_MODE_FUZZING || 
+        g_rr_framework->mode == RR_MODE_REPLAY) {
+        
         const char *tree_output = getenv("RR_TREE_OUTPUT");
-        if (tree_output) {
-            rr_tree_export_json(tree_output);
-        } else {
-            /* 默认输出到 /tmp/syscall_tree.json */
-            rr_tree_export_json("/tmp/syscall_tree.json");
-        }
+        // Pass tree_output directly (can be NULL for default /tmp/syscall_tree_{pid}.html)
+        rr_tree_export_json(tree_output);
     }
     rr_tree_cleanup();
     RR_VERBOSE("Syscall tree cleaned up");
 
-    /* 清理Coverage模块 */
+    /* Cleanup Coverage module */
     rr_coverage_cleanup();
     RR_VERBOSE("Coverage tracking cleaned up");
 
     rr_ipc_cleanup();
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE
-    /* 清理动态跟踪 */
+    /* Cleanup Dynamic Trace */
     rr_dynamic_trace_cleanup();
 #endif
     
@@ -598,14 +621,14 @@ void rr_framework_cleanup(void)
     rr_debug_cleanup();
     rr_config_cleanup();
 
-    /* 清理映射管理器 */
+    /* Cleanup mapping manager */
     rr_mapping_manager_cleanup();
 
-    /* 清理轨迹 */
+    /* Cleanup trace records */
     syscall_record_t *record = g_rr_framework->trace_head;
     while (record) {
         syscall_record_t *next = record->next;
-        /* 清理参数数据 */
+        /* Clean up argument data */
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (record->arg_data[i]) {
                 g_free(record->arg_data[i]);
@@ -621,42 +644,44 @@ void rr_framework_cleanup(void)
 }
 
 /**
- * @brief RR-Fuzz 框架的核心系统调用拦截处理函数
+ * @brief Core syscall interception and handling function of the RR-Fuzz framework.
  * 
- * 该函数是 RR-Fuzz 框架与 QEMU 的主要接入点，由 `linux-user/syscall.c` 中的
- * `do_syscall()` 在系统调用执行**之前**调用。根据当前运行模式 (record/replay/fuzzing),
- * 决定是记录、重放还是以修改的方式执行系统调用。
+ * This function serves as the primary entry point for the RR-Fuzz framework into QEMU.
+ * It is called by `do_syscall()` in `linux-user/syscall.c` BEFORE the syscall execution.
+ * Based on the current mode (record/replay/fuzzing), it decides whether to record, 
+ * replay, or execute the syscall with modifications.
  * 
- * **工作流程**:
- * - **Record 模式**: 返回 -1，让 QEMU 执行原始系统调用，结果在 post-hook 中记录
- * - **Replay 模式**: 调用 `rr_replay_syscall()` 或 `rr_replay_syscall_strace()`，
- *   根据 trace 文件确定性反现系统调用结果
- * - **Fuzzing 模式**: 类似 replay，但会应用 mutation 并支持 fork-server 机制
+ * **Workflow**:
+ * - **Record Mode**: Returns -1, allowing QEMU to execute the original syscall; results
+ *   are recorded in the post-hook.
+ * - **Replay Mode**: Calls `rr_replay_syscall()` or `rr_replay_syscall_strace()`, replaying
+ *   syscall results deterministically from the trace file.
+ * - **Fuzzing Mode**: Similar to replay but applies mutations and supports the fork-server mechanism.
  * 
- * **Fork-Server 机制** (✅ Early Fork):
- * 在 fuzzing 模式下，该函数在**第一个系统调用之前**就会进入 fork-server 循环，
- * 确保 fork 出的子进程从 `main()` 开始执行，自然完成整个 trace 的 replay。
+ * **Fork-Server Mechanism**:
+ * In fuzzing mode, this function enters the fork-server loop before the first syscall, 
+ * ensuring that forked child processes start execution from `main()`, naturally replaying the trace.
  * 
- * @param env CPU 架构状态指针 (CPUArchState)
- * @param num 系统调用编号 (syscall number)
- * @param arg1-arg8 系统调用的 8 个参数指针 (注意是指针，可被修改)
+ * @param env CPU architecture state pointer (CPUArchState).
+ * @param num Syscall number.
+ * @param arg1-arg8 Pointers to the 8 syscall arguments (can be modified).
  * 
  * @return abi_long
- *         - 非 -1: 由 RR-Fuzz 框架处理的系统调用返回值，QEMU 直接使用，不再执行原始 syscall
- *         - -1: RR-Fuzz 未处理，让 QEMU 执行原始系统调用 (record 模式或未启用时)
+ *         - Not -1: Syscall return value handled by RR-Fuzz; QEMU uses this directly.
+ *         - -1: Not handled by RR-Fuzz; let QEMU execute the original syscall (record mode or disabled).
  * 
- * @note 这是 pre-hook，在系统调用执行**之前**被调用
- * @note Fuzzing 模式下，fork-server 只会被初始化一次 (static bool fork_server_entered)
- * @note 退出相关的系统调用 (exit/exit_group) 在 record 模式下会被特殊处理
+ * @note This is a pre-hook, called BEFORE syscall execution.
+ * @note In fuzzing mode, the fork-server is initialized only once (static bool fork_server_entered).
+ * @note Exit-related syscalls (exit/exit_group) are handled specially in record mode.
  * 
- * @warning 此函数会直接修改参数指针 (arg1-arg8) 的值，在 fuzzing 模式下用于应用 mutation
- * @warning Fork-server 逻辑会导致进程 fork，调用者需考虑多进程场景
+ * @warning This function may directly modify the values pointed to by arg1-arg8 (used for mutations in fuzzing mode).
+ * @warning Fork-server logic results in process forking; callers must consider multi-process scenarios.
  * 
- * @see do_syscall() QEMU 中调用此函数的入口
- * @see rr_syscall_post_hook() 对应的 post-hook (系统调用执行之后)
- * @see rr_replay_syscall() Binary trace replay 实现
- * @see rr_replay_syscall_strace() Strace replay 实现
- * @see rr_fork_server_loop() Fork-server 循环实现
+ * @see do_syscall() QEMU entry point calling this function.
+ * @see rr_syscall_post_hook() Corresponding post-hook (after syscall execution).
+ * @see rr_replay_syscall() Binary trace replay implementation.
+ * @see rr_replay_syscall_strace() Strace replay implementation.
+ * @see rr_fork_server_loop() Fork-server loop implementation.
  */
 abi_long rr_do_syscall(CPUArchState *env, int num,
                        abi_long *arg1, abi_long *arg2, abi_long *arg3, abi_long *arg4,
@@ -666,31 +691,47 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
     if (!rr_framework_enabled()) {
         RR_VERBOSE("RR_DO_SYSCALL: Framework not enabled, returning -1");
-        return -1; // 让调用者执行原始逻辑
+        return -1; // Let caller execute original logic
     }
 
     RR_VERBOSE("RR_DO_SYSCALL: Framework enabled, mode=%d", g_rr_framework->mode);
 
-    /* ✅ FIX: 在第一个syscall之前进入fork server (方案B)
-     * 
-     * 策略：在target程序执行第一个syscall之前进入fork server loop
-     *      这样fork出的子进程会从main()开始自然执行
-     *      
-     * 优点：子进程自动replay整个trace，mutation自动应用
+    /**
+     * NOTE: Syscall tree recording is handled in post-hook only to ensure
+     * return values are available and correct.
+     */
+
+    /**
+     * [EARLY FORK] In fuzzing mode, enter the fork server loop before the target 
+     * program executes its first syscall. This ensures that all child processes 
+     * start naturally from main(), allowing for seamless replay and mutation.
      */
     static bool fork_server_entered = false;
+    // Debug check
+    static bool logged_fs_check = false;
+    if (!logged_fs_check) {
+         fprintf(stderr, "[DEBUG-RR] rr_do_syscall check: mode=%d, active=%d, entered=%d\n",
+                 g_rr_framework->mode, g_rr_framework->fork_server_active, fork_server_entered);
+         fflush(stderr);
+         logged_fs_check = true;
+    }
     if (!fork_server_entered && g_rr_framework->mode == RR_MODE_FUZZING && 
         g_rr_framework->fork_server_active) {
         
         fork_server_entered = true;
-        RR_INFO("🚀 [EARLY FORK] Entering fork server BEFORE first syscall");
-        RR_INFO("🚀 [EARLY FORK] This ensures child processes replay from main()");
+        RR_INFO("[EARLY FORK] Entering fork server BEFORE first syscall");
+        RR_INFO("[EARLY FORK] This ensures child processes replay from main()");
         
         int fork_result = rr_fork_server_loop();
         
         if (fork_result < 0) {
             RR_INFO("🔄 Fork server received quit command, exiting");
             exit(0);
+        } else if (fork_result == 2) {
+            /* Result 2 means "Advance State" (Checkpointing) */
+            RR_INFO("⏩ [CHECKPOINT] Parent received ADVANCE command. Target: %u", 
+                    g_rr_framework->checkpoint_target);
+            /* Fall through to let parent execute syscalls until target is reached */
         } else if (fork_result > 0) {
             RR_INFO("🔄 Child process %d will now execute syscalls from the beginning", getpid());
         } else {
@@ -698,7 +739,7 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
         }
     }
 
-    /* 添加醒目的系统调用入口提示 - 调试阶段使用 */
+    /* Syscall entry hint for debugging */
     const char* syscall_name = get_syscall_name(num);
     /* RR_INFO("===============================================================");    
     RR_INFO("=== ENTERING SYSCALL: %s (%d) === MODE: %s ===",
@@ -707,7 +748,7 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             g_rr_framework->mode == RR_MODE_REPLAY ? "REPLAY" :
             g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN"); */
 
-    /* 退出系统调用需要记录结果，但仍交由宿主执行 */
+    /* Exit syscalls need results recorded, but still executed by host */
     if (num == 231 || num == 60) {
         /* RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num); */
         if (g_rr_framework->mode == RR_MODE_RECORD) {
@@ -720,16 +761,16 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
     }
 
     abi_long args[8] = {*arg1, *arg2, *arg3, *arg4, *arg5, *arg6, *arg7, *arg8};
-    abi_long ret;
+    abi_long ret = -1;
 
     switch (g_rr_framework->mode) {
         case RR_MODE_RECORD:
-            /* 记录模式：执行原始系统调用，然后记录结果 */
-            ret = -1; // 返回-1让调用者执行原始逻辑
+            /* Record mode: execute original syscall, then record result */
+            ret = -1; // Return -1 to let caller execute original logic
             break;
 
         case RR_MODE_REPLAY:
-            /* 重放模式：根据类型选择重放方式 */
+            /* Replay mode: select replay method based on type */
             RR_VERBOSE("RR_DO_SYSCALL: Checking if strace replay is enabled...");
             if (rr_strace_replay_enabled()) {
                 RR_VERBOSE("RR_DO_SYSCALL: ABOUT TO CALL rr_replay_syscall_strace for syscall %d", num);
@@ -743,8 +784,43 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
             break;
 
         case RR_MODE_FUZZING:
-            /* Fuzzing模式：可能修改参数，然后重放 */
-            /* 根据是否使用strace模式选择replay函数 */
+            /* CHECKPOINT RE-ENTRY LOGIC */
+            /* If we have a checkpoint target and we reached it, re-enter fork server loop */
+            if (g_rr_framework->checkpoint_target > 0 && 
+                g_rr_framework->replay_index >= g_rr_framework->checkpoint_target) {
+                
+                RR_INFO("🛑 [CHECKPOINT] Reached target index %u (target=%u). Re-entering Fork Server.", 
+                        g_rr_framework->replay_index, g_rr_framework->checkpoint_target);
+                
+                g_rr_framework->checkpoint_target = 0;
+                g_rr_framework->silent_replay_mode = false;
+                
+                /* CHECKPOINT FIX: Signal fork server to resume previous 'C' command logic */
+                g_rr_framework->resume_from_checkpoint = true;
+                
+                int fork_result = rr_fork_server_loop();
+                
+                if (fork_result < 0) {
+                    exit(0);
+                } else if (fork_result == 2) {
+                    RR_INFO("⏩ [CHECKPOINT] Parent needing to ADVANCE further to %u", 
+                            g_rr_framework->checkpoint_target);
+                } else if (fork_result > 0) {
+                    RR_INFO("🔄 Child process continuing from checkpoint via fallthrough");
+                }
+            }
+
+            /**
+             * Autonomous Nested Fork: For deep-fuzzing (depth > 0), identify new 
+             * fork points within child processes to explore deeper execution paths.
+             */
+            if (g_rr_framework->is_autonomous_child && 
+                rr_should_nested_fork(num, get_syscall_name(num), ret)) {
+                rr_autonomous_nested_fork(g_rr_framework->replay_index);
+            }
+
+            /* Fuzzing mode: may modify parameters, then replay */
+            /* Select replay function based on whether strace mode is enabled */
             if (rr_strace_replay_enabled()) {
                 ret = rr_replay_syscall_strace_optimized(env, num, args);
             } else {
@@ -758,67 +834,20 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
                 exit(0);
             }
             
-            /* 
-             * ✅ FIX: 禁用旧的auto fork point检查
-             * 
-             * 原因：我们已经在第一个syscall之前进入fork server了（EARLY FORK）
-             *      不需要在syscall执行后再次fork
-             *      
-             * 保留代码作为参考，但添加条件永远为false
-             */
-            {
-                const char *syscall_name_auto = get_syscall_name(num);
-                
-                // ✅ 禁用：fork_server_entered总是true，所以永远不会进入
-                if (false && !fork_server_entered && rr_check_auto_fork_point(num, syscall_name_auto, ret)) {
-                    /* 进入Fork Server主循环 */
-                    RR_INFO("🔄 Entering fork server loop after %s", syscall_name_auto);
-                    int fork_result = rr_fork_server_loop();
-                    RR_INFO("🔄 Fork server loop returned: %d", fork_result);
-                    
-                    // ✅ DEBUG: 检查fork server返回后的状态
-                    fprintf(stderr, "[DEBUG-AFTER-FORK] PID=%d, fork_result=%d\n", getpid(), fork_result);
-                    fprintf(stderr, "[DEBUG-AFTER-FORK]   g_instruction_count=%zu\n", g_instruction_count);
-                    fflush(stderr);
-                    
-                    if (fork_result < 0) {
-                        RR_INFO("🔄 Exiting due to quit command");
-                        exit(0); // 收到退出命令
-                    } else if (fork_result > 0) {
-                        /* 子进程继续Fuzzing执行 */
-                        RR_INFO("🔄 Child process %d continuing fuzzing", getpid());
-                        fprintf(stderr, "[DEBUG-CHILD-CONTINUE] PID=%d will execute syscalls now\n", getpid());
-                        fprintf(stderr, "[DEBUG-CHILD-CONTINUE]   g_instruction_count=%zu at this point\n", g_instruction_count);
-                        fflush(stderr);
-                    } else {
-                        RR_INFO("🔄 Parent process %d continuing after fork", getpid());
-                    }
-                }
-                
-                /* ✅ 新增：Autonomous nested fork检查
-                 * 
-                 * 如果是autonomous child（depth > 0），在IO syscalls上检查是否应该嵌套fork
-                 */
-                if (g_rr_framework->is_autonomous_child && 
-                    rr_should_nested_fork(num, syscall_name_auto, ret)) {
-                    uint32_t fork_index = g_rr_framework->replay_index;
-                    rr_autonomous_nested_fork(fork_index);
-                }
-            }
             break;
 
         default:
             ret = -1;
             break;
     }
-    /* 将可能修改过的参数写回到指针中 */
+    /* Write back modified parameters to pointers */
     *arg1 = args[0]; *arg2 = args[1]; *arg3 = args[2]; *arg4 = args[3];
     *arg5 = args[4]; *arg6 = args[5]; *arg7 = args[6]; *arg8 = args[7];
 
-    /* ✅ 2025-11-17: IO Mutation 返回值覆盖已在 rr_replay_syscall() 中处理 */
-    /* 注意: ret 已经是覆盖后的值，由 rr_replay.c:655-664 处理 */
+    /* IO Mutation return value override is handled in rr_replay_syscall() */
+    /* NOTE: ret is already the overridden value, handled by rr_replay.c */
 
-    /* 添加醒目的系统调用退出提示 - 调试阶段使用 */
+    /* Syscall exit hint for debugging */
     RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %d ===",
             syscall_name, num, (int)ret);
     RR_INFO("===============================================================");
@@ -826,31 +855,31 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 }
 
 /**
- * @brief 处理 mmap 系统调用执行后的地址映射
+ * @brief Handles address mapping after mmap syscall execution.
  * 
- * 在 replay/fuzzing 模式下，由于 ASLR (Address Space Layout Randomization)，
- * mmap 返回的地址会与 record 阶段不同。该函数负责建立 record 地址到
- * replay 地址的映射关系，供后续内存相关系统调用 (munmap, mprotect 等) 使用。
+ * In replay/fuzzing mode, mmap return addresses may differ from the record stage 
+ * due to ASLR. This function establishes a mapping from the recorded address to
+ * the actual address, used by subsequent memory syscalls (munmap, mprotect, etc.).
  * 
- * @param recorded_addr mmap 在 record 阶段返回的地址 (从 trace 文件读取)
- * @param actual_addr mmap 在 replay 阶段实际返回的地址
+ * @param recorded_addr Address returned by mmap during record (read from trace).
+ * @param actual_addr Actual address returned by mmap during replay.
  * 
- * @note 该函数在 post-hook 中被调用，确保 mmap 已经实际执行完成
- * @note 地址映射信息存储在全局映射管理器中
+ * @note Called in post-hook to ensure mmap has actually executed.
+ * @note Mapping info is stored in the global mapping manager.
  * 
- * @warning 必须在 mmap 执行后立即调用，否则后续操作可能找不到正确的映射
+ * @warning Must be called immediately after mmap execution.
  * 
- * @see rr_addr_mapping_add() 地址映射管理器的添加函数
- * @see rr_syscall_post_hook() 调用此函数的 post-hook
- * @see g_pending_mmap_recorded_addr 保存 recorded_addr 的全局变量
+ * @see rr_addr_mapping_add() Mapping manager add function.
+ * @see rr_syscall_post_hook() Caller function.
+ * @see g_pending_mmap_recorded_addr Global storing recorded_addr.
  */
 void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr)
 {
     if (recorded_addr != actual_addr) {
-        /* 检查是否已存在映射 (可能是重复使用record导致的bug) */
+        /* Check if mapping exists (possible bug in trace reuse) */
         target_ulong existing = rr_addr_mapping_get(recorded_addr);
         if (existing != recorded_addr && existing != actual_addr) {
-            RR_WARN("⚠️  Overwriting existing mmap mapping: 0x%lx -> 0x%lx (old) with 0x%lx -> 0x%lx (new), size=%lu",
+            RR_WARN("Overwriting existing mmap mapping: 0x%lx -> 0x%lx (old) with 0x%lx -> 0x%lx (new), size=%lu",
                     (unsigned long)recorded_addr, (unsigned long)existing,
                     (unsigned long)recorded_addr, (unsigned long)actual_addr,
                     (unsigned long)g_pending_mmap_length);
@@ -864,37 +893,36 @@ void rr_handle_mmap_post(target_ulong recorded_addr, target_ulong actual_addr)
 }
 
 /**
- * @brief 系统调用执行后的通用 Hook 函数
+ * @brief Universal Hook function after syscall execution.
  * 
- * 该函数在 QEMU 执行完系统调用之后被调用，负责处理系统调用的
- * 各种副作用，包括：
- * - **Record 模式**: 记录系统调用的返回值和输出数据到 trace 文件
- * - **FD 管理**: 更新 FD 映射表 (open/close/dup 等调用)
- * - **地址映射**: 处理 mmap/munmap/mremap 的地址映射
- * - **Fuzzing 统计**: 更新 fuzzing 模式下的执行统计信息
+ * Called after QEMU executes a syscall, handling various side effects:
+ * - **Record Mode**: Record return values and output data to trace.
+ * - **FD Management**: Update FD mapping (open, close, dup, etc.).
+ * - **Address Mapping**: Handle mmap/munmap/mremap address mappings.
+ * - **Fuzzing Stats**: Update execution statistics in fuzzing mode.
  * 
- * **处理的主要系统调用类型**:
- * - 文件操作: open, openat, close, dup, dup2, dup3
- * - 内存管理: mmap, mmap2, munmap, mremap, mprotect
- * - 网络: socket, accept, accept4
- * - 进程管理: fork, vfork, clone
+ * **Mainly Handled Syscalls**:
+ * - File Ops: open, openat, close, dup, dup2, dup3
+ * - Memory Management: mmap, mmap2, munmap, mremap, mprotect
+ * - Networking: socket, accept, accept4
+ * - Process Management: fork, vfork, clone
  * 
- * @param env CPU 架构状态指针
- * @param num 系统调用编号
- * @param ret 系统调用的返回值
- * @param arg1-arg8 系统调用的 8 个参数值 (注意不是指针)
+ * @param env CPU architecture state pointer.
+ * @param num Syscall number.
+ * @param ret Syscall return value.
+ * @param arg1-arg8 The 8 syscall argument values (NOTE: these are values, not pointers).
  * 
- * @note 这是 post-hook，在系统调用执行**之后**被调用
- * @note 与 `rr_do_syscall` 不同，这里的 arg1-arg8 是值而不是指针
- * @note 包含一个大型 switch-case 结构 (L800-L900+)，处理各种系统调用
+ * @note This is a post-hook, called AFTER syscall execution.
+ * @note Unlike `rr_do_syscall`, arg1-arg8 here are values.
+ * @note Contains a large switch-case structure (L900+) for varied syscall handling.
  * 
- * @warning 该函数自身没有返回值，无法阻止 QEMU 的后续处理
- * @warning 包含大量 switch-case 逻辑，与 `rr_syscall_dispatch.c` 存在功能重复
+ * @warning This function has no return value and cannot stop subsequent QEMU processing.
+ * @warning Contains significant switch-case logic; overlaps with `rr_syscall_dispatch.c`.
  * 
- * @see rr_do_syscall() 对应的 pre-hook
- * @see rr_syscall_dispatch.c 更模块化的 syscall 处理方式
- * @see rr_record_syscall() Record 模式下记录系统调用
- * @see rr_fd_mapping_add() FD 映射管理
+ * @see rr_do_syscall() Corresponding pre-hook.
+ * @see rr_syscall_dispatch.c Modular syscall handling.
+ * @see rr_record_syscall() Recording syscall in record mode.
+ * @see rr_fd_mapping_add() FD mapping management.
  */
 void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                           abi_long arg1, abi_long arg2, abi_long arg3, abi_long arg4,
@@ -906,7 +934,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
         return;
     }
 
-    /* ✅ C-Tree-P2: 记录syscall节点到树结构 */
+    /* Record syscall node to tree structure */
     if (g_rr_framework) {
         uint64_t args_arr[6] = {
             (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
@@ -914,6 +942,22 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
         };
         uint32_t current_idx = (g_rr_framework->mode == RR_MODE_RECORD) ? 
                                g_rr_framework->trace_length : g_rr_framework->replay_index;
+        
+        /* Detect if this syscall was mutated in fuzzing mode */
+        bool was_mutated = false;
+        
+        if (g_rr_framework->mode == RR_MODE_FUZZING) {
+            /* Check if mutation occurred during replay of this syscall */
+            if (g_rr_framework->last_syscall_mutated) {
+                was_mutated = true;
+                RR_VERBOSE("POST_HOOK: Syscall #%u was mutated (flag detected)", current_idx);
+                
+                /* Reset flag */
+                g_rr_framework->last_syscall_mutated = false;
+            }
+        }
+
+        // Redundant g_instruction_count check removed (IsMutated handled by last_syscall_mutated flag)
         
         uint32_t node_id = rr_tree_add_syscall_node(
             getpid(),                               // PID
@@ -923,10 +967,11 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             args_arr,                                // args
             ret,                                     // retval
             0,                                       // timestamp_enter (auto)
-            0                                        // timestamp_exit (auto)
+            0,                                       // timestamp_exit (auto)
+            was_mutated                              /* is_mutated flag */
         );
 
-        /* ✅ C-Tree-P2: 检测fork系统调用并记录fork关系 */
+        /* Detect fork syscall and record fork relation */
         if ((num == 56 || num == 57 || num == 58) && ret > 0) {  // clone/fork/vfork
             rr_tree_add_fork_relation(node_id, (uint32_t)ret);
             RR_VERBOSE("Recorded fork relation: parent_node=%u, child_pid=%u", node_id, (uint32_t)ret);
@@ -934,7 +979,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
     }
 
     if (g_rr_framework->mode == RR_MODE_RECORD) {
-        /* 记录模式：记录系统调用结果 */
+        /* Record mode: record syscall result */
         RR_VERBOSE("POST_HOOK: Recording syscall %d with ret=%d", num, (int)ret);
         abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
 
@@ -949,32 +994,32 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
     }
     
     if (g_rr_framework->mode == RR_MODE_REPLAY || g_rr_framework->mode == RR_MODE_FUZZING) {
-        /* 重放模式：处理句柄映射 */
+        /* Replay mode: handle FD mapping */
         
-        /* 🔥 修复：先让 strace post_hook 运行，再检查标志 */
+        /* Ensure strace post_hook runs before checking flags */
         if (rr_strace_replay_enabled()) {
             abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
             rr_strace_syscall_post_hook(env, num, ret, args);
         }
         
-        /* 检查：如果这个系统调用已经在 rr_replay_syscall 中被消费（读取记录并递增索引），
-         * 就不要再做记录处理，避免重复 */
+        /* CHECK: If this syscall was already consumed in rr_replay_syscall 
+         * (record read and index incremented), do not process again to avoid duplication. */
         if (g_syscall_already_consumed) {
             syscall_record_t *record = g_pending_post_record;
             g_syscall_already_consumed = false;
             g_pending_post_record = NULL;
 
             if (record) {
-                /* 🔥 P0: 偏离检测 - 验证返回值是否与 trace 一致 */
+                /* Deviation detection - verify return value matches trace */
                 if (record->retval != ret) {
                     if (is_expected_deviation(num, record->retval, ret)) {
-                        /* 预期的偏离 (如 ASLR),只在 VERBOSE 级别输出 */
+                        /* Expected deviation (e.g., ASLR); log at VERBOSE level only */
                         RR_VERBOSE("Expected deviation: syscall=%d (%s), recorded=0x%lx, actual=0x%lx",
                                    num, get_syscall_name(num), 
                                    (unsigned long)record->retval, (unsigned long)ret);
                     } else {
-                        /* 非预期的偏离,需要警告 */
-                        RR_WARN("⚠️  UNEXPECTED DEVIATION: syscall=%d (%s), recorded_ret=%ld, actual_ret=%ld (diff=%ld)",
+                        /* Unexpected deviation, issue warning */
+                        RR_WARN("UNEXPECTED DEVIATION: syscall=%d (%s), recorded_ret=%ld, actual_ret=%ld (diff=%ld)",
                                 num, get_syscall_name(num), (long)record->retval, (long)ret, (long)(ret - record->retval));
                         g_rr_framework->deviation_count++;
                     }
@@ -1084,7 +1129,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                     break;
                 }
 
-                /* 动态跟踪：系统调用退出（Hybrid 路径） */
+                /* Dynamic trace: Syscall exit (Hybrid path) */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
                 rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)&arg1, ret,
                                                 g_rr_framework->replay_index - 1, 0);
@@ -1113,13 +1158,10 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             g_pending_mmap_length = 0;
         }
 
-        /* 🔥 修复：始终发送EXIT消息以保证tree visualization完整性
-         * Silent mode的目的是性能优化，不应该影响消息完整性
-         * 即使在silent replay期间，tree visualizer也需要接收完整的syscall消息
-         */
+        /* Always send EXIT message to preserve tree visualization integrity */
         abi_long args[8] = {arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8};
         rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
-                                       g_rr_framework->replay_index - 1, false);  // -1因为已递增
+                                       g_rr_framework->replay_index - 1, false);  // -1 because it's already incremented
         
         RR_VERBOSE("POST_HOOK: Replay mode, syscall=%d, ret=%d", num, (int)ret);
         return;

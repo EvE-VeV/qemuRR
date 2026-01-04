@@ -1,8 +1,8 @@
 /**
- * RR-Fuzz 系统调用分类信息
+ * RR-Fuzz Syscall Classification Information
  * 
- * 基于 EnvFuzz 的 P_IO 分类策略
- * 只对数据传输类系统调用进行 fuzzing
+ * Based on the P_IO classification strategy from EnvFuzz.
+ * Primarily focuses on fuzzing data-transfer syscalls.
  */
 
 #ifndef RR_SYSCALL_INFO_H
@@ -11,51 +11,51 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* 系统调用分类（参考 EnvFuzz） */
+/* Syscall classes (referencing EnvFuzz) */
 typedef enum {
-    SYSCALL_CLASS_MISC = 0,    /* 杂项 */
-    SYSCALL_CLASS_FD   = 1,    /* 文件描述符管理（open, close, socket...） */
-    SYSCALL_CLASS_IO   = 2,    /* I/O 数据传输 - fuzzing 目标！ */
-    SYSCALL_CLASS_INFO = 3,    /* 信息查询（stat, getpid...） */
-    SYSCALL_CLASS_MEM  = 4,    /* 内存管理（mmap, brk...） */
-    SYSCALL_CLASS_SIG  = 5,    /* 信号处理 */
-    SYSCALL_CLASS_THR  = 6,    /* 线程管理 */
-    SYSCALL_CLASS_PROC = 7,    /* 进程管理（fork, execve...） */
+    SYSCALL_CLASS_MISC = 0,    /* Miscellaneous */
+    SYSCALL_CLASS_FD   = 1,    /* File descriptor management (open, close, socket...) */
+    SYSCALL_CLASS_IO   = 2,    /* I/O data transfer - Fuzzing target! */
+    SYSCALL_CLASS_INFO = 3,    /* Information query (stat, getpid...) */
+    SYSCALL_CLASS_MEM  = 4,    /* Memory management (mmap, brk...) */
+    SYSCALL_CLASS_SIG  = 5,    /* Signal handling */
+    SYSCALL_CLASS_THR  = 6,    /* Thread management */
+    SYSCALL_CLASS_PROC = 7,    /* Process management (fork, execve...) */
 } syscall_class_t;
 
-/* 系统调用信息 */
+/* Syscall information */
 typedef struct {
-    int nr;                    /* 系统调用号 */
-    const char *name;          /* 名称 */
-    syscall_class_t class;     /* 分类 */
-    bool is_input;             /* 是否为输入方向（read: true, write: false） */
+    int nr;                    /* Syscall number */
+    const char *name;          /* Name */
+    syscall_class_t class;     /* Classification */
+    bool is_input;             /* Is input direction (read: true, write: false) */
 } syscall_info_t;
 
-/* ===== 核心函数 ===== */
+/* ===== Core Functions ===== */
 
 /**
- * 获取系统调用信息
- * @param syscall_nr 系统调用号
- * @return 系统调用信息，如果未找到返回默认信息
+ * Get syscall information.
+ * @param syscall_nr Syscall number
+ * @return Syscall info, or default if not found.
  */
 const syscall_info_t *rr_get_syscall_info(int syscall_nr);
 
 /**
- * 判断是否应该自动 fork（EnvFuzz 策略）
+ * Determine whether to auto fork (EnvFuzz strategy).
  * 
- * 充要条件:
- * 1. 是 P_IO 类（数据传输）
- * 2. inbound 方向（输入，如 read）
- * 3. 返回值 > 0（有数据）
+ * Necessary and sufficient conditions:
+ * 1. P_IO class (data transfer)
+ * 2. Inbound direction (input, e.g., read)
+ * 3. Return value > 0 (data available)
  * 
- * @param syscall_nr 系统调用号
- * @param ret 系统调用返回值
- * @return true 表示应该 fork
+ * @param syscall_nr Syscall number
+ * @param ret Syscall return value
+ * @return true if fork should occur
  */
 bool rr_should_auto_fork(int syscall_nr, abi_long ret);
 
 /**
- * 获取系统调用分类名称（用于日志）
+ * Get syscall class name (for logging).
  */
 const char *rr_get_syscall_class_name(syscall_class_t class);
 

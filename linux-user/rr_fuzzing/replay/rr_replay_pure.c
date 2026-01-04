@@ -1,12 +1,12 @@
 /**
- * RR-Fuzz 纯确定性重放模块
- * Pure Deterministic Replay - EnvFuzz 风格
+ * RR-Fuzz Pure Deterministic Replay Module
+ * Pure Deterministic Replay - EnvFuzz style
  * 
- * 完全独立的重放实现：
- * - 使用 AUX 数据完全恢复
- * - 不执行真实 syscall
- * - 不修改 args（不应用 FD 映射）
- * - 完全确定性执行
+ * Fully independent replay implementation:
+ * - Complete restoration using AUX data
+ * - No real syscall execution
+ * - No argument modification (no FD mapping application)
+ * - Fully deterministic execution
  */
 
 #define RR_DEBUG 1
@@ -18,60 +18,62 @@
 #include <unistd.h>
 
 /**
- * @brief 纯确定性重放 - 完全在用户态恢复系统调用，不执行真实 syscall
+ * @brief Pure Deterministic Replay - Restore syscall in userspace without real execution
  * 
- * 这是 RR-Fuzz 的核心创新之一，实现了 EnvFuzz 风格的确定性重放。
- * 对于已捕获 aux_data 的系统调用，直接从 aux_data 恢复内存状态和返回值，
- * **完全绕过**真实的系统调用执行，从而：
- * 1. 消除 syscall 开销，提升 replay 性能
- * 2. 避免与操作系统交互，提高确定性
- * 3. 支持离线分析（不需要实际的文件/网络资源）
+ * One of the core innovations of RR-Fuzz, implementing EnvFuzz-style deterministic replay.
+ * For syscalls with captured aux_data, the memory state and return value are restored
+ * directly from aux_data, COMPLETELY BYPASSING the real system call execution.
  * 
- * **支持的系统调用类型**:
- * - ✅ **输入类 I/O**: read, pread64, recv, recvfrom
- * - ✅ **非确定性源**: getrandom (关键！确保随机性可重现)
- * - ✅ **特殊 ioctl**: 带输出缓冲区的 ioctl 命令
- * - ❌ **输出类 I/O**: write, send (必须真实执行以维持 I/O 状态)
- * - ❌ **内存管理**: mmap, brk (必须真实执行以维持 QEMU 内存映射状态)
+ * Benefits:
+ * 1. Eliminates syscall overhead, improving replay performance.
+ * 2. Avoids interaction with the OS, increasing determinism.
+ * 3. Supports offline analysis (no actual file/network resources needed).
  * 
- * **工作原理**:
- * 1. 检查 record 是否有 aux_data (has_aux_data)
- * 2. 根据 syscall 类型查找对应的 aux_data 条目（按 arg_index）
- * 3. 使用 cpu_memory_rw_debug() 将 aux_data 写入 guest 内存
- * 4. 直接返回记录的 retval，QEMU 不会执行真实 syscall
+ * Supported Syscall Types:
+ * - Input I/O: read, pread64, recv, recvfrom
+ * - Non-deterministic sources: getrandom (Crucial! Ensures reproducibility of randomness)
+ * - Special ioctl: ioctl commands with output buffers
+ * - (Unsupported) Output I/O: write, send (Must execute to maintain I/O state)
+ * - (Unsupported) Memory management: mmap, brk (Must execute to maintain QEMU memory mapping)
  * 
- * @param env CPU 架构状态指针（用于写入 guest 内存）
- * @param num 系统调用编号
- * @param args 系统调用参数数组（8个参数），Pure replay 可能会修改某些参数
- * @param record 从 trace 文件读取的系统调用记录（包含 aux_data）
+ * Principles:
+ * 1. Check if record has aux_data (has_aux_data).
+ * 2. Find corresponding aux_data entry based on syscall type (by arg_index).
+ * 3. Write aux_data to guest memory using cpu_memory_rw_debug().
+ * 4. Return recorded retval directly; QEMU will not execute the real syscall.
+ * 
+ * @param env CPU architecture state pointer (for guest memory writes)
+ * @param num System call number
+ * @param args System call arguments array (8 arguments), Pure replay might modify some
+ * @param record Syscall record read from trace file (containing aux_data)
  * 
  * @return abi_long
- *         - >= 0: Pure replay 成功，返回记录的 retval
- *         - -1: 不支持 pure replay 或失败，需要回退到 Hybrid replay
+ *         - >= 0: Pure replay successful, returns recorded retval
+ *         - -1: Pure replay not supported or failed, fallback to Hybrid replay
  * 
- * @note 如果没有 aux_data 或 aux_data 为空，会立即返回 -1 (回退到 hybrid)
- * @note 对于 write/send 等输出调用，强制返回 -1 以确保真实执行
- * @note 对于 mmap/brk，强制返回 -1 因为需要 QEMU 维护内存映射
+ * @note Returns -1 immediately if no aux_data is present or if it's empty.
+ * @note Force returns -1 for output calls like write/send to ensure real execution.
+ * @note Force returns -1 for mmap/brk as QEMU must maintain memory mappings.
  * 
- * @warning cpu_memory_rw_debug 失败会打印错误但仍返回 -1（回退到 hybrid）
- * @warning 必须确保 aux_data 的 arg_index 与实际参数索引匹配
+ * @warning cpu_memory_rw_debug failure logs an error and returns -1 (fallback to hybrid).
+ * @warning Ensure aux_data arg_index matches the actual argument index.
  * 
- * @see rr_replay_syscall() 调用此函数，如果返回 -1 则执行 hybrid replay
- * @see rr_aux_find() 从 aux_data 链表中查找指定 arg_index 的条目
- * @see capture_syscall_args_aux() Record 阶段创建 aux_data 的对应函数
- * @see cpu_memory_rw_debug() QEMU 提供的 guest 内存读写函数
+ * @see rr_replay_syscall() Calls this function, if it returns -1, hybrid replay is executed.
+ * @see rr_aux_find() Finds the entry with the specified arg_index from the aux_data linked list.
+ * @see capture_syscall_args_aux() Corresponding function for creating aux_data during the Record phase.
+ * @see cpu_memory_rw_debug() QEMU function for reading/writing guest memory.
  */
 abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
                                 syscall_record_t *record)
 {
     if (!record->has_aux_data || !record->aux_data) {
         RR_VERBOSE("PURE_REPLAY: No aux_data for syscall %d", num);
-        return -1; /* 回退到 hybrid */
+        return -1; /* Fallback to hybrid */
     }
 
     RR_VERBOSE("PURE_REPLAY: Replaying syscall %d with aux_data", num);
 
-    /* 根据系统调用类型从 AUX 数据恢复 */
+    /* Restore from AUX data based on syscall type */
     switch (num) {
         case TARGET_NR_brk:
 #if defined(TARGET_NR_mmap)
@@ -81,19 +83,19 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
         case TARGET_NR_mmap2:
 #endif
         {
-            /* brk/mmap 需要真实执行以维护QEMU内部状态，这里直接回退 */
+            /* brk/mmap require real execution to maintain QEMU internal state; fallback directly */
             RR_VERBOSE("PURE_REPLAY: Syscall %d requires hybrid path, fallback", num);
             return -1;
         }
 
         case TARGET_NR_read: {
-            /* 从 aux_data 恢复读取的数据 */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1); /* arg[1] 是缓冲区 */
+            /* Restore read data from aux_data */
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1); /* arg[1] is the buffer */
             if (aux && aux->data && aux->size > 0) {
-                /* 写入数据到 guest 内存 */
+                /* Write data to guest memory */
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
                     RR_VERBOSE("PURE_REPLAY: Restored %u bytes for read()", aux->size);
-                    return record->retval; /* 返回记录的返回值，不执行真实 read */
+                    return record->retval; /* Return recorded retval, skip real read */
                 } else {
                     RR_ERROR("PURE_REPLAY: Failed to write data for read()");
                 }
@@ -103,9 +105,9 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
         case TARGET_NR_write:
         case TARGET_NR_writev: {
-            /* 输出系统调用不支持Pure Replay，必须真实执行以维持I/O状态 */
+            /* Output syscalls not supported in Pure Replay; must execute to maintain I/O state */
             RR_VERBOSE("PURE_REPLAY: Output syscall write/writev, falling back to real execution");
-            return -1; /* 返回-1让hybrid模式真实执行 */
+            return -1; /* Let hybrid mode execute real syscall */
         }
 
 #ifdef TARGET_NR_getrandom
@@ -114,8 +116,8 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
         case 318: /* x86_64 getrandom */
 #endif
         {
-            /* 恢复随机数据 - 确定性的关键 */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0); /* arg[0] 是缓冲区 */
+            /* Restore random data - Crucial for determinism */
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0); /* arg[0] is the buffer */
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[0], aux->data, aux->size, 1) == 0) {
                     RR_VERBOSE("PURE_REPLAY: Restored %u bytes of random data", aux->size);
@@ -129,7 +131,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
 #ifdef TARGET_NR_pread64
         case TARGET_NR_pread64: {
-            /* 恢复 pread64 数据 */
+            /* Restore pread64 data */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -145,7 +147,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom: {
-            /* 恢复接收的网络数据 */
+            /* Restore received network data */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -161,7 +163,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
 #ifdef TARGET_NR_recv
         case TARGET_NR_recv: {
-            /* 恢复 recv 数据 */
+            /* Restore recv data */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -179,43 +181,43 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
         case TARGET_NR_send:
         case TARGET_NR_sendto:
         case TARGET_NR_sendmsg:
-            /* 输出系统调用不支持Pure Replay，必须真实执行 */
+            /* Output syscalls not supported in Pure Replay; must execute */
             RR_VERBOSE("PURE_REPLAY: Output syscall send/sendto/sendmsg, falling back to real execution");
             return -1;
 #endif
 
         case TARGET_NR_ioctl: {
-            /* ioctl Pure Replay - 从 AUX 数据恢复输出缓冲区 */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 2); /* arg[2] 是缓冲区 */
+            /* ioctl Pure Replay - Restore output buffer from AUX data */
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 2); /* arg[2] is the buffer */
             if (aux && aux->kind == AUX_IOCTL_OUTPUT && aux->data && aux->size > 0) {
-                /* 直接写回输出缓冲区 */
+                /* Write back to output buffer directly */
                 if (cpu_memory_rw_debug(env_cpu(env), args[2], aux->data, aux->size, 1) == 0) {
                     RR_VERBOSE("PURE_REPLAY: Restored %u bytes ioctl output for cmd=0x%lx", 
                                aux->size, (unsigned long)args[1]);
-                    return record->retval; /* Pure replay 成功,返回记录的返回值 */
+                    return record->retval; /* Pure replay successful, return recorded retval */
                 } else {
                     RR_ERROR("PURE_REPLAY: Failed to write ioctl output buffer");
                 }
             } else {
-                /* 没有捕获的输出数据,可能是不支持的 ioctl 命令 */
+                /* No captured output data, might be an unsupported ioctl command */
                 RR_VERBOSE("PURE_REPLAY: No ioctl output data, fallback to hybrid");
             }
             break;
         }
 
         default:
-            /* 其他系统调用暂不支持纯重放 */
+            /* Other syscalls not yet supported in Pure Replay */
             RR_VERBOSE("PURE_REPLAY: Syscall %d not supported in pure mode", num);
             return -1;
     }
 
-    /* 如果没有成功恢复，回退到 hybrid 模式 */
+    /* Fallback to hybrid mode if restoration didn't succeed */
     RR_VERBOSE("PURE_REPLAY: Failed to replay syscall %d, fallback to hybrid", num);
     return -1;
 }
 
 /**
- * 检查系统调用是否支持纯重放
+ * Check if the syscall supports Pure Replay
  */
 bool rr_replay_pure_supported(int syscall_nr)
 {
@@ -253,11 +255,11 @@ bool rr_replay_pure_supported(int syscall_nr)
 }
 
 /**
- * 打印纯重放统计信息
+ * Print Pure Replay statistics
  */
 void rr_replay_pure_print_stats(void)
 {
-    /* TODO: 添加统计信息 */
+    /* TODO: Add statistics */
     RR_INFO("Pure replay statistics: (not implemented yet)");
 }
 

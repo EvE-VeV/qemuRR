@@ -39,7 +39,6 @@ __pycache__/
 
 # Fuzzing输出
 fuzzing_summary_*.json
-*.html
 analysis_reports/
 
 # 编辑器临时文件

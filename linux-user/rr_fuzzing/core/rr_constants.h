@@ -1,12 +1,12 @@
 /**
- * RR-Fuzz 统一常量定义
+ * RR-Fuzz Unified Constant Definitions
  * 
- * 目的：消除魔数，统一管理所有常量
+ * Purpose: Centralized management of constants to eliminate magic numbers.
  * 
- * 维护规则：
- * 1. 每个常量必须有注释说明来源和理由
- * 2. 相关常量按功能分组
- * 3. 修改常量时检查所有使用位置
+ * Maintenance Rules:
+ * 1. Every constant must be commented with its origin and rationale.
+ * 2. Related constants should be grouped by function.
+ * 3. Check all usage locations when modifying a constant.
  */
 
 #ifndef RR_CONSTANTS_H
@@ -17,292 +17,270 @@
 #include <poll.h>          // struct pollfd
 #include <sys/epoll.h>     // struct epoll_event
 
-/* ========== 系统调用相关 ========== */
+/* Syscall Related */
 
 /**
- * 系统调用最大参数数量
+ * Maximum number of syscall arguments
  * 
- * 来源：x86-64 ABI 规范
- * - 6 个寄存器参数 (rdi, rsi, rdx, r10, r8, r9)
- * - 2 个预留位置（用于未来扩展或特殊情况）
+ * Source: x86-64 ABI Specification
+ * - 6 register arguments (rdi, rsi, rdx, r10, r8, r9)
+ * - 2 reserved slots for future expansion or special cases
  */
 #define RR_MAX_SYSCALL_ARGS     8
 
 /**
- * 系统调用号上限
+ * Upper limit of syscall number
  * 
- * 来源：Linux kernel syscall table
- * - x86-64: 目前最大约 450
- * - 设置为 512 留有余量
+ * Source: Linux kernel syscall table
+ * - x86-64: currently ~450
+ * - Set to 512 for future scalability
  */
 #define RR_MAX_SYSCALL_NR       512
 
-/* ========== 文件描述符相关 ========== */
+/* File Descriptor Related */
 
 /**
- * 用户态文件描述符起始编号
+ * Starting number for user-space file descriptors
  * 
- * 来源：POSIX 标准
+ * Source: POSIX Standard
  * - 0: stdin
  * - 1: stdout
  * - 2: stderr
- * - 3+: 用户文件描述符
+ * - 3+: User file descriptors
  */
 #define RR_FIRST_USER_FD        3
 
 /**
- * FD 检查的最大范围
+ * Maximum range for FD checks
  * 
- * 来源：Linux 默认 soft limit (ulimit -n)
- * - 通常为 1024
- * - 用于遍历查找可用 FD
+ * Source: Linux default soft limit (ulimit -n)
+ * - Usually 1024
+ * - Used to traverse and find available FDs
  */
 #define RR_MAX_CHECKED_FD       1024
 
-/* ========== 缓冲区大小 ========== */
+/* Buffer Sizes */
 
 /**
- * 路径字符串最大长度
+ * Maximum length for path strings
  * 
- * 来源：POSIX PATH_MAX
- * - Linux: 4096 字节
+ * Source: POSIX PATH_MAX
+ * - Linux: 4096 bytes
  */
 #define RR_MAX_PATH_LENGTH      PATH_MAX
 
 /**
- * 内联存储的缓冲区阈值
+ * Threshold for inline buffer storage
  * 
- * 来源：内存页大小
- * - 小于 4KB 的数据直接内联存储
- * - 大于 4KB 考虑外部存储
- * 理由：避免频繁的小内存分配
+ * Source: Memory page size
+ * - Data < 4KB is stored inline
+ * - Data > 4KB considered for external storage
+ * Rationale: Avoid frequent small memory allocations.
  */
 #define RR_MAX_BUFFER_INLINE    (4 * 1024)
 
 /**
- * 记录单个缓冲区的最大大小
+ * Maximum size for single recorded buffer
  * 
- * 来源：经验值 + 性能考虑
- * - 64KB 是常见的网络 buffer 大小
- * - 超过此值可能导致内存膨胀
- * 理由：平衡记录完整性和内存开销
+ * Source: Empirical analysis + performance consideration
+ * - 64KB is common for network buffers
+ * - Exceeding this may cause memory bloat
+ * Rationale: Balance between recording completeness and memory overhead.
  */
 #define RR_MAX_BUFFER_TOTAL     (64 * 1024)
 
 /**
- * ioctl payload 最大大小
+ * Maximum size for ioctl payload
  * 
- * 来源：内核 ioctl 实现
- * - 大多数 ioctl 命令的参数 < 4KB
- * - 某些设备可能超出，但罕见
+ * Source: Kernel ioctl implementation
+ * - Most ioctl commands have arguments < 4KB
+ * - Some devices may exceed this, but rare
  */
 #define RR_MAX_IOCTL_PAYLOAD    4096
 
 /**
- * sockaddr 结构体最大大小
+ * Maximum size for sockaddr structure
  * 
- * 来源：sizeof(struct sockaddr_storage)
- * - IPv4: 16 字节
- * - IPv6: 28 字节
- * - sockaddr_storage: 128 字节（容纳所有协议）
+ * Source: sizeof(struct sockaddr_storage)
+ * - IPv4: 16 bytes
+ * - IPv6: 28 bytes
+ * - sockaddr_storage: 128 bytes (accommodates all protocols)
  */
 #define RR_MAX_SOCKADDR_SIZE    128
 
 /**
- * iovec 数组最大元素数量
+ * Maximum number of iovec array elements
  * 
- * 来源：Linux kernel UIO_MAXIOV
- * - readv/writev 的最大向量数量
- * - 定义在 <linux/uio.h>，值为 1024
+ * Source: Linux kernel UIO_MAXIOV
+ * - Maximum number of vectors for readv/writev
+ * - Defined in <linux/uio.h> as 1024
  */
 #define RR_MAX_IOVEC_COUNT      1024
 
 /**
- * getdents 缓冲区典型大小
+ * Typical buffer size for getdents
  * 
- * 来源：libc 实现和性能测试
- * - glibc 使用 32KB buffer
- * - 足够一次读取大多数目录
+ * Source: libc implementation and performance tests
+ * - glibc uses 32KB buffer
+ * - Sufficient for most directory reads
  */
 #define RR_GETDENTS_BUF_SIZE    (32 * 1024)
 
-/* ========== Fuzzing 相关 ========== */
+/* Fuzzing Related */
 
 /**
- * Fuzzing 共享内存魔数
+ * Fuzzing shared memory magic number
  * 
- * 来源：ASCII "FUZZ"
- * - 用于验证共享内存格式正确性
+ * Source: ASCII "FUZZ"
+ * - Used to verify shared memory format integrity
  */
 #define RR_FUZZ_MAGIC           0x46555A5A
 
 /**
- * Fuzzing 指令队列最大长度
+ * Maximum length of fuzzing instruction queue
  * 
- * 来源：共享内存大小计算
- * - 共享内存: 64KB
+ * Source: Shared memory size calculation
+ * - Shared memory: 64KB
  * - Header: ~40 bytes
- * - 每条指令: ~270 bytes (header + data)
- * - 理论上限: (64KB - 40) / 270 ≈ 242
- * - 实际设置: 32（保守值，AFL mutation queue 平均长度）
+ * - Instruction: ~270 bytes (header + data)
+ * - Theoretical limit: (64KB - 40) / 270 ≈ 242
+ * - Actual setting: 32 (Conservative, based on AFL mutation queue average)
  * 
- * 权衡：
- * - 更大：可以发送更多变异指令
- * - 更小：减少共享内存复杂度，提高可靠性
+ * Trade-offs:
+ * - Higher: Allows more mutation instructions.
+ * - Lower: Reduces complexity and increases reliability.
  */
 #define RR_FUZZ_MAX_INSTRUCTIONS    32
 
 /**
- * 每条 Fuzzing 指令的数据负载大小
+ * Data payload size for each fuzzing instruction
  * 
- * 来源：常见 payload 大小分析
- * - 256 字节足够容纳：
- *   * 短文件路径 (< 100 字节)
- *   * 小结构体 (stat: 144 字节, timeval: 16 字节)
- *   * 短字符串和少量随机数据
+ * Source: Common payload size analysis
+ * - 256 bytes is sufficient for:
+ *   * Short file paths (< 100 bytes)
+ *   * Small structs (stat: 144 bytes, timeval: 16 bytes)
+ *   * Short strings and small random data
  * 
- * 不适用于：
- * - 大缓冲区变异（需要专门机制）
- * - 文件内容（应该通过文件系统）
+ * Note: Not suitable for large buffer mutations or full file contents.
  */
 #define RR_FUZZ_INSTRUCTION_DATA    256
 
 /**
- * Fuzzing 共享内存总大小
+ * Total size of fuzzing shared memory
  * 
- * 来源：计算得出
- * - 必须容纳：header + (instructions × instruction_size)
- * - 必须与 Python 端一致！
+ * Source: Calculated based on Header + (Instructions × Instruction Size)
+ * - Must be synchronized with the Python side
  *
- * ⚠️ 修改此值时必须同步更新：
- * - fuzzing/conductor/constants.py 中的 FUZZ_SHM_SIZE
+ * Update triggers:
+ * - conductor/constants.py: FUZZ_SHM_SIZE
  * - config/template/rr_config.fuzzing.template
  *
- * ✅ 修复: 增加到128KB以容纳完整FuzzSharedMemory结构
- * - Header: 36B + instructions[32]: 8960B + variants[10]: 89640B = 98636B
- * - 128KB提供足够缓冲空间
+ * Note: Increased to 128KB to accommodate FuzzSharedMemory structure.
  */
 #define RR_FUZZ_SHM_SIZE        (128 * 1024)
 
 /**
- * 初始化阶段 Syscall 数量阈值
+ * Threshold for syscalls during initialization phase
  *
- * 来源：经验值（启发式）
- * - 大多数程序的前 25 个 syscall 包含初始化
- * - 包括：mmap、brk、set_tid_address、arch_prctl、动态链接等
+ * Source: Empirical value (heuristic)
+ * - Most initializations (mmap, brk, dynamic linking, etc.) happen within the first 25 syscalls.
  *
- * ⚠️ 这是临时方案！
- * TODO: 实现自适应检测（基于符号、时间或状态机）
- *
- * 使用建议：
- * - 可通过配置文件覆盖
- * - 未来应该改为动态检测
- *
- * ✅ 与Python端同步 (conductor/constants.py: INIT_PHASE_THRESHOLD = 25)
+ * Note: Currently a static limit. Future implementation should be adaptive.
  */
 #define RR_INIT_PHASE_THRESHOLD     25
 
-/* ========== 映射管理 ========== */
+/* Mapping Management */
 
 /**
- * FD 映射哈希表桶数量
+ * Number of hash table buckets for FD mapping
  * 
- * 来源：性能测试
- * - 假设同时打开 FD 数量 < 100
- * - 256 桶提供足够的分散性（平均每桶 < 1 个元素）
- * - 2 的幂次方，优化哈希计算
+ * Source: Performance testing
+ * - Assuming < 100 simultaneous open FDs.
+ * - 256 buckets provide sufficient dispersion.
+ * - Power of 2 optimized for hashing.
  */
 #define RR_FD_MAPPING_BUCKETS       256
 
 /**
- * 地址映射哈希表桶数量
+ * Number of hash table buckets for address mapping
  * 
- * 来源：内存映射区域数量估计
- * - 典型程序: 10-50 个 mmap 区域
- * - 128 桶提供合理的性能
- * - 比 FD 少，因为地址映射相对稳定
+ * Source: Memory mapping region estimation
+ * - Typical program has 10-50 mmap regions.
+ * - 128 buckets provide reasonable performance.
  */
 #define RR_ADDR_MAPPING_BUCKETS     128
 
-/* ========== IPC 相关 ========== */
+/* IPC Related */
 
 /**
- * IPC 操作超时时间（毫秒）
+ * IPC operation timeout (milliseconds)
  * 
- * 来源：用户体验考虑
- * - 1 秒足够完成大多数 IPC 操作
- * - 太短：正常操作超时
- * - 太长：挂起时等待过久
+ * Source: User experience
+ * - 1 second is sufficient for most IPC operations.
  */
 #define RR_IPC_TIMEOUT_MS           1000
 
 /**
- * 动态追踪管道缓冲区大小
+ * Dynamic trace pipe buffer size
  * 
- * 来源：Linux pipe 默认最大值
- * - fcntl(F_SETPIPE_SZ) 上限通常为 1MB
- * - 用于高吞吐量的实时追踪
+ * Source: Linux default pipe maximum
+ * - fcntl(F_SETPIPE_SZ) limit is usually 1MB.
+ * - Used for high-throughput real-time tracing.
  */
 #define RR_DYNAMIC_TRACE_PIPE_SIZE  (1024 * 1024)
 
-/* ========== 覆盖率追踪 ========== */
+/* Coverage Tracking */
 
 /**
- * 覆盖率 bitmap 大小
+ * Coverage bitmap size
  * 
- * 来源：AFL 标准
- * - 64KB 是 AFL 的默认 bitmap 大小
- * - 足够记录大多数程序的边覆盖
- * - 权衡：更大的 bitmap 可以减少哈希冲突，但增加内存开销
+ * Source: AFL standard
+ * - 64KB is the default AFL bitmap size.
+ * - Sufficient for recording edge coverage for most programs.
  */
 #define RR_COVERAGE_BITMAP_SIZE     (64 * 1024)
 
 /**
- * 覆盖率边哈希种子
+ * Hash seed for coverage edges
  * 
- * 来源：随机选择的质数
- * - 用于计算 (from_pc, to_pc) → bitmap_index
+ * Source: Randomly selected prime number
+ * - Used to calculate (from_pc, to_pc) → bitmap_index
  */
 #define RR_COVERAGE_HASH_SEED       0x12345678
 
-/* ========== 调试和日志 ========== */
+/* Debugging and Logging */
 
 /**
- * 配置文件行缓冲区大小
+ * Size for config file line buffer
  * 
- * 来源：典型配置文件行长度
- * - 大多数配置行 < 200 字节
- * - 256 字节足够容纳注释和长路径
+ * Source: Typical config line length (< 200 bytes)
  */
 #define RR_CONFIG_LINE_BUFFER       256
 
 /**
- * Strace 重放前瞻数量
+ * Strace replay lookahead count
  * 
- * 来源：实验调优
- * - 当 syscall 不匹配时，向前查找 N 条记录
- * - 5 是性能和准确性的平衡点
+ * Source: Experimental tuning
+ * - Number of records to search forward when a syscall mismatch occurs.
  */
 #define RR_STRACE_DEFAULT_LOOKAHEAD 5
 
-/* ========== 性能优化 ========== */
+/* Performance Optimization */
 
 /**
- * Record 阶段批量 flush 间隔
+ * Batch flush interval for Record phase
  * 
- * 来源：I/O 性能优化
- * - 每 100 条 syscall 才 flush 一次
- * - 减少频繁的 fflush 调用
- * - 权衡：崩溃时可能丢失最后 99 条记录
+ * Source: I/O performance optimization
+ * - Flushes every 100 syscalls to reduce frequent fflush calls.
+ * - Trade-off: Potential loss of last 99 records on crash.
  */
 #define RR_RECORD_FLUSH_INTERVAL    100
 
 /**
- * Fork Server Fallback 阈值
+ * Fork Server Fallback threshold
  * 
- * 来源：实验测试
- * - 如果 fork point 之后还有 > 20 个 syscall
- * - 说明 fork point 选择太早，fallback 到普通模式
+ * Source: Experimental testing
+ * - If more than 20 syscalls occurs after a fork point, the point choice is considered suboptimal.
  */
 #define RR_FORK_FALLBACK_THRESHOLD  20
 

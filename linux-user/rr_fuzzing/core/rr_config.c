@@ -1,6 +1,6 @@
 /**
- * RR-Fuzz统一配置管理系统
- * 替换分散的getenv()调用，提供统一的配置接口
+ * RR-Fuzz Unified Configuration Management System
+ * Replaces scattered getenv() calls with a unified configuration interface.
  */
 
 #ifndef RR_DEBUG
@@ -11,52 +11,52 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* 全局配置实例 */
+/* Global configuration instance */
 rr_config_t g_rr_config = {0};
 
 /**
- * 默认配置值 (Fallback Defaults)
+ * Default Configuration Values (Fallback Defaults)
  * 
- * 如果未通过环境变量或配置文件指定，则使用这些默认值。
+ * Used if no values are provided via environment variables or configuration files.
  * 
- * **关键默认值**:
- * - `mode`: DISABLED (需显式启用)
- * - `fork_strategy`: AGGRESSIVE (最大化覆盖率)
- * - `shared_memory_size`: 64KB (适配标准 fuzzing 负载)
- * - `use_legacy_capture`: false (避免双重捕获 bug)
+ * Key Defaults:
+ * - mode: DISABLED (Must be explicitly enabled)
+ * - fork_strategy: AGGRESSIVE (Maximize coverage)
+ * - shared_memory_size: 64KB (Fits standard fuzzing payloads)
+ * - use_legacy_capture: false (Avoid double-capture bugs)
  */
 static const rr_config_t DEFAULT_CONFIG = {
     .enabled = false,
     .mode = RR_MODE_DISABLED,
 
-    /* 文件路径 - 默认为NULL，需要时动态分配 */
+    /* File paths - NULL defaults, allocated as needed */
     .trace_file = NULL,
     .shared_memory_name = NULL,
     .cmd_pipe_path = NULL,
     .status_pipe_path = NULL,
     .config_file = NULL,
 
-    /* Fork Server配置 */
+    /* Fork Server configuration */
     .fork_server_enabled = false,
     .fork_point = 0,
-    .fork_strategy = RR_FORK_STRATEGY_AGGRESSIVE,  // 默认：激进模式（当前最实用）
-    .fork_fallback_threshold = 20,                  // Fallback阈值：20个syscall
+    .fork_strategy = RR_FORK_STRATEGY_AGGRESSIVE,  // Default: Aggressive mode (most practical currently)
+    .fork_fallback_threshold = 20,                  // Fallback threshold: 20 syscalls
 
-    /* IPC配置 */
-    .shared_memory_size = 64 * 1024,      // 64KB (与 Python 端一致，支持 32 条指令)
-    .ipc_timeout = 1000,                  // 1秒
+    /* IPC configuration */
+    .shared_memory_size = 64 * 1024,      // 64KB (matches Python side)
+    .ipc_timeout = 1000,                  // 1 second
     
-    /* 高级配置 */
-    .use_legacy_capture = false           // 默认只使用aux_data，避免双重捕获
+    /* Advanced configuration */
+    .use_legacy_capture = false           // Default to using only aux_data to avoid double-capture
 };
 
 /**
- * 解析模式字符串
+ * Parses the mode string.
  */
 static rr_mode_t parse_mode(const char *mode_str)
 {
     if (!mode_str) {
-        return RR_MODE_RECORD; // 默认记录模式
+        return RR_MODE_RECORD; // Default to record mode
     }
 
     if (strcmp(mode_str, "record") == 0) {
@@ -74,7 +74,7 @@ static rr_mode_t parse_mode(const char *mode_str)
 }
 
 /**
- * 解析布尔值
+ * Parses a boolean value.
  */
 static bool parse_bool(const char *str, bool default_val)
 {
@@ -94,7 +94,7 @@ static bool parse_bool(const char *str, bool default_val)
 }
 
 /**
- * 解析整数值
+ * Parses an integer value.
  */
 static int parse_int(const char *str, int default_val)
 {
@@ -113,7 +113,7 @@ static int parse_int(const char *str, int default_val)
 }
 
 /**
- * 解析大小值(支持K、M、G后缀)
+ * Parses a size value (supports K, M, G suffixes).
  */
 static size_t parse_size(const char *str, size_t default_val)
 {
@@ -139,7 +139,7 @@ static size_t parse_size(const char *str, size_t default_val)
                 val *= 1024 * 1024 * 1024;
                 break;
             case '\0':
-                // 纯数字，不需要处理
+                // Pure number, no suffix to process
                 break;
             default:
                 RR_WARN("Invalid size suffix in '%s', using default %zu", str, default_val);
@@ -155,7 +155,7 @@ static size_t parse_size(const char *str, size_t default_val)
 
 
 /**
- * 从配置文件读取配置
+ * Load configuration from a file
  */
 static int load_config_file(const char *config_file)
 {
@@ -173,14 +173,14 @@ static int load_config_file(const char *config_file)
     while (fgets(line, sizeof(line), fp)) {
         line_num++;
 
-        /* 跳过注释和空行 */
+        /* Skip comments and empty lines */
         char *trimmed = line;
         while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
         if (*trimmed == '#' || *trimmed == '\n' || *trimmed == '\0') {
             continue;
         }
 
-        /* 解析key=value格式 */
+        /* Parse key=value format */
         char *equals = strchr(trimmed, '=');
         if (!equals) {
             RR_WARN("Invalid config line %d: %s", line_num, line);
@@ -191,13 +191,13 @@ static int load_config_file(const char *config_file)
         char *key = trimmed;
         char *value = equals + 1;
 
-        /* 去除末尾的换行符和空格 */
+        /* Trim trailing newline and spaces */
         char *end = value + strlen(value) - 1;
         while (end > value && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t')) {
             *end-- = '\0';
         }
 
-        /* 解析配置项 */
+        /* Parse configuration key-value pairs */
         if (strcmp(key, "enabled") == 0) {
             g_rr_config.enabled = parse_bool(value, false);
         } else if (strcmp(key, "mode") == 0) {
@@ -222,7 +222,7 @@ static int load_config_file(const char *config_file)
         } else if (strcmp(key, "ipc_timeout") == 0) {
             g_rr_config.ipc_timeout = parse_int(value, DEFAULT_CONFIG.ipc_timeout);
         } else if (strcmp(key, "debug_level") == 0) {
-            /* 调试级别将在rr_debug_init中处理 */
+            /* Debug level handled in rr_debug_init */
             setenv("RR_DEBUG_LEVEL", value, 1);
         } else if (strcmp(key, "debug_file") == 0) {
             setenv("RR_DEBUG_FILE", value, 1);
@@ -243,46 +243,55 @@ static int load_config_file(const char *config_file)
 }
 
 /**
- * @brief 初始化配置系统 (Global Config Init)
+ * @brief Initialize configuration system (Global Config Init)
  * 
- * 加载顺序 (优先级从低到高):
- * 1. 默认值 (`DEFAULT_CONFIG`)
- * 2. 配置文件 (`RR_CONFIG_FILE` 指定)
- * 3. 环境变量 (如 `RR_MODE`, `RR_TRACE_FILE`)
+ * Loading order (priority from low to high):
+ * 1. Default values (`DEFAULT_CONFIG`)
+ * 2. Configuration file (specified by `RR_CONFIG_FILE`)
+ * 3. Environment variables (e.g., `RR_MODE`, `RR_TRACE_FILE`)
  * 
- * **副作用**:
- * - 初始化全局变量 `g_rr_config`。
- * - 可能修改一些环境变量 (如 `RR_DEBUG_LEVEL`) 以适配底层库。
+ * **Side effects**:
+ * - Initialize global variable `g_rr_config`.
+ * - May modify some environment variables (e.g., `RR_DEBUG_LEVEL`) to adapt to underlying libraries.
  * 
- * @return int 0 成功
+ * @return int 0 for success
  */
 int rr_config_init(void)
 {
-    /* fprintf(stderr, "RR_CONFIG_INIT: Starting configuration initialization\\n\");\n    fflush(stderr); */
+    /* Preserve configuration if already initialized */
+    static bool initialized = false;
+    if (initialized) {
+        RR_VERBOSE("rr_config_init() already called, skipping re-initialization");
+        return 0;
+    }
+    initialized = true;
+    
+    /* fprintf(stderr, "RR_CONFIG_INIT: Starting configuration initialization\n");
+    fflush(stderr); */
 
     RR_VERBOSE("Initializing RR-Fuzz configuration system");
 
-    /* 使用默认配置初始化 */
+    /* Initialize with default configuration */
     g_rr_config = DEFAULT_CONFIG;
 
-    /* 优先从配置文件读取 */
+    /* Read from config file with priority */
     const char *config_file = getenv("RR_CONFIG_FILE");
     if (config_file) {
         g_rr_config.config_file = g_strdup(config_file);
         load_config_file(config_file);
     }
 
-    /* ✅ FIX: 检查RR_MODE，如果设置了就自动启用 */
+    /* Auto-enable RR-Fuzz if RR_MODE is set */
     const char *mode_str = getenv("RR_MODE");
     if (mode_str) {
         g_rr_config.mode = parse_mode(mode_str);
-        /* 如果设置了mode，自动启用RR-Fuzz */
+        /* Auto-enable RR-Fuzz if mode is set */
         if (g_rr_config.mode != RR_MODE_DISABLED) {
             g_rr_config.enabled = true;
         }
     }
     
-    /* 环境变量可以覆盖配置文件和自动启用 */
+    /* Environment variables can override config file and auto-enablement */
     const char *rr_enabled = getenv("RR_FUZZING_ENABLED");
     if (rr_enabled) {
         g_rr_config.enabled = parse_bool(rr_enabled, g_rr_config.enabled);
@@ -323,10 +332,14 @@ int rr_config_init(void)
         g_rr_config.fork_server_enabled = (g_rr_config.fork_point > 0);
     }
     
-    /* 在 Fuzzing 模式下自动启用 Fork Server（新的自动检测模式） */
+    /* Auto-enable Fork Server in Fuzzing mode (new auto-detection mode) */
     if (g_rr_config.mode == RR_MODE_FUZZING) {
-        g_rr_config.fork_server_enabled = true;
-        RR_INFO("Auto-enabled Fork Server for fuzzing mode");
+        if (!getenv("RR_DISABLE_FORK_SERVER")) {
+            g_rr_config.fork_server_enabled = true;
+            RR_INFO("Auto-enabled Fork Server for fuzzing mode");
+        } else {
+            RR_INFO("Fork Server manually disabled via RR_DISABLE_FORK_SERVER");
+        }
     }
 
     const char *shm_size = getenv("RR_SHARED_MEMORY_SIZE");
@@ -339,7 +352,7 @@ int rr_config_init(void)
         g_rr_config.ipc_timeout = parse_int(ipc_timeout, DEFAULT_CONFIG.ipc_timeout);
     }
 
-    /* Fork Server高级配置 */
+    /* Fork Server advanced configuration */
     const char *fork_strategy = getenv("RR_FORK_STRATEGY");
     if (fork_strategy) {
         g_rr_config.fork_strategy = parse_int(fork_strategy, DEFAULT_CONFIG.fork_strategy);
@@ -350,13 +363,13 @@ int rr_config_init(void)
         g_rr_config.fork_fallback_threshold = parse_int(fork_threshold, DEFAULT_CONFIG.fork_fallback_threshold);
     }
 
-    /* 高级配置 */
+    /* Advanced configuration */
     const char *use_legacy_capture = getenv("RR_USE_LEGACY_CAPTURE");
     if (use_legacy_capture) {
         g_rr_config.use_legacy_capture = parse_bool(use_legacy_capture, DEFAULT_CONFIG.use_legacy_capture);
     }
 
-    /* 设置默认路径 */
+    /* Set default paths */
     if (!g_rr_config.trace_file) {
         g_rr_config.trace_file = g_strdup("/tmp/rr_trace.dat");
     }
@@ -375,7 +388,7 @@ int rr_config_init(void)
 }
 
 /**
- * 获取模式名称
+ * Get mode name
  */
 const char *rr_config_get_mode_name(rr_mode_t mode)
 {
@@ -389,7 +402,7 @@ const char *rr_config_get_mode_name(rr_mode_t mode)
 }
 
 /**
- * 打印配置信息
+ * Print configuration information
  */
 void rr_config_print(void)
 {
@@ -425,7 +438,7 @@ void rr_config_print(void)
 }
 
 /**
- * 清理配置系统
+ * Clean up configuration system
  */
 void rr_config_cleanup(void)
 {

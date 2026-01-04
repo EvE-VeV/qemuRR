@@ -50,9 +50,9 @@ class FuzzCheckpoint:
     coverage_state: bytes  # 覆盖率状态（用于恢复）
     unexplored_mutations: List  # 未探索的mutation变种
     parent_checkpoint_id: str  # 父checkpoint ID（用于追溯）
-    checkpoint_id: str  # 唯一标识
-    discovery_iteration: int  # 发现此checkpoint的迭代次数
-    mutation_node_ids: List[str] = None  # ✅ Task #6补充: Mutation node IDs for tracking
+    checkpoint_id: str  # Unique identifier
+    discovery_iteration: int  # Iteration count when this checkpoint was found
+    mutation_node_ids: List[str] = None  # Mutation node IDs for tracking in dependency graph
 
     def __str__(self):
         return f"Checkpoint[{self.checkpoint_id}] @syscall[{self.syscall_index}] depth={self.depth} mutations={len(self.unexplored_mutations)}"
@@ -83,9 +83,10 @@ class DynamicForkController:
                  coverage_tracker: CoverageTracker,
                  trace_manager: TraceManager = None,
                  fuzzing_stats=None,
-                 mutation_graph=None):
+                 mutation_graph=None,
+                 crash_detector=None):  # ✅ Task #8: Add crash detector
         """Initialize dynamic fork controller
-
+        
         Args:
             executor: QEMU executor
             path_finder: PathFinder instance (optional, None uses simple strategy)
@@ -95,30 +96,41 @@ class DynamicForkController:
             trace_manager: TraceManager instance (for saving interesting seeds)
             fuzzing_stats: FuzzingStatistics instance (for unified tracking)
             mutation_graph: MutationDependencyGraph instance (for mutation tracking)
+            crash_detector: CrashDetector instance (for saving crashes)
         """
         self.executor = executor
         self.path_finder = path_finder
         self.mutator = mutator
         self.recipe_pool = recipe_pool
         self.coverage_tracker = coverage_tracker
-        self.trace_manager = trace_manager  # ✅ 修复2: 添加trace_manager用于保存新种子
-        self.fuzzing_stats = fuzzing_stats  # ✅ Single source of truth
-        self.mutation_graph = mutation_graph  # ✅ Task #6补充: Mutation tracking
+        self.trace_manager = trace_manager
+        self.fuzzing_stats = fuzzing_stats
+        self.mutation_graph = mutation_graph
+        self.crash_detector = crash_detector
 
-        # 🔥 新增：深度优先checkpoint/snapshot模式配置
-        self.depth_first_mode = True  # 启用深度优先探索
-        self.max_depth = 2  # ✅ P0 Fix 1.3: 降低深度从5到2 (执行数从243降到9, 节省96%)
-        self.max_variants_per_checkpoint = 2  # 每个checkpoint最多2个变种
+        # Depth-first exploration mode configuration
+        self.depth_first_mode = True 
+        
+        # ✅ Configurable parameters via Environment Variables
+        import os
+        self.max_depth = int(os.environ.get('RR_MAX_DEPTH', 2))
+        print(f"[DynamicForkController] Config: max_depth = {self.max_depth}")
+        
+        self.max_variants_per_checkpoint = int(os.environ.get('RR_MAX_VARIANTS', 2))
+        print(f"[DynamicForkController] Config: max_variants_per_checkpoint = {self.max_variants_per_checkpoint}")
+        
         self.checkpoint_queue = []  # 待探索的checkpoint队列（深度优先）
 
         # 传统配置（调整为支持深度模式）
-        self.max_variants_per_fork = 2  # 降低并发数，支持深度探索
+        self.max_variants_per_fork = self.max_variants_per_checkpoint
         self.fork_budget_per_1000 = 200  # 增加预算，支持深度探索
 
-        # ✅ 自适应trigger_probability配置
-        # 🔥 P3 Fix 3.2: 从10%提升到20%，解决触发频率过低问题 (6.7% → 20%+)
-        self.trigger_probability = 0.2  # 基础概率（初始值）从0.1提升到0.2
-        self.adaptive_trigger = True  # 启用自适应调整
+        # Adaptive trigger probability configuration
+        # Default probability increased to handle low trigger frequency issues
+        self.trigger_probability = float(os.environ.get('RR_TRIGGER_PROB', 0.2)) 
+        print(f"[DynamicForkController] Config: trigger_probability = {self.trigger_probability}")
+        
+        self.adaptive_trigger = True  # Enable adaptive adjustment
         self.min_trigger_probability = 0.15  # 最小触发概率从0.05提升到0.15
         self.max_trigger_probability = 0.4  # 最大触发概率从0.3提升到0.4
 
@@ -127,10 +139,10 @@ class DynamicForkController:
         self.recent_window_size = 20  # 窗口大小
         self.last_new_coverage_time = time.time()  # 最后发现新coverage的时间
 
-        # 🔥 新增：当前trace对象（用于IO mutation）
+        # Current trace object used for IO mutations
         self.current_trace = None
 
-        # 统计（增加深度相关统计）
+        # Statistics including depth-related metrics
         self.stats = {
             'total_multi_forks': 0,
             'total_variants_tested': 0,
@@ -142,13 +154,12 @@ class DynamicForkController:
             'snapshot_restores': 0
         }
 
-        print(f"[DynamicForkController] Initialized (🌊 深度优先checkpoint/snapshot模式)")
-        print(f"  Deep-First Mode: ✅ 启用")
+        print(f"[DynamicForkController] Initialized (Depth-First Checkpoint Mode)")
         print(f"  Max exploration depth: {self.max_depth}")
         print(f"  Max variants per checkpoint: {self.max_variants_per_checkpoint}")
         print(f"  Fork budget: {self.fork_budget_per_1000}/1000 iterations")
         if self.adaptive_trigger:
-            print(f"  Adaptive Trigger: ✅ 启用 (初始={self.trigger_probability}, 范围=[{self.min_trigger_probability}, {self.max_trigger_probability}])")
+            print(f"  Adaptive Trigger: Enabled (Initial={self.trigger_probability}, Range=[{self.min_trigger_probability}, {self.max_trigger_probability}])")
 
     def _calculate_adaptive_probability(self) -> float:
         """
@@ -228,14 +239,14 @@ class DynamicForkController:
         if iteration % 1000 == 0:
             self.stats['forks_this_period'] = 0
 
-        # ✅ 自适应概率触发
+        # Adaptive probability trigger logic
         if self.adaptive_trigger:
             adaptive_prob = self._calculate_adaptive_probability()
-            # 每100次迭代更新一次trigger_probability
+            # Update trigger_probability periodically
             if iteration % 100 == 0:
                 old_prob = self.trigger_probability
                 self.trigger_probability = adaptive_prob
-                if abs(old_prob - adaptive_prob) > 0.01:  # 只在变化明显时输出
+                if abs(old_prob - adaptive_prob) > 0.01:
                     print(f"[DynamicForkController] Adaptive trigger_probability: {old_prob:.3f} → {adaptive_prob:.3f}")
             return random.random() < adaptive_prob
         else:
@@ -243,14 +254,14 @@ class DynamicForkController:
     
     def explore_multi_path(self, trace: Trace, iteration_id: int = 0) -> bool:
         """
-        🌊 深度优先checkpoint/snapshot探索
+        Depth-First Checkpoint/Snapshot Exploration
 
-        实现策略：
-        1. 从根trace开始或恢复最深的checkpoint
-        2. 在每个IO syscall处创建checkpoint
-        3. 执行第一个mutation，继续深度探索
-        4. 如果到达最大深度或无新覆盖率，回溯到前一个checkpoint
-        5. 继续探索该checkpoint的其他mutations
+        Strategy:
+        1. Start from root trace or restore deepest checkpoint.
+        2. Create checkpoint at each IO syscall.
+        3. Execute first mutation to continue deeper exploration.
+        4. If max depth is reached or no new coverage is found, backtrack.
+        5. Continue exploring other mutations for the checkpoint.
 
         Args:
             trace: 要探索的trace
@@ -259,7 +270,7 @@ class DynamicForkController:
         Returns:
             True if discovered new paths
         """
-        # 🔥 保存当前trace供mutation使用
+        # Save current trace for mutation use
         self.current_trace = trace
         if not self.depth_first_mode:
             # 兼容性：如果未启用深度模式，使用传统模式
@@ -267,8 +278,8 @@ class DynamicForkController:
 
         print(f"\n[DynamicForkController] 🌊 Iteration {iteration_id}: Dynamic Multi-Fork on {trace.id}")
 
-        # 🔥 修复：每次都从根trace开始，一次性测试多个mutations
-        print(f"[DynamicForkController] 🌱 Starting multi-fork from root trace")
+        # Execute multiple mutations from root trace once
+        print(f"[DynamicForkController] Starting multi-fork exploration from root trace")
         return self._start_depth_exploration(trace, iteration_id)
 
     def _start_depth_exploration(self, trace: Trace, iteration_id: int) -> bool:
@@ -277,28 +288,15 @@ class DynamicForkController:
 
         ✅ OPTIMIZATION: 缓存baseline执行结果，避免重复fork QEMU
         """
-        # ✅ 检查是否已经缓存了这个trace的IO syscalls
-        cache_key = trace.file_path
-        if not hasattr(self, '_io_syscalls_cache'):
-            self._io_syscalls_cache = {}
-
-        if cache_key in self._io_syscalls_cache:
-            # ✅ 使用缓存，避免重复分析
-            io_syscalls = self._io_syscalls_cache[cache_key]
-            print(f"[DynamicForkController] ⚡ Using cached IO syscalls for {trace.id} (0ms)")
+        if cache_key in self._io_syscall_cache:
+            # Use cached IO syscalls to avoid repeated analysis
+            io_syscalls = self._io_syscall_cache[cache_key]
+            print(f"[DynamicForkController] Using cached IO syscalls for {trace.id}")
         else:
-            # ✅ P0 Fix 1.2: 使用静态分析替代baseline执行 (节省120ms)
-            print(f"[DynamicForkController] 📊 Static analysis to discover IO syscalls (no QEMU execution)...")
-
-            # ❌ 移除: baseline_result = self.executor.execute_baseline(...)
-            # ✅ 改为: 直接使用TraceAnalyzer静态分析
-
-            # ✅ 智能IO syscall选择（_find_io_syscalls内部使用TraceAnalyzer静态分析）
+            # Use static analysis to discover IO syscalls (avoids expensive QEMU baseline execution)
+            print(f"[DynamicForkController] Static analysis to discover IO syscalls...")
             io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
-
-            # ✅ 缓存结果
             self._io_syscalls_cache[cache_key] = io_syscalls
-            print(f"[DynamicForkController] 💾 Cached {len(io_syscalls)} IO syscalls for future use (saved 120ms baseline execution)")
 
         if not io_syscalls:
             print(f"[DynamicForkController] No IO syscalls found")
@@ -326,16 +324,14 @@ class DynamicForkController:
         checkpoint_id = f"cp_{iteration_id}_{syscall_index}_{depth}"
         print(f"[DynamicForkController] 📍 Creating checkpoint[{checkpoint_id}] @syscall[{syscall_index}] depth={depth}")
 
-        # 生成mutations for this checkpoint
         mutations = []
-        mutation_node_ids = []  # ✅ Task #6补充: Track mutation node IDs
+        mutation_node_ids = []  # Track mutation node IDs in graph
         for i in range(self.max_variants_per_checkpoint):
             # 🔥 传递当前trace对象供IO mutation使用
             mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index)
             mutations.append(mutation)
 
-            # ✅ Task #6补充: Track mutation in graph
-            # ✅ 2025-11-18: 从FuzzInstruction中读取mutation_type
+            # Track mutation in graph and extract type from instructions
             if isinstance(mutation, list) and len(mutation) > 0:
                 mut_type = getattr(mutation[0], 'mutation_type', 'unknown')
             else:
@@ -358,22 +354,21 @@ class DynamicForkController:
         coverage_snapshot = self._save_coverage_state()
 
         # 🔥 修复：不需要checkpoint队列，直接执行所有mutations
-        # 创建checkpoint对象（用于记录，但不队列）
         checkpoint = FuzzCheckpoint(
             trace_file=trace_file,
             syscall_index=syscall_index,
             depth=depth,
             coverage_state=coverage_snapshot,
-            unexplored_mutations=[],  # 所有mutations都会被执行
+            unexplored_mutations=[],  
             parent_checkpoint_id=parent_id,
             checkpoint_id=checkpoint_id,
             discovery_iteration=iteration_id,
             mutation_node_ids=mutation_node_ids if mutation_node_ids else []
         )
 
-        # 🔥 修复：一次性执行所有mutations（真正的dynamic fork）
+        # Execute all mutations in parallel (dynamic multi-fork)
         if mutations:
-            print(f"[DynamicForkController] 🚀 Executing {len(mutations)} mutations in parallel (dynamic multi-fork)...")
+            print(f"[DynamicForkController] Executing {len(mutations)} variants in parallel...")
 
             try:
                 results = self.executor.execute_fork(
@@ -406,10 +401,25 @@ class DynamicForkController:
                         )
 
                     # 🔥 修复：让程序运行到结束（正常退出或崩溃）再回退到checkpoint
+                    # Allow program to run to completion (normal exit or crash) before backtracking to checkpoint
                     if result.crashed:
                         print(f"[DynamicForkController] 💥 CRASH detected at depth={depth}!")
                         print(f"[DynamicForkController] 🎯 Crash info: {result.crash_info if hasattr(result, 'crash_info') else 'Unknown crash'}")
                         self.stats['new_paths_discovered'] += 1
+                        
+                        if self.crash_detector:
+                            print(f"[DynamicForkController] Saving crash report...")
+                            trace_obj = self.current_trace
+                            # Ensure trace object has file_path
+                            if trace_obj and not hasattr(trace_obj, 'file_path'):
+                                trace_obj = None 
+                            
+                            # Log crash details to detector
+                            self.crash_detector.save_crash(
+                                result=result,
+                                trace=trace_obj,
+                                mutations=mutations[0] if mutations and len(mutations) > 0 and isinstance(mutations[0], list) else mutations
+                            )
 
                         # ✅ 记录成功的fork
                         self._record_fork_result(success=True)
@@ -421,11 +431,11 @@ class DynamicForkController:
                         print(f"[DynamicForkController] 🎉 New coverage discovered at depth={depth}!")
                         self.stats['new_paths_discovered'] += 1
 
-                        # ✅ 记录成功的fork并更新last_new_coverage_time
+                        # Update success metrics for adaptive trigger
                         self._record_fork_result(success=True)
                         self.last_new_coverage_time = time.time()
 
-                        # ✅ 修复2: 保存新种子到corpus
+                        # Save new seed to corpus if coverage improved
                         if self.trace_manager:
                             coverage_stats = self.coverage_tracker.get_stats()
                             new_edges = coverage_stats.get('new_edges', set())
@@ -437,7 +447,6 @@ class DynamicForkController:
                                 'edges': new_edges if new_edges else set()
                             }
 
-                            # Flatten mutations list (mutations is List[List[FuzzInstruction]])
                             mutation_dicts = []
                             for mutation_list in mutations:
                                 if isinstance(mutation_list, list):
@@ -448,7 +457,6 @@ class DynamicForkController:
                                                 'cmd': instr.cmd
                                             })
 
-                            # 保存新种子（使用当前trace文件和mutations）
                             parent_trace_id = getattr(self, 'current_trace_id', None)
                             self.trace_manager.add_trace(
                                 trace_file=trace_file,
@@ -456,24 +464,20 @@ class DynamicForkController:
                                 parent_id=parent_trace_id,
                                 mutations=mutation_dicts
                             )
-                            print(f"[DynamicForkController] 💾 Saved new seed to corpus (new_edges={len(new_edges) if new_edges else 1})")
+                            print(f"[DynamicForkController] Saved new seed to corpus (new_edges={len(new_edges)})")
 
-                        # ✅ 2025-11-18: Nested Fork - 继续探索更深层次（使用预选IO syscalls）
+                        # Nested Fork: Explore deeper levels using preselected IO syscalls
                         if depth < self.max_depth:
-                            # ✅ 2025-11-18: 智能选择 - 使用预选的IO syscall列表，避免过多fork点
                             next_syscall = None
                             if hasattr(self, 'current_io_syscalls') and self.current_io_syscalls:
-                                # 找到当前syscall之后的下一个预选IO syscall
+                                # Find next preselected IO syscall after current index
                                 next_io_syscalls = [io for io in self.current_io_syscalls if io > syscall_index]
                                 if next_io_syscalls:
                                     next_syscall = next_io_syscalls[0]
-                                    print(f"[DynamicForkController] ⬇️  Going deeper: depth {depth} → {depth+1}, next IO fork @syscall[{next_syscall}]")
-                                else:
-                                    print(f"[DynamicForkController] 🔚 No more preselected IO syscalls available for deeper exploration at depth={depth}")
+                                    print(f"[DynamicForkController] Going deeper: depth {depth} -> {depth+1} @syscall[{next_syscall}]")
                             else:
-                                # 回退到原有逻辑（如果没有预选IO syscalls）
+                                # Fallback if no preselected IO syscalls
                                 next_syscall = syscall_index + 10
-                                print(f"[DynamicForkController] ⬇️  Going deeper: depth {depth} → {depth+1}, next fork @syscall[{next_syscall}] (fallback)")
 
                             # ✅ 只在找到有效的下一个syscall时才递归探索
                             if next_syscall is not None:
@@ -820,13 +824,13 @@ class DynamicForkController:
 
     def _select_diverse_fork_point(self, io_syscalls: list, iteration_id: int) -> int:
         """
-        🔥 修复：选择多样化的fork点，避免单点固定
+        Select diverse fork points to avoid getting stuck in restricted local optima.
 
-        策略:
-        1. 轮换算法：在IO syscalls之间循环选择
-        2. 分层探索：早期/中期/后期syscalls
-        3. 随机扰动：避免完全预测性
-        4. PathFinder集成：优先选择CFG引导的热点
+        Strategy:
+        1. Rotation: Cycle through available IO syscalls.
+        2. Tiered exploration: Target early/mid/late phases based on iteration.
+        3. Random perturbation: Add jitter to selection.
+        4. (Future) PathFinder integration: Prioritize CFG-guided hotspots.
 
         Args:
             io_syscalls: 可用的IO syscall索引列表

@@ -162,7 +162,7 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
                         if (cpu_memory_rw_debug(env_cpu(env), target_addr, instr->data, instr->size, 1) == 0) {
                             has_buffer_mutation = 1;
                             g_fuzz_stats.buffer_mutations++;
-                            FUZZ_DEBUG_LOG("[OVERWRITE] ✅ Wrote %u bytes to 0x%lx\n", instr->size, target_addr);
+                            FUZZ_DEBUG_LOG("[OVERWRITE] ✅ Wrote %u bytes to 0x%lx\n", instr->size, (unsigned long)target_addr);
                         }
                     }
                 }

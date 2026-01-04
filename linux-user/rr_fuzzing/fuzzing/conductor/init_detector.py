@@ -125,7 +125,7 @@ class InitPhaseDetector:
             self.metrics['final_threshold'] = self.init_phase_end
             self.metrics['confidence'] = self.confidence
             
-            print(f"[InitPhaseDetector] 🔍 Detected init phase end at index {self.init_phase_end}")
+            print(f"[InitPhaseDetector] Detected init phase end at index {self.init_phase_end}")
             print(f"  Detection points: {end_points}")
             print(f"  Confidence: {self.confidence*100:.1f}%")
         else:
@@ -133,7 +133,7 @@ class InitPhaseDetector:
             self.init_phase_end = self.static_threshold
             self.confidence = 0.3  # Low confidence
             self.metrics['fallback'] = True
-            print(f"[InitPhaseDetector] ⚠️  Auto-detection failed, using fallback: {self.static_threshold}")
+            print(f"[InitPhaseDetector] Auto-detection failed, using fallback: {self.static_threshold}")
         
         return self.init_phase_end
     

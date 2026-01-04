@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-系统调用Handler自动生成器
+Syscall Handler Auto-Generator
 
-功能：
-1. 从syscall_64.tbl解析所有系统调用
-2. 自动生成rr_syscall_dispatch.c的handler表
-3. 自动分类系统调用类型
-4. 生成完整的C代码
+Features:
+1. Parse all syscalls from syscall_64.tbl.
+2. Automatically generate the handler table for rr_syscall_dispatch.c.
+3. Automatically classify syscall types.
+4. Generate complete C code.
 
-作者: RR-Fuzz Team
-日期: 2025-11-05
+Author: RR-Fuzz Team
+Date: 2025-11-05
 """
 
 import re
@@ -22,7 +22,7 @@ from enum import Enum
 
 
 class SyscallType(Enum):
-    """系统调用类型"""
+    """Syscall type"""
     FILE_IO = "SYSCALL_TYPE_FILE_IO"
     NETWORK = "SYSCALL_TYPE_NETWORK"
     PROCESS = "SYSCALL_TYPE_PROCESS"
@@ -35,7 +35,7 @@ class SyscallType(Enum):
 
 
 class SyscallImportance(Enum):
-    """系统调用重要性"""
+    """Syscall importance"""
     CRITICAL = "SYSCALL_IMPORTANCE_CRITICAL"
     IMPORTANT = "SYSCALL_IMPORTANCE_IMPORTANT"
     OPTIONAL = "SYSCALL_IMPORTANCE_OPTIONAL"
@@ -44,63 +44,63 @@ class SyscallImportance(Enum):
 
 @dataclass
 class SyscallInfo:
-    """系统调用信息"""
+    """Syscall information"""
     number: int
     abi: str  # common, 64, x32
     name: str
     entry_point: str
     
-    # 自动推断的属性
+    # Automatically inferred attributes
     syscall_type: SyscallType = SyscallType.UNKNOWN
     importance: SyscallImportance = SyscallImportance.ENVIRONMENT
     needs_fd_mapping: bool = False
     needs_addr_mapping: bool = False
     is_fd_syscall: bool = False
     
-    # Handler函数名
+    # Handler function names
     apply_args_func: str = "apply_generic_args"
     apply_fd_mapping_func: Optional[str] = None
     post_hook_func: str = "generic_post_hook"
 
 
 class SyscallClassifier:
-    """系统调用分类器"""
+    """Syscall classifier"""
     
-    # 文件I/O相关系统调用
+    # File I/O related syscalls
     FILE_IO_SYSCALLS = {
-        # 基本文件操作
+        # Basic file operations
         'open', 'openat', 'openat2', 'creat', 'close',
         'read', 'write', 'readv', 'writev', 'pread64', 'pwrite64',
         'preadv', 'pwritev', 'preadv2', 'pwritev2',
         
-        # 文件属性和状态
+        # File attributes and status
         'stat', 'fstat', 'lstat', 'newfstatat', 'statx',
         'access', 'faccessat', 'faccessat2', 'chmod', 'fchmod',
         'fchmodat', 'chown', 'fchown', 'lchown', 'fchownat',
         
-        # 目录操作
+        # Directory operations
         'getdents', 'getdents64', 'mkdir', 'mkdirat', 'rmdir',
         'chdir', 'fchdir', 'getcwd',
         
-        # 文件控制
+        # File control
         'fcntl', 'ioctl', 'lseek', 'dup', 'dup2', 'dup3',
         'pipe', 'pipe2', 'select', 'pselect6', 'poll', 'ppoll',
         'epoll_create', 'epoll_create1', 'epoll_ctl', 'epoll_wait', 'epoll_pwait',
         
-        # 文件系统操作
+        # Filesystem operations
         'mount', 'umount2', 'statfs', 'fstatfs', 'truncate', 'ftruncate',
         'fallocate', 'unlink', 'unlinkat', 'rename', 'renameat', 'renameat2',
         'link', 'linkat', 'symlink', 'symlinkat', 'readlink', 'readlinkat',
         
-        # 同步操作
+        # Synchronization operations
         'sync', 'syncfs', 'fsync', 'fdatasync',
         
-        # 扩展属性
+        # Extended attributes
         'getxattr', 'lgetxattr', 'fgetxattr', 'setxattr', 'lsetxattr', 'fsetxattr',
         'listxattr', 'llistxattr', 'flistxattr', 'removexattr', 'lremovexattr', 'fremovexattr',
     }
     
-    # 网络相关系统调用
+    # Network-related syscalls
     NETWORK_SYSCALLS = {
         'socket', 'socketpair', 'bind', 'listen', 'accept', 'accept4',
         'connect', 'getsockname', 'getpeername',
@@ -109,7 +109,7 @@ class SyscallClassifier:
         'setsockopt', 'getsockopt', 'shutdown',
     }
     
-    # 进程管理相关系统调用
+    # Process management related syscalls
     PROCESS_SYSCALLS = {
         'fork', 'vfork', 'clone', 'clone3', 'execve', 'execveat',
         'exit', 'exit_group', 'wait4', 'waitid', 'waitpid',
@@ -125,7 +125,7 @@ class SyscallClassifier:
         'ptrace',
     }
     
-    # 内存管理相关系统调用
+    # Memory management related syscalls
     MEMORY_SYSCALLS = {
         'mmap', 'munmap', 'mremap', 'mprotect', 'madvise', 'mlock', 'munlock',
         'mlockall', 'munlockall', 'mincore', 'msync',
@@ -135,7 +135,7 @@ class SyscallClassifier:
         'mbind', 'get_mempolicy', 'set_mempolicy', 'migrate_pages', 'move_pages',
     }
     
-    # 时间相关系统调用
+    # Time-related syscalls
     TIME_SYSCALLS = {
         'time', 'gettimeofday', 'settimeofday',
         'clock_gettime', 'clock_settime', 'clock_getres',
@@ -146,7 +146,7 @@ class SyscallClassifier:
         'timerfd_create', 'timerfd_settime', 'timerfd_gettime',
     }
     
-    # 信号相关系统调用
+    # Signal-related syscalls
     SIGNAL_SYSCALLS = {
         'rt_sigaction', 'rt_sigprocmask', 'rt_sigpending', 'rt_sigtimedwait',
         'rt_sigqueueinfo', 'rt_sigsuspend', 'rt_sigreturn',
@@ -154,7 +154,7 @@ class SyscallClassifier:
         'signalfd', 'signalfd4',
     }
     
-    # IPC相关系统调用
+    # IPC-related syscalls
     IPC_SYSCALLS = {
         'msgget', 'msgsnd', 'msgrcv', 'msgctl',
         'semget', 'semop', 'semctl', 'semtimedop',
@@ -164,7 +164,7 @@ class SyscallClassifier:
         'eventfd', 'eventfd2',
     }
     
-    # 系统信息相关系统调用
+    # System information related syscalls
     SYSTEM_INFO_SYSCALLS = {
         'uname', 'sysinfo', 'syslog', 'klogctl',
         'getrusage', 'getrlimit', 'setrlimit', 'prlimit64',
@@ -186,7 +186,7 @@ class SyscallClassifier:
         'rseq', 'pidfd_open', 'pidfd_send_signal', 'pidfd_getfd',
     }
     
-    # 高优先级（CRITICAL）系统调用
+    # CRITICAL syscalls
     CRITICAL_SYSCALLS = {
         'read', 'write', 'open', 'openat', 'close',
         'mmap', 'munmap',
@@ -194,7 +194,7 @@ class SyscallClassifier:
         'exit_group', 'writev', 'sendmsg', 'recvmsg',
     }
     
-    # 重要（IMPORTANT）系统调用
+    # IMPORTANT syscalls
     IMPORTANT_SYSCALLS = {
         'stat', 'fstat', 'lstat', 'newfstatat',
         'mprotect', 'brk', 'ioctl',
@@ -204,29 +204,29 @@ class SyscallClassifier:
         'fcntl', 'dup', 'dup2', 'pipe',
     }
     
-    # 需要FD映射的系统调用
+    # Syscalls requiring FD mapping
     FD_MAPPING_SYSCALLS = {
         'read', 'write', 'readv', 'writev', 'pread64', 'pwrite64',
         'close', 'fstat', 'ioctl', 'fcntl', 'dup', 'dup2', 'dup3',
         'getdents', 'getdents64', 'lseek',
         'fsync', 'fdatasync', 'fchmod', 'fchown', 'ftruncate',
         'fstatfs', 'fchdir', 'flock',
-        # 网络相关
+        # Network-related
         'send', 'sendto', 'sendmsg', 'recv', 'recvfrom', 'recvmsg',
         'bind', 'listen', 'accept', 'accept4', 'connect',
         'getsockname', 'getpeername', 'setsockopt', 'getsockopt', 'shutdown',
-        # at系列（第一个参数可能是dirfd）
+        # 'at' family (first argument may be dirfd)
         'openat', 'mkdirat', 'unlinkat', 'renameat', 'linkat', 'symlinkat',
         'readlinkat', 'fchmodat', 'fchownat', 'faccessat', 'newfstatat',
     }
     
-    # 需要地址映射的系统调用
+    # Syscalls requiring address mapping
     ADDR_MAPPING_SYSCALLS = {
         'mmap', 'munmap', 'mremap', 'mprotect', 'madvise',
         'msync', 'mincore', 'mlock', 'munlock',
     }
     
-    # 产生FD的系统调用（需要在post_hook中建立映射）
+    # FD-creating syscalls (requires mapping established in post_hook)
     FD_CREATING_SYSCALLS = {
         'open', 'openat', 'openat2', 'creat',
         'socket', 'socketpair', 'accept', 'accept4',
@@ -242,8 +242,8 @@ class SyscallClassifier:
     
     @classmethod
     def classify(cls, syscall_name: str) -> Tuple[SyscallType, SyscallImportance]:
-        """分类系统调用"""
-        # 确定类型
+        """Classify syscalls"""
+        # Determine type
         if syscall_name in cls.FILE_IO_SYSCALLS:
             syscall_type = SyscallType.FILE_IO
         elif syscall_name in cls.NETWORK_SYSCALLS:
@@ -263,7 +263,7 @@ class SyscallClassifier:
         else:
             syscall_type = SyscallType.UNKNOWN
         
-        # 确定重要性
+        # Determine importance
         if syscall_name in cls.CRITICAL_SYSCALLS:
             importance = SyscallImportance.CRITICAL
         elif syscall_name in cls.IMPORTANT_SYSCALLS:
@@ -280,8 +280,8 @@ class SyscallClassifier:
     @classmethod
     def get_handler_functions(cls, syscall_name: str, 
                              syscall_type: SyscallType) -> Tuple[str, Optional[str], str]:
-        """获取handler函数名"""
-        # apply_args函数
+        """Get handler function names"""
+        # apply_args function
         if syscall_type == SyscallType.FILE_IO:
             apply_args = "apply_file_io_args"
         elif syscall_type == SyscallType.NETWORK:
@@ -291,20 +291,20 @@ class SyscallClassifier:
         else:
             apply_args = "apply_generic_args"
         
-        # apply_fd_mapping函数
+        # apply_fd_mapping function
         if syscall_name in cls.FD_MAPPING_SYSCALLS:
             if syscall_type == SyscallType.FILE_IO:
                 apply_fd_mapping = "apply_file_io_fd_mapping"
             elif syscall_type == SyscallType.MEMORY:
                 apply_fd_mapping = "apply_memory_fd_mapping"
             elif syscall_type == SyscallType.NETWORK:
-                apply_fd_mapping = "apply_file_io_fd_mapping"  # 复用
+                apply_fd_mapping = "apply_file_io_fd_mapping"  # Reuse
             else:
                 apply_fd_mapping = None
         else:
             apply_fd_mapping = None
         
-        # post_hook函数
+        # post_hook function
         if syscall_type == SyscallType.FILE_IO or syscall_name in cls.FD_CREATING_SYSCALLS:
             post_hook = "file_io_post_hook"
         elif syscall_type == SyscallType.NETWORK:
@@ -318,23 +318,23 @@ class SyscallClassifier:
 
 
 class SyscallTableParser:
-    """解析syscall_64.tbl文件"""
+    """Parser for syscall_64.tbl"""
     
     def __init__(self, tbl_file: str):
         self.tbl_file = tbl_file
         self.syscalls: List[SyscallInfo] = []
     
     def parse(self) -> List[SyscallInfo]:
-        """解析syscall表"""
+        """Parse syscall table"""
         with open(self.tbl_file, 'r') as f:
             for line in f:
                 line = line.strip()
                 
-                # 跳过注释和空行
+                # Skip comments and empty lines
                 if not line or line.startswith('#'):
                     continue
                 
-                # 解析行: <number> <abi> <name> <entry_point>
+                # Parse line: <number> <abi> <name> <entry_point>
                 parts = line.split()
                 if len(parts) < 4:
                     continue
@@ -345,19 +345,19 @@ class SyscallTableParser:
                     name = parts[2]
                     entry_point = parts[3]
                     
-                    # 分类
+                    # Classify
                     syscall_type, importance = SyscallClassifier.classify(name)
                     
-                    # 获取handler函数
+                    # Get handler functions
                     apply_args, apply_fd_mapping, post_hook = \
                         SyscallClassifier.get_handler_functions(name, syscall_type)
                     
-                    # 判断标志
+                    # Determine flags
                     needs_fd_mapping = name in SyscallClassifier.FD_MAPPING_SYSCALLS
                     needs_addr_mapping = name in SyscallClassifier.ADDR_MAPPING_SYSCALLS
                     is_fd_syscall = name in SyscallClassifier.FD_CREATING_SYSCALLS
                     
-                    # 创建SyscallInfo
+                    # Create SyscallInfo
                     info = SyscallInfo(
                         number=number,
                         abi=abi,
@@ -384,21 +384,21 @@ class SyscallTableParser:
 
 
 class SyscallHandlerGenerator:
-    """生成C代码的handler表"""
+    """Generator for C code handler table"""
     
     def __init__(self, syscalls: List[SyscallInfo]):
         self.syscalls = syscalls
     
     def generate_handler_table(self) -> str:
-        """生成handler表的C代码"""
+        """Generate handler table C code"""
         lines = []
         
-        lines.append("/* ==================== 自动生成的系统调用处理表 ==================== */")
-        lines.append("/* 此文件由syscall_generator.py自动生成，请勿手动修改 */")
+        lines.append("/* ==================== Automatically Generated Syscall Handler Table ==================== */")
+        lines.append("/* This file is automatically generated by syscall_generator.py. Do not modify manually. */")
         lines.append("")
         lines.append("static rr_syscall_handler_t syscall_handlers[] = {")
         
-        # 按类型分组
+        # Group by type
         by_type = {}
         for sc in self.syscalls:
             type_name = sc.syscall_type.name
@@ -406,13 +406,13 @@ class SyscallHandlerGenerator:
                 by_type[type_name] = []
             by_type[type_name].append(sc)
         
-        # 生成各类型的handler
+        # Generate handlers for each type
         for type_name in ['FILE_IO', 'NETWORK', 'PROCESS', 'MEMORY', 'TIME', 
                           'SIGNAL', 'IPC', 'SYSTEM_INFO', 'UNKNOWN']:
             if type_name not in by_type:
                 continue
             
-            lines.append(f"    /* {type_name.replace('_', ' ')}类 */")
+            lines.append(f"    /* {type_name.replace('_', ' ')} Class */")
             
             for sc in by_type[type_name]:
                 fd_mapping = sc.apply_fd_mapping_func or "NULL"
@@ -428,7 +428,7 @@ class SyscallHandlerGenerator:
             
             lines.append("")
         
-        lines.append("    /* 结束标记 */")
+        lines.append("    /* End marker */")
         lines.append("    {NULL, -1, SYSCALL_TYPE_UNKNOWN, SYSCALL_IMPORTANCE_ENVIRONMENT, "
                     "NULL, NULL, NULL, false, false, false}")
         lines.append("};")
@@ -437,42 +437,42 @@ class SyscallHandlerGenerator:
         return "\n".join(lines)
     
     def generate_stats(self) -> str:
-        """生成统计信息"""
+        """Generate statistical information"""
         lines = []
         lines.append("=" * 60)
-        lines.append("系统调用Handler生成统计")
+        lines.append("Syscall Handler Generation Statistics")
         lines.append("=" * 60)
-        lines.append(f"\n总计: {len(self.syscalls)} 个系统调用\n")
+        lines.append(f"\nTotal: {len(self.syscalls)} syscalls\n")
         
-        # 按类型统计
+        # Statistics by type
         by_type = {}
         for sc in self.syscalls:
             type_name = sc.syscall_type.name
             by_type[type_name] = by_type.get(type_name, 0) + 1
         
-        lines.append("按类型分布:")
+        lines.append("Distribution by Type:")
         for type_name, count in sorted(by_type.items(), key=lambda x: -x[1]):
             lines.append(f"  {type_name:20s}: {count:4d}")
         
-        # 按重要性统计
+        # Statistics by importance
         by_importance = {}
         for sc in self.syscalls:
             imp_name = sc.importance.name
             by_importance[imp_name] = by_importance.get(imp_name, 0) + 1
         
-        lines.append("\n按重要性分布:")
+        lines.append("\nDistribution by Importance:")
         for imp_name, count in sorted(by_importance.items()):
             lines.append(f"  {imp_name:20s}: {count:4d}")
         
-        # 特性统计
+        # Feature statistics
         needs_fd = sum(1 for sc in self.syscalls if sc.needs_fd_mapping)
         needs_addr = sum(1 for sc in self.syscalls if sc.needs_addr_mapping)
         creates_fd = sum(1 for sc in self.syscalls if sc.is_fd_syscall)
         
-        lines.append("\n特性统计:")
-        lines.append(f"  需要FD映射:       {needs_fd:4d}")
-        lines.append(f"  需要地址映射:     {needs_addr:4d}")
-        lines.append(f"  创建FD:           {creates_fd:4d}")
+        lines.append("\nFeature Statistics:")
+        lines.append(f"  Requires FD mapping:      {needs_fd:4d}")
+        lines.append(f"  Requires address mapping: {needs_addr:4d}")
+        lines.append(f"  Creates FD:               {creates_fd:4d}")
         
         lines.append("=" * 60)
         
@@ -480,45 +480,45 @@ class SyscallHandlerGenerator:
 
 
 def main():
-    """主函数"""
+    """Main function"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='系统调用Handler自动生成器')
+    parser = argparse.ArgumentParser(description='Syscall Handler Auto-Generator')
     parser.add_argument('--tbl', default='../../../x86_64/syscall_64.tbl',
-                       help='syscall_64.tbl文件路径')
+                       help='Path to syscall_64.tbl')
     parser.add_argument('--output', default='rr_syscall_dispatch_generated.c',
-                       help='输出文件路径')
+                       help='Output file path')
     parser.add_argument('--stats', action='store_true',
-                       help='只显示统计信息')
+                       help='Display statistics only')
     
     args = parser.parse_args()
     
-    # 解析系统调用表
+    # Parse syscall table
     tbl_file = Path(__file__).parent / args.tbl
     if not tbl_file.exists():
-        print(f"❌ 找不到文件: {tbl_file}")
+        print(f"❌ File not found: {tbl_file}")
         return 1
     
-    print(f"📖 解析系统调用表: {tbl_file}")
+    print(f"📖 Parsing syscall table: {tbl_file}")
     parser_obj = SyscallTableParser(str(tbl_file))
     syscalls = parser_obj.parse()
     
-    # 生成代码
+    # Generate code
     generator = SyscallHandlerGenerator(syscalls)
     
-    # 显示统计信息
+    # Display statistical information
     print("\n" + generator.generate_stats())
     
     if not args.stats:
-        # 生成C代码
+        # Generate C code
         code = generator.generate_handler_table()
         
         output_file = Path(__file__).parent / args.output
         with open(output_file, 'w') as f:
             f.write(code)
         
-        print(f"\n✅ 已生成: {output_file}")
-        print(f"   共 {len(syscalls)} 个系统调用handler")
+        print(f"\n✅ Generated: {output_file}")
+        print(f"   Total {len(syscalls)} syscall handlers")
     
     return 0
 

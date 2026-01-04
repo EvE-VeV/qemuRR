@@ -1,13 +1,13 @@
 /**
  * RR-Fuzz Phase 1: Pure Replay Reapply
  * 
- * 在 aux_data 被 Fuzzing 变异后，重新将变异后的数据恢复到 guest 内存
+ * Re-applies mutated aux_data back to guest memory after Fuzzing mutation.
  * 
- * 设计理念：
- * 1. Pure Replay 首次恢复原始 aux_data
- * 2. Fuzzing 变异 aux_data
- * 3. Reapply 将变异后的 aux_data 重新恢复到 guest 内存
- * 4. 程序使用变异后的数据继续执行
+ * Design Concept:
+ * 1. Pure Replay first restores original aux_data.
+ * 2. Fuzzing mutates aux_data.
+ * 3. Reapply restores mutated aux_data to guest memory.
+ * 4. Program continues execution with the mutated data.
  */
 
 #include "../core/rr_framework.h"
@@ -15,12 +15,12 @@
 #include "../record/rr_aux_data.h"
 
 /**
- * 重新应用 Pure Replay（在 aux_data 变异后）
+ * Re-apply Pure Replay after aux_data mutation.
  * 
- * 这个函数的核心思想是：
- * - aux_data 已经被 rr_fuzz_mutate_aux_data() 变异
- * - 我们需要将变异后的 aux_data 写回 guest 内存
- * - 返回值可能也需要调整（如果 size 变化）
+ * Core Logic:
+ * - aux_data has been mutated by rr_fuzz_mutate_aux_data().
+ * - Mutated aux_data must be written back to guest memory.
+ * - Return value may need adjustment (e.g., if size changed).
  */
 abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num, 
                                         abi_long *args,
@@ -33,21 +33,21 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
     
     RR_VERBOSE("PURE_REAPPLY: Reapplying mutated aux_data for syscall %d", num);
     
-    // 根据系统调用类型重新恢复数据
+    /* Restore data based on syscall type */
     switch (num) {
         /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-         * 输入类系统调用：read, recv, getrandom 等
-         * 这些需要将 aux_data 写回到指定的 buffer
+         * Input Syscalls: read, recv, getrandom, etc.
+         * These require writing aux_data back to the specified buffer.
          * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
         
         case TARGET_NR_read: {
-            /* read(fd, buf, count) - buf 在 arg[1] */
+            /* read(fd, buf, count) - buf at arg[1] */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1)); // arg[1]
             if (aux && aux->data && aux->size > 0) {
-                // 将变异后的数据写入 guest 内存
+                /* Write mutated data to guest memory */
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
                     RR_INFO("PURE_REAPPLY: read() - reapplied %u bytes (mutated)", aux->size);
-                    // 返回值可能改变（如果 size 被 truncate/extend）
+                    /* Return value may change (e.g., if size was truncated or extended) */
                     return (abi_long)aux->size;
                 } else {
                     RR_ERROR("PURE_REAPPLY: read() - failed to write to guest memory");
@@ -59,7 +59,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         
 #ifdef TARGET_NR_pread64
         case TARGET_NR_pread64: {
-            /* pread64(fd, buf, count, offset) - buf 在 arg[1] */
+            /* pread64(fd, buf, count, offset) - buf at arg[1] */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -72,7 +72,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
 #endif
         
         case TARGET_NR_getrandom: {
-            /* getrandom(buf, buflen, flags) - buf 在 arg[0] */
+            /* getrandom(buf, buflen, flags) - buf at arg[0] */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 0)); // arg[0]
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[0], aux->data, aux->size, 1) == 0) {
@@ -86,7 +86,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         
 #ifdef TARGET_NR_recv
         case TARGET_NR_recv: {
-            /* recv(sockfd, buf, len, flags) - buf 在 arg[1] */
+            /* recv(sockfd, buf, len, flags) - buf at arg[1] */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -101,7 +101,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom: {
-            /* recvfrom(sockfd, buf, len, flags, src_addr, addrlen) - buf 在 arg[1] */
+            /* recvfrom(sockfd, buf, len, flags, src_addr, addrlen) - buf at arg[1] */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -114,10 +114,10 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
 #endif
         
         /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-         * 输出类系统调用：write, send 等
+         * Output Syscalls: write, send, etc.
          * 
-         * 注意：这些系统调用在 Pure Replay 中通常不支持
-         * 但如果未来扩展支持，这里可以处理参数变异
+         * Note: These syscalls are typically not supported in Pure Replay,
+         * but can handle parameter mutations if support is extended.
          * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
         
         case TARGET_NR_write:
@@ -131,20 +131,18 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         case TARGET_NR_sendto:
 #endif
         {
-            /* 输出类系统调用：通常不需要 reapply
-             * 因为数据已经在 guest 内存中，真实执行会读取
-             * 
-             * 但如果变异了输出缓冲区的内容，可以在这里处理
+            /* Output syscalls: Reapply usually not needed as data exists in guest memory.
+             * However, can handle mutations to output buffers if necessary.
              */
             RR_VERBOSE("PURE_REAPPLY: Output syscall %d - no reapply needed", num);
             return record->retval;
         }
         
         /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-         * 结构体类系统调用（未来 Phase 2 扩展）
+         * Struct Syscalls (Phase 2 Extension)
          * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
         
-        // 这些将在 Phase 2 实现
+        /* Phase 2 Implementations */
         // case TARGET_NR_stat:
         // case TARGET_NR_gettimeofday:
         // case TARGET_NR_clock_gettime:
@@ -155,7 +153,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
             return -1;
     }
     
-    /* 如果走到这里，说明没有成功 reapply */
+    /* Fallthrough if reapply unsuccessful */
     RR_VERBOSE("PURE_REAPPLY: Failed to reapply for syscall %d", num);
     return -1;
 }

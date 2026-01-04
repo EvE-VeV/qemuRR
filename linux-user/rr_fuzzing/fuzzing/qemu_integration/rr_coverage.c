@@ -178,8 +178,10 @@ static bool g_range_set = false;
  */
 int rr_coverage_init(const char *shm_name)
 {
+    fprintf(stderr, "[DEBUG-COV] rr_coverage_init entered\n");
     if (g_coverage) {
         RR_WARN("Coverage already initialized");
+        fprintf(stderr, "[DEBUG-COV] Coverage already initialized, returning 0\n");
         return 0;
     }
     
@@ -187,6 +189,7 @@ int rr_coverage_init(const char *shm_name)
     g_coverage = calloc(1, sizeof(rr_coverage_t));
     if (!g_coverage) {
         RR_ERROR("Failed to allocate coverage context");
+        fprintf(stderr, "[DEBUG-COV] Failed to allocate context\n");
         return -1;
     }
     
@@ -196,12 +199,15 @@ int rr_coverage_init(const char *shm_name)
     }
     
     // 创建共享内存
+    fprintf(stderr, "[DEBUG-COV] Calling create_shared_memory(%s)...\n", shm_name);
     if (create_shared_memory(shm_name) < 0) {
         RR_ERROR("create_shared_memory() failed");
+        fprintf(stderr, "[DEBUG-COV] create_shared_memory failed\n");
         free(g_coverage);
         g_coverage = NULL;
         return -1;
     }
+    fprintf(stderr, "[DEBUG-COV] create_shared_memory succeeded\n");
     
     // 初始化状态
     g_coverage->enabled = true;
@@ -210,6 +216,7 @@ int rr_coverage_init(const char *shm_name)
     g_coverage->unique_edges = 0;
     
     RR_INFO("Coverage tracking initialized");
+    fprintf(stderr, "[DEBUG-COV] Coverage tracking initialized successfully\n");
     
     return 0;
 }
@@ -273,9 +280,32 @@ void rr_coverage_cleanup(void)
  * 
  * @param cur_pc 当前基本块的地址
  */
+/* Debug counter for coverage calls */
+static uint64_t s_trace_call_count = 0;
+
 void rr_coverage_trace_edge(uint64_t cur_pc)
 {
+    s_trace_call_count++;
+    
+    /* Periodic debug log (every 10000 calls) */
+    if (s_trace_call_count % 10000 == 1) {
+        fprintf(stderr, "[RR-COV-DEBUG] trace_edge called %lu times, cur_pc=0x%lx\n", 
+                s_trace_call_count, cur_pc);
+    }
+    
     if (!rr_coverage_is_enabled()) {
+        if (s_trace_call_count == 1) {
+            fprintf(stderr, "[RR-COV-DEBUG] Coverage DISABLED at first call!\n");
+        }
+        return;
+    }
+    
+    /* Runtime range filter: Only track PCs within target binary.
+     * This check is done here (at runtime) because:
+     * 1. Target range is set AFTER ELF loading, after many TBs are translated
+     * 2. We cannot flush TB cache during loading (assertion failure)
+     */
+    if (!rr_in_target_range(cur_pc)) {
         return;
     }
     
@@ -398,12 +428,33 @@ void rr_set_target_range(uint64_t start, uint64_t end)
     fprintf(stderr, "[RR-Fuzz] Target Range Set: 0x%lx - 0x%lx\n", start, end);
 }
 
+/* Debug counter for range checks */
+static uint64_t s_range_check_count = 0;
+static uint64_t s_range_denied_count = 0;
+
 bool rr_in_target_range(uint64_t pc)
 {
+    s_range_check_count++;
+    
     if (!g_range_set) {
-        // Strict Mode: Deny everything until target range is explicitly set.
-        // This prevents instrumenting ld.so or other early setup code.
+        s_range_denied_count++;
+        /* Log first denial and periodically after */
+        if (s_range_denied_count == 1 || s_range_denied_count % 100000 == 0) {
+            fprintf(stderr, "[RR-RANGE-DEBUG] DENIED (range not set): pc=0x%lx, denied %lu times\n", 
+                    pc, s_range_denied_count);
+        }
         return false;
     }
-    return (pc >= g_target_start && pc < g_target_end);
+    
+    bool in_range = (pc >= g_target_start && pc < g_target_end);
+    
+    /* Log first in-range hit */
+    static bool first_hit_logged = false;
+    if (in_range && !first_hit_logged) {
+        fprintf(stderr, "[RR-RANGE-DEBUG] FIRST IN-RANGE HIT: pc=0x%lx (range: 0x%lx-0x%lx)\n", 
+                pc, g_target_start, g_target_end);
+        first_hit_logged = true;
+    }
+    
+    return in_range;
 }

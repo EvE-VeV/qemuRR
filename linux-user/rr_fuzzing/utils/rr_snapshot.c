@@ -1,6 +1,6 @@
 /**
- * RR-Fuzz Snapshot模块
- * 当前为简化实现，主要功能预留给未来扩展
+ * RR-Fuzz Snapshot Module
+ * Currently a simplified implementation; functionality reserved for future expansion.
  */
 
 #ifndef RR_DEBUG
@@ -9,11 +9,11 @@
 
 #include "../core/rr_framework.h"
 
-/* 全局快照状态（预留） */
+/* Global snapshot state (reserved) */
 static uint32_t g_latest_snapshot_index = 0;
 
 /**
- * 保存快照（当前为stub实现）
+ * Save snapshot (Current stub implementation).
  */
 int rr_snapshot_save(uint32_t syscall_index)
 {
@@ -23,7 +23,7 @@ int rr_snapshot_save(uint32_t syscall_index)
 }
 
 /**
- * 恢复快照（当前为stub实现）
+ * Restore snapshot (Current stub implementation).
  */
 int rr_snapshot_restore(uint32_t syscall_index)
 {
@@ -32,7 +32,7 @@ int rr_snapshot_restore(uint32_t syscall_index)
 }
 
 /**
- * 获取最新快照索引
+ * Get latest snapshot index.
  */
 uint32_t rr_snapshot_get_latest(void)
 {
@@ -40,17 +40,17 @@ uint32_t rr_snapshot_get_latest(void)
 }
 
 /**
- * 自动管理快照（当前为stub实现）
+ * Automatically manage snapshots (Current stub implementation).
  */
 void rr_snapshot_auto_manage(int syscall_nr, uint32_t syscall_index)
 {
     (void)syscall_nr;
     (void)syscall_index;
-    /* 当前不做任何事，预留给未来的自动快照管理 */
+    /* Reserved for future automatic snapshot management */
 }
 
 /**
- * 清理快照资源
+ * Clean up snapshot resources.
  */
 void rr_snapshot_cleanup(void)
 {

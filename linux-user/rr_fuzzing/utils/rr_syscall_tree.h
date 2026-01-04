@@ -4,83 +4,94 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define MAX_TREE_NODES 100000      // 最多10万个节点
-#define MAX_CHILDREN_PER_NODE 16   // 每个节点最多16个子节点
+#define MAX_TREE_NODES 100000      // Max 100,000 nodes
+#define MAX_CHILDREN_PER_NODE 16   // Max 16 child nodes per node
 #define MAX_SYSCALL_NAME 32
 
-// TreeNode：表示一个syscall执行节点
+/* TreeNode: Represents a syscall execution node */
 typedef struct TreeNode {
-    // 基本信息
-    uint32_t id;                           // 节点ID（全局唯一）
-    uint32_t pid;                          // 进程ID
-    uint32_t syscall_index;                // 在trace中的索引
-    uint32_t syscall_nr;                   // 系统调用号
-    char syscall_name[MAX_SYSCALL_NAME];   // 系统调用名称
+    /* Basic information */
+    uint32_t id;                           // Node ID (globally unique)
+    uint32_t pid;                          // Process ID
+    uint32_t syscall_index;                // Index in trace
+    uint32_t syscall_nr;                   // Syscall number
+    char syscall_name[MAX_SYSCALL_NAME];   // Syscall name
 
-    // Syscall参数和返回值
-    uint64_t args[6];                      // 最多6个参数
-    int64_t retval;                        // 返回值
+    /* Syscall arguments and return value */
+    uint64_t args[6];                      // Max 6 arguments
+    int64_t retval;                        // Return value
 
-    // 时间信息
-    uint64_t timestamp_enter;              // 进入时间戳（纳秒）
-    uint64_t timestamp_exit;               // 退出时间戳（纳秒）
+    /* Timestamp information */
+    uint64_t timestamp_enter;              // Entry timestamp (ns)
+    uint64_t timestamp_exit;               // Exit timestamp (ns)
 
-    // 树结构
-    uint32_t parent_id;                    // 父节点ID
-    uint32_t children_ids[MAX_CHILDREN_PER_NODE];  // 子节点IDs
-    uint8_t children_count;                // 子节点数量
+    /* Tree structure */
+    // Tree structure (Linked List for unlimited children)
+    uint32_t parent_id;                    // Parent node ID
+    // Linked list implementation for unlimited children
+    uint32_t first_child_id;               // First child node ID
+    uint32_t last_child_id;                // Last child node ID (for fast append)
+    uint32_t next_sibling_id;              // Next sibling node ID
 
-    // Fork信息
-    bool is_fork_node;                     // 是否为fork节点
-    uint32_t fork_child_pid;               // Fork产生的子进程PID
+    /* Fork information */
+    bool is_fork_node;                     // Whether it's a fork node
+    uint32_t fork_child_pid;               // PID of child process created by fork
 
-    // 覆盖率信息（可选）
-    bool has_new_coverage;                 // 是否发现新覆盖
-    uint32_t new_edges_count;              // 新edge数量
+    /* Coverage information (optional) */
+    bool has_new_coverage;                 // Whether new coverage was discovered
+    uint32_t new_edges_count;              // Number of new edges
 
-    // 变异信息（可选）
-    bool is_mutated;                       // 是否被变异
-    uint8_t mutation_cmd;                  // 变异命令类型
+    /* Mutation information (optional) */
+    bool is_mutated;                       // Whether it was mutated
+    uint8_t mutation_cmd;                  // Mutation command type
 
 } TreeNode;
 
-// Syscall Tree全局结构
+/* Syscall Tree global structure */
 typedef struct RRSyscallTree {
-    // 节点池
+    /* Node pool */
     TreeNode nodes[MAX_TREE_NODES];
-    uint32_t node_count;                   // 当前节点数量
+    uint32_t node_count;                   // Current number of nodes
 
-    // 根节点
+    /* Root node */
     uint32_t root_node_id;
 
-    // 当前活跃节点（用于追踪execution）- 简化为单PID
-    uint32_t current_node_id;
-
-    // 统计信息
+    /* Statistics */
     uint32_t total_syscalls;
     uint32_t total_forks;
 
-    // 启用标志
+    /* Process parent-child relationship mapping (Shared Memory Linkage) */
+    // Index: Child PID, Value: Parent Node ID
+    #define MAX_TRACKED_PIDS 65536
+    uint32_t process_parents[MAX_TRACKED_PIDS];
+
+    /* Enable flag */
     bool enabled;
 
 } RRSyscallTree;
 
-// 全局tree实例
-extern RRSyscallTree g_syscall_tree;
+/* Global tree instance (SHARED MEMORY POINTER) */
+extern RRSyscallTree *g_syscall_tree_ptr;
+// Compatibility Macro to minimize code changes: g_syscall_tree.xxx -> g_syscall_tree_ptr->xxx
+#define g_syscall_tree (*g_syscall_tree_ptr)
 
-// API函数
+// Process-Local State (COW ensures each process has its own cursor)
+extern uint32_t g_current_tree_node_id;
+
+/* API Functions */
 void rr_tree_init(void);
 void rr_tree_cleanup(void);
 
 uint32_t rr_tree_add_syscall_node(
     uint32_t pid,
     uint32_t syscall_index,
-    uint32_t syscall_nr,
+    int syscall_nr,
     const char *syscall_name,
-    uint64_t *args,
+    uint64_t args[6],
     int64_t retval,
     uint64_t timestamp_enter,
-    uint64_t timestamp_exit
+    uint64_t timestamp_exit,
+    bool is_mutated           // Whether mutated
 );
 
 void rr_tree_add_fork_relation(
@@ -90,7 +101,7 @@ void rr_tree_add_fork_relation(
 
 void rr_tree_export_json(const char *output_file);
 
-// 辅助函数
+/* Helper functions */
 const char* rr_tree_get_syscall_name(uint32_t syscall_nr);
 
 #endif /* RR_SYSCALL_TREE_H */

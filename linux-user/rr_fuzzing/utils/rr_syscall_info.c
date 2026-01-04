@@ -1,36 +1,36 @@
 /**
- * RR-Fuzz 系统调用分类信息实现
+ * RR-Fuzz Syscall Classification Information Implementation
  */
 
 #include "../core/rr_framework.h"
 #include "rr_syscall_info.h"
 
-/* 系统调用号定义 */
+/* Syscall number definitions */
 #ifndef __NR_read
 #include <sys/syscall.h>
 #endif
 
-/* ===== 系统调用分类表 ===== */
+/* ===== Syscall Classification Table ===== */
 /**
- * @brief 系统调用分类表 (P0 Key Data Structure)
+ * @brief Syscall Classification Table (P0 Key Data Structure)
  * 
- * 定义了所有受支持的系统调用的分类信息。
+ * Defines classification information for all supported syscalls.
  * 
- * **分类 (Class)**:
- * - `SYSCALL_CLASS_IO`:   读写数据 (fuzzing 重点)
- * - `SYSCALL_CLASS_FD`:   管理 FD (open, close, socket)
- * - `SYSCALL_CLASS_MEM`:  内存管理 (mmap)
- * - `SYSCALL_CLASS_PROC`: 进程控制 (fork, exec)
+ * **Class**:
+ * - `SYSCALL_CLASS_IO`:   I/O operations (Fuzzing target)
+ * - `SYSCALL_CLASS_FD`:   File descriptor management (open, close, socket)
+ * - `SYSCALL_CLASS_MEM`:  Memory management (mmap, brk)
+ * - `SYSCALL_CLASS_PROC`: Process control (fork, exec)
  * 
- * **属性**:
- * - `is_input`: 标记该 syscall 是否为输入源 (如 read 是, write 不是)。
- *               这对于 Auto Fork 策略至关重要。
+ * **Attributes**:
+ * - `is_input`: Marks whether the syscall is an input source (e.g., read is input, write is not).
+ *               Crucial for the Auto Fork strategy.
  */
 static const syscall_info_t g_syscall_table[] = {
-    /* ===== P_IO 类（18个）- fuzzing 目标 ===== */
-    /* 这些系统调用传输数据，是 fuzzing 的主要目标 */
+    /* ===== SYSCALL_CLASS_IO (18) - Fuzzing Targets ===== */
+    /* These syscalls transfer data and are the primary targets for fuzzing. */
     
-    /* 文件 I/O */
+    /* File I/O */
     {__NR_read,          "read",          SYSCALL_CLASS_IO, true},
     {__NR_write,         "write",         SYSCALL_CLASS_IO, false},
 #ifdef __NR_pread64
@@ -48,7 +48,7 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_pwritev,       "pwritev",       SYSCALL_CLASS_IO, false},
 #endif
     
-    /* 网络 I/O */
+    /* Network I/O */
     {__NR_sendto,        "sendto",        SYSCALL_CLASS_IO, false},
     {__NR_recvfrom,      "recvfrom",      SYSCALL_CLASS_IO, true},
     {__NR_sendmsg,       "sendmsg",       SYSCALL_CLASS_IO, false},
@@ -60,15 +60,15 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_recvmmsg,      "recvmmsg",      SYSCALL_CLASS_IO, true},
 #endif
     
-    /* 设备和目录 I/O */
+    /* Device and Directory I/O */
     {__NR_ioctl,         "ioctl",         SYSCALL_CLASS_IO, true},
     {__NR_getdents,      "getdents",      SYSCALL_CLASS_IO, true},
 #ifdef __NR_getdents64
     {__NR_getdents64,    "getdents64",    SYSCALL_CLASS_IO, true},
 #endif
     
-    /* ===== P_FD 类 - 文件描述符管理 ===== */
-    /* 这些系统调用管理文件描述符，不传输数据 */
+    /* ===== SYSCALL_CLASS_FD - File Descriptor Management ===== */
+    /* These syscalls manage file descriptors and do not transfer data. */
     {__NR_open,          "open",          SYSCALL_CLASS_FD, false},
     {__NR_openat,        "openat",        SYSCALL_CLASS_FD, false},
     {__NR_close,         "close",         SYSCALL_CLASS_FD, false},
@@ -90,7 +90,7 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_pipe2,         "pipe2",         SYSCALL_CLASS_FD, false},
 #endif
     
-    /* ===== PMEM 类 - 内存管理 ===== */
+    /* ===== SYSCALL_CLASS_MEM - Memory Management ===== */
     {__NR_mmap,          "mmap",          SYSCALL_CLASS_MEM, false},
     {__NR_munmap,        "munmap",        SYSCALL_CLASS_MEM, false},
     {__NR_mprotect,      "mprotect",      SYSCALL_CLASS_MEM, false},
@@ -100,7 +100,7 @@ static const syscall_info_t g_syscall_table[] = {
 #endif
     {__NR_madvise,       "madvise",       SYSCALL_CLASS_MEM, false},
     
-    /* ===== PINF 类 - 信息查询 ===== */
+    /* ===== SYSCALL_CLASS_INFO - Information Queries ===== */
     {__NR_stat,          "stat",          SYSCALL_CLASS_INFO, false},
     {__NR_fstat,         "fstat",         SYSCALL_CLASS_INFO, false},
     {__NR_lstat,         "lstat",         SYSCALL_CLASS_INFO, false},
@@ -116,7 +116,7 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_getcwd,        "getcwd",        SYSCALL_CLASS_INFO, false},
     {__NR_getdents,      "getdents",      SYSCALL_CLASS_INFO, false},
     
-    /* ===== PROC 类 - 进程管理 ===== */
+    /* ===== SYSCALL_CLASS_PROC - Process Management ===== */
     {__NR_fork,          "fork",          SYSCALL_CLASS_PROC, false},
 #ifdef __NR_vfork
     {__NR_vfork,         "vfork",         SYSCALL_CLASS_PROC, false},
@@ -132,7 +132,7 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_exit,          "exit",          SYSCALL_CLASS_PROC, false},
     {__NR_exit_group,    "exit_group",    SYSCALL_CLASS_PROC, false},
     
-    /* ===== PSIG 类 - 信号处理 ===== */
+    /* ===== SYSCALL_CLASS_SIG - Signal Handling ===== */
     {__NR_rt_sigaction,  "rt_sigaction",  SYSCALL_CLASS_SIG, false},
     {__NR_rt_sigprocmask, "rt_sigprocmask", SYSCALL_CLASS_SIG, false},
 #ifdef __NR_rt_sigreturn
@@ -143,29 +143,29 @@ static const syscall_info_t g_syscall_table[] = {
     {__NR_tkill,         "tkill",         SYSCALL_CLASS_SIG, false},
 #endif
     
-    /* ===== PTHR 类 - 线程管理 ===== */
+    /* ===== SYSCALL_CLASS_THR - Thread Management ===== */
     {__NR_clone,         "clone",         SYSCALL_CLASS_THR, false},
 #ifdef __NR_sched_yield
     {__NR_sched_yield,   "sched_yield",   SYSCALL_CLASS_THR, false},
 #endif
     {__NR_futex,         "futex",         SYSCALL_CLASS_THR, false},
     
-    /* 结束标记 */
+    /* End marker */
     {-1, NULL, SYSCALL_CLASS_MISC, false}
 };
 
-/* ===== 实现函数 ===== */
+/* ===== Implementation Functions ===== */
 
 const syscall_info_t *rr_get_syscall_info(int syscall_nr)
 {
-    /* 线性查找（表不大，性能足够） */
+    /* Linear search (small table, sufficient performance) */
     for (int i = 0; g_syscall_table[i].nr != -1; i++) {
         if (g_syscall_table[i].nr == syscall_nr) {
             return &g_syscall_table[i];
         }
     }
     
-    /* 未找到，返回默认信息 */
+    /* Not found, return default info */
     static const syscall_info_t default_info = {
         -1, "unknown", SYSCALL_CLASS_MISC, false
     };
@@ -173,69 +173,69 @@ const syscall_info_t *rr_get_syscall_info(int syscall_nr)
 }
 
 /**
- * @brief 判断是否应该自动 Fork (Auto Fork Heuristic)
+ * @brief Determine whether to Auto Fork (Auto Fork Heuristic)
  * 
- * Fork Server 的核心决策函数。在 `rr_check_auto_fork_point` 中被调用。
- * 决定当前系统调用执行完毕后，是否应该作为一个新的 Fork 点。
+ * Core decision function for Fork Server. Called in `rr_check_auto_fork_point`.
+ * Decides whether the current syscall point should be used as a new Fork Point.
  * 
- * **策略 (Strategy)**:
- * - `STRICT`: 仅当成功读取且被标记为 input 时 fork (保守)。
- * - `RELAXED`: 允许部分错误 (如 ENOENT)。
- * - `AGGRESSIVE`: 只要是 IO 类 syscall 就 fork (覆盖率最大化)。
- * - `FALLBACK`: 留给上层逻辑决定。
+ * **Strategy**:
+ * - `STRICT`: Fork only on successful read marked as input (Conservative).
+ * - `RELAXED`: Allow partial errors (e.g., ENOENT).
+ * - `AGGRESSIVE`: Fork on any I/O class syscall (Maximize coverage).
+ * - `FALLBACK`: Defer decision to upper layer logic.
  * 
- * @param syscall_nr 系统调用号
- * @param ret 返回值
- * @return true 应该 fork, false 不 fork
+ * @param syscall_nr System call number
+ * @param ret Return value
+ * @return true if fork should occur, false otherwise.
  */
 bool rr_should_auto_fork(int syscall_nr, abi_long ret)
 {
     const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
     
     /*
-     * 改进的 Fork 策略（支持多种模式）
+     * Improved Fork Strategy (Supports multiple modes)
      * 
-     * 模式说明：
-     * - STRICT: EnvFuzz原始策略（ret>0 && is_input && class==IO）
-     * - RELAXED: 允许探测性错误（ENOENT, EACCES）
-     * - AGGRESSIVE: 任何I/O类syscall都fork（当前最实用）
-     * - FALLBACK: 会在rr_check_auto_fork_point()中处理
+     * Mode descriptions:
+     * - STRICT: Original EnvFuzz strategy (ret > 0 && is_input && class == IO)
+     * - RELAXED: Allows exploratory errors (ENOENT, EACCES)
+     * - AGGRESSIVE: Fork on any I/O class syscall (Recommended for testing)
+     * - FALLBACK: Handled in rr_check_auto_fork_point()
      */
     
-    /* 基本过滤：必须是I/O类或FD类（因为open/openat返回fd后会有read/write） */
+    /* Base filter: Must be I/O class or FD class (as open/openat is followed by I/O) */
     if (info->class != SYSCALL_CLASS_IO && info->class != SYSCALL_CLASS_FD) {
         return false;  
     }
     
-    /* 根据策略选择不同的判断逻辑 */
+    /* Choose logic based on strategy */
     switch (g_rr_config.fork_strategy) {
         case RR_FORK_STRATEGY_STRICT:
-            /* 严格模式：EnvFuzz原始策略 */
+            /* STRICT: Original EnvFuzz strategy */
             if (!info->is_input) return false;
             if (ret <= 0) return false;
             return true;
             
         case RR_FORK_STRATEGY_RELAXED:
-            /* 宽松模式：允许ENOENT/EACCES等探测性错误 */
+            /* RELAXED: Allows exploratory errors like ENOENT/EACCES */
             if (!info->is_input) return false;
-            if (ret > 0) return true;  // 成功
-            // 允许特定的探测性错误
+            if (ret > 0) return true;  // Success
+            // Allow specific exploratory errors
             if (ret == -2 || ret == -13) return true;  // ENOENT or EACCES
             return false;
             
         case RR_FORK_STRATEGY_AGGRESSIVE:
-            /* 激进模式：任何I/O类syscall都fork（推荐用于测试） */
-            // 不检查方向，不检查返回值
+            /* AGGRESSIVE: Any I/O class syscall forks (Recommended) */
+            // Does not check direction or return value
             return true;
             
         case RR_FORK_STRATEGY_FALLBACK:
-            /* Fallback模式：在check_auto_fork_point中处理 */
+            /* FALLBACK: Handled in check_auto_fork_point */
             if (!info->is_input) return false;
-            if (ret > 0) return true;  // 成功的优先
-            return false;  // 失败的等fallback处理
+            if (ret > 0) return true;  // Success preferred
+            return false;  // Failure waits for fallback handling
             
         default:
-            /* 默认使用AGGRESSIVE */
+            /* Default to AGGRESSIVE */
             return true;
     }
 }

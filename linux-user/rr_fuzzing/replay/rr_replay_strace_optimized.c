@@ -1,6 +1,6 @@
 /**
- * 优化后的 RR-Fuzz Strace重放模块
- * 使用模块化设计和优化的数据结构
+ * Optimized RR-Fuzz Strace Replay Module
+ * Modular design with optimized data structures.
  */
 
 #include "../core/rr_framework.h"
@@ -9,7 +9,7 @@
 #include "rr_replay_strace.h"
 #include "../utils/rr_syscall_dispatch.h"
 #include "../utils/rr_mapping_manager.h"
-#include "../utils/rr_dynamic_trace.h"  /* 动态跟踪API */
+#include "../utils/rr_dynamic_trace.h"  /* Dynamic trace API */
 #include "qemu.h"
 #include <sys/mman.h>
 #include <unistd.h>
@@ -21,53 +21,53 @@
 #include <signal.h>
 #include <time.h>
 
-/* ==================== 全局状态管理 ==================== */
+/* Global State Management */
 
-/* Strace解析器实例 */
+/* Strace parser instance */
 static rr_strace_parser_t *g_strace_parser = NULL;
 
-/* 全局系统调用索引（供fork server使用） */
+/* Global syscall index (used by fork server) */
 uint32_t g_strace_current_index = 0;
 
-/* 重放控制状态 - 简化版本 */
+/* Replay control state - Simplified version */
 typedef struct {
     bool enabled;
     bool strict_mode;
     bool skip_unmatched;
     int max_lookahead;
 
-    /* 统计信息 */
+    /* Statistics */
     uint64_t total_syscalls;
     uint64_t matched_syscalls;
     uint64_t skipped_syscalls;
     uint64_t error_syscalls;
     uint64_t fallback_syscalls;
 
-    /* 状态信息 */
+    /* Status information */
     char *trace_filename;
     size_t current_record_index;
     bool trace_exhausted;
     bool allow_fallback_execution;
 
-    /* 🔥 修复：跟踪当前syscall的变异状态 */
+    /* Track mutation state for the current syscall */
     bool current_syscall_was_fuzzed;
 } rr_strace_replay_state_t;
 
 static rr_strace_replay_state_t g_strace_state = {0};
 static char g_stats_filename[256] = {0};
 
-/* 统计输出控制 */
+/* Statistics output control */
 #define STATS_PRINT_INTERVAL 10
 static size_t g_last_stats_print = 0;
 
-/* 当前正在处理的记录 (strace专用，区别于binary replay的g_current_record) */
+/* Current record being processed (strace-specific, distinct from binary replay g_current_record) */
 __attribute__((unused)) static rr_strace_record_t *g_current_strace_record = NULL;
-static rr_strace_record_t *g_current_record_strace = NULL;  /* 供 post_hook 使用 */
+static rr_strace_record_t *g_current_record_strace = NULL;  /* For post_hook usage */
 
-/* 信号处理器标志 */
+/* Signal handler flag */
 static volatile sig_atomic_t g_signal_received = 0;
 
-/* ==================== 日志系统 ==================== */
+/* Logging System */
 
 typedef enum {
     STRACE_LOG_ERROR = 0,
@@ -97,8 +97,8 @@ static void init_strace_log_level(void) {
 }
 
 /* 
- * Strace模块专用日志宏 - 避免与框架日志宏冲突
- * 使用 STRACE_ 前缀以区分
+ * Strace module specific logging macros - avoids conflict with framework macros.
+ * Uses STRACE_ prefix for differentiation.
  */
 #define STRACE_ERROR(fmt, ...)   do { if (g_strace_log_level >= STRACE_LOG_ERROR) fprintf(stderr, "[STRACE-ERROR] " fmt "\n", ##__VA_ARGS__); } while(0)
 #define STRACE_WARN(fmt, ...)    do { if (g_strace_log_level >= STRACE_LOG_WARN) fprintf(stderr, "[STRACE-WARN] " fmt "\n", ##__VA_ARGS__); } while(0)
@@ -106,7 +106,7 @@ static void init_strace_log_level(void) {
 #define STRACE_VERBOSE(fmt, ...) do { if (g_strace_log_level >= STRACE_LOG_VERBOSE) fprintf(stderr, "[STRACE-VERBOSE] " fmt "\n", ##__VA_ARGS__); } while(0)
 #define STRACE_DEBUG(fmt, ...)   do { if (g_strace_log_level >= STRACE_LOG_DEBUG) fprintf(stderr, "[STRACE-DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
-/* ==================== 统计和信号处理 ==================== */
+/* Statistics and Signal Handling */
 
 static void rr_strace_signal_handler(int sig);
 
@@ -136,7 +136,7 @@ void rr_strace_save_stats_to_file(const char *filename) {
         fprintf(fp, "Status: %s\n", g_strace_state.trace_exhausted ? "EXHAUSTED" : "ACTIVE");
     }
     
-    // 添加映射管理器统计
+    // Add mapping manager statistics
     rr_mapping_stats_t mapping_stats;
     rr_mapping_get_stats(&mapping_stats);
     fprintf(fp, "\nMapping Statistics:\n");
@@ -165,7 +165,7 @@ void rr_strace_replay_print_stats(void) {
     STRACE_INFO("  Error syscalls: %zu", g_strace_state.error_syscalls);
     STRACE_INFO("  Fallback executions: %zu", g_strace_state.fallback_syscalls);
     
-    // 显示映射统计
+    // Display mapping statistics
     rr_mapping_print_stats();
     
     STRACE_INFO("=== END STATISTICS ===");
@@ -199,7 +199,7 @@ static void rr_strace_check_periodic_stats(void) {
     }
 }
 
-/* ==================== 优化的匹配算法 ==================== */
+/* Optimized Matching Algorithm */
 
 static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_long *args) {
     const char *syscall_name = rr_get_syscall_name_fast(syscall_nr);
@@ -210,7 +210,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
     
     syscall_importance_t importance = rr_get_syscall_importance(syscall_nr);
     
-    // 根据重要性调整搜索策略
+    // Adjust search strategy based on importance
     int max_skip;
     switch (importance) {
         case SYSCALL_IMPORTANCE_CRITICAL:
@@ -252,17 +252,17 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
         
         /* 🔥 修复：索引递增移到匹配成功后 */
         
-        // === 智能匹配算法 - 三级策略 ===
+        // === Intelligent Matching Algorithm - Three-level Strategy ===
         
-        // Level 0: syscall号必须匹配
+        // Level 0: Syscall number must match
         if (strcmp(record->syscall_name, syscall_name) != 0) {
             skip_count++;
-            /* 不匹配：继续循环但不递增索引 */
+            /* No match: continue loop; index remains unchanged */
             continue;
         }
         
-        // Level 1: 探测性匹配 (PROBE)
-        // 识别"探测性"syscall: 返回ENOENT的文件访问
+        // Level 1: Probing Match (PROBE)
+        // Identifies "probing" syscalls (e.g., file access returning ENOENT)
         if ((syscall_nr == 257 || syscall_nr == 262 || syscall_nr == 21) &&  // openat/newfstatat/access
             record->ret_value == -2) {  // ENOENT
             
@@ -271,16 +271,16 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
                 STRACE_INFO("Probe match successful after skipping %d records: %s", 
                         skip_count, syscall_name);
             }
-            /* 🔥 匹配成功，递增索引 */
+            /* Match successful, increment index */
             g_strace_state.current_record_index++;
             return record;
         }
         
-        // Level 2: 语义匹配 (SEMANTIC)
+        // Level 2: Semantic Match (SEMANTIC)
         
-        // openat 成功的情况 - 只检查访问模式
+        // openat success - only check access mode
         if (syscall_nr == 257 && record->ret_value >= 0) {
-            // 只检查访问模式（flags的低2位）
+            // Only check access mode (low 2 bits of flags)
             if (record->arg_count > 2 && args) {
                 int record_mode = record->args[2].value & 0x3;  // O_ACCMODE
                 int current_mode = args[2] & 0x3;
@@ -299,7 +299,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
             }
         }
         
-        // newfstatat - 只检查flags
+        // newfstatat - only check flags
         if (syscall_nr == 262) {
             if (record->arg_count > 3 && args) {
                 if (args[3] == record->args[3].value) {  // flags相同
@@ -314,7 +314,7 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
             }
         }
         
-        // mmap - 检查prot和flags，忽略地址和长度
+        // mmap - check prot and flags, ignore address and length
         if (syscall_nr == 9) {
             if (record->arg_count > 3 && args) {
                 bool prot_match = (args[2] == record->args[2].value);  // prot
@@ -333,8 +333,8 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
             }
         }
         
-        // Level 3: 精确匹配（兜底策略）
-        // syscall号已经匹配，直接返回
+        // Level 3: Exact Match (Fallback Strategy)
+        // Syscall number already matches, return record.
         STRACE_VERBOSE("✓ Exact match: %s", syscall_name);
         if (skip_count > 0) {
             STRACE_INFO("Exact match successful after skipping %d records: %s", 
@@ -348,26 +348,23 @@ static rr_strace_record_t *optimized_find_matching_record(int syscall_nr, abi_lo
     return NULL;
 }
 
-/* ==================== 确定性系统调用处理 ==================== */
+/* Deterministic Syscall Handling */
 
 /**
- * 确定性uname处理 - 解决uname系统调用不稳定导致的执行路径分歧
+ * Deterministic uname handling - resolves instabilities leading to execution path divergence.
  * 
- * 关键修复: 不要返回-1让QEMU执行，因为QEMU执行可能失败并触发fallback，
- * 导致插入额外的系统调用（openat /proc/sys/kernel/osrelease等），
- * 从而破坏trace的对齐。应该直接返回成功(0)。
+ * Logic: Returns success (0) directly instead of executing via QEMU to avoid potential 
+ * fallback syscalls (e.g., reading /proc/sys/kernel/osrelease) that could break trace alignment.
  */
 __attribute__((unused)) static abi_long rr_handle_deterministic_uname(CPUArchState *env, abi_long buf_addr) {
     g_strace_state.matched_syscalls++;
     STRACE_INFO("Deterministic uname: directly returning success to avoid fallback syscalls");
     
-    // 关键: 直接返回0表示成功，不让QEMU执行uname
-    // 这样可以避免uname失败后触发fallback（读取/proc/sys/kernel/osrelease）
-    // 从而避免插入额外的系统调用，保持trace对齐
+    // Return 0 (success) directly to avoid fallback and extra syscalls.
     return 0;
 }
 
-/* ==================== 主要接口函数 ==================== */
+/* Main Interface Functions */
 
 int rr_strace_replay_init(const char *trace_file) {
     init_strace_log_level();
@@ -379,7 +376,7 @@ int rr_strace_replay_init(const char *trace_file) {
     
     STRACE_INFO("Initializing optimized strace replay with trace file: %s", trace_file);
     
-    // 初始化状态
+    // Initialize state
     memset(&g_strace_state, 0, sizeof(g_strace_state));
     g_strace_state.trace_filename = strdup(trace_file);
     if (!g_strace_state.trace_filename) {
@@ -393,14 +390,14 @@ int rr_strace_replay_init(const char *trace_file) {
     g_strace_state.trace_exhausted = false;
     g_strace_state.allow_fallback_execution = true;
     
-    // 初始化系统调用分发器
+    // Initialize syscall dispatcher
     if (rr_syscall_dispatch_init() < 0) {
         STRACE_ERROR("Failed to initialize syscall dispatcher");
         free(g_strace_state.trace_filename);
         return -1;
     }
     
-    // 初始化映射管理器
+    // Initialize mapping manager
     if (rr_mapping_manager_init(256, 128) < 0) {
         STRACE_ERROR("Failed to initialize mapping manager");
         rr_syscall_dispatch_cleanup();
@@ -408,7 +405,7 @@ int rr_strace_replay_init(const char *trace_file) {
         return -1;
     }
     
-    // 初始化strace解析器
+    // Initialize strace parser
     g_strace_parser = rr_strace_parser_init(trace_file);
     if (!g_strace_parser) {
         STRACE_ERROR("Failed to initialize strace parser");
@@ -418,7 +415,7 @@ int rr_strace_replay_init(const char *trace_file) {
         return -1;
     }
     
-    // 加载strace文件
+    // Load strace file
     if (rr_strace_parser_load(g_strace_parser) < 0) {
         STRACE_ERROR("Failed to load strace file");
         rr_strace_parser_cleanup(g_strace_parser);
@@ -429,18 +426,18 @@ int rr_strace_replay_init(const char *trace_file) {
         return -1;
     }
     
-    // 获取统计信息
+    // Get statistics
     size_t total_records, current_index;
     rr_strace_get_stats(g_strace_parser, &total_records, &current_index);
     
     g_strace_state.enabled = true;
     
-    // 注册信号处理器
+    // Register signal handlers
     signal(SIGINT, rr_strace_signal_handler);
     signal(SIGTERM, rr_strace_signal_handler);
     signal(SIGQUIT, rr_strace_signal_handler);
     
-    // 设置统计文件名
+    // Set statistics filename
     snprintf(g_stats_filename, sizeof(g_stats_filename), "/tmp/rr_strace_optimized_stats_%d.txt", getpid());
     rr_strace_save_stats_to_file(g_stats_filename);
     
@@ -455,12 +452,12 @@ int rr_strace_replay_init(const char *trace_file) {
 void rr_strace_replay_cleanup(void) {
     if (!g_strace_state.enabled) return;
     
-    // 保存最终统计信息
+    // Save final statistics
     if (g_stats_filename[0] != '\0') {
         rr_strace_save_stats_to_file(g_stats_filename);
     }
     
-    // 清理资源
+    // Cleanup resources
     if (g_strace_parser) {
         rr_strace_parser_cleanup(g_strace_parser);
         g_strace_parser = NULL;
@@ -482,7 +479,7 @@ void rr_strace_replay_cleanup(void) {
 abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long *args) {
     STRACE_DEBUG("Processing syscall %d", num);
     
-    /* DEBUG: 打印第一个syscall的silent mode状态 */
+    /* DEBUG: Print silent mode status for the first syscall */
     static int first_call = 1;
     static pid_t last_pid = 0;
     pid_t current_pid = getpid();
@@ -493,7 +490,7 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
                 g_rr_framework->silent_replay_mode, g_rr_framework->checkpoint_target);
     }
     
-    /* DEBUG: 每个进程的第一个syscall打印详细状态 */
+    /* DEBUG: Detailed status print for each process's first syscall */
     if (current_pid != last_pid) {
         last_pid = current_pid;
         RR_INFO("🔍 [PID %d] First syscall: trace_exhausted=%d, current_record_index=%zu, parser=%p, enabled=%d",
@@ -508,35 +505,35 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     g_strace_state.total_syscalls++;
     
-    // 检查trace是否已耗尽
+    // Check if trace exhausted
     if (g_strace_state.trace_exhausted) {
         g_strace_state.fallback_syscalls++;
         const char *syscall_name = rr_get_syscall_name_fast(num);
         STRACE_VERBOSE("Trace exhausted, fallback execution for %s (%zu total fallbacks)", 
                   syscall_name ? syscall_name : "unknown", g_strace_state.fallback_syscalls);
         
-        /* 🔥 关键修复：如果是fuzzing模式的子进程，trace耗尽后应该退出 */
+        /* Trace exhausted in Fuzzing mode child process should exit */
         if (g_rr_framework && 
             g_rr_framework->mode == RR_MODE_FUZZING && 
             g_rr_framework->child_pid == 0) {
-            STRACE_INFO("🎯 Trace exhausted in child process (PID=%d), exiting normally", getpid());
-            exit(0);  // 子进程正常退出，父进程的waitpid()会返回
+            STRACE_INFO("Trace exhausted in child process (PID=%d), exiting normally", getpid());
+            exit(0);  /* Child exits; parent waitpid() will return */
         }
         
         return -1;
     }
     
-    // 检查周期性统计
+    // Check periodic statistics
     rr_strace_check_periodic_stats();
     
-    // 查找匹配的记录
+    // Find matching record
     rr_strace_record_t *record = optimized_find_matching_record(num, args);
     
-    /* 🔥 修复：uname 不使用固定字符串，改为真实执行或从 trace 读取 */
+    /* uname handling: execute real uname if not found in trace for compatibility */
     if (!record && num == 63) { // TARGET_NR_uname
         STRACE_INFO("uname not found in trace, executing real uname for environment compatibility");
         g_strace_state.fallback_syscalls++;
-        return -1; // 让 QEMU 执行真实 uname，适应环境
+        return -1; // Fallback to host execution
     }
     if (!record) {
         g_strace_state.error_syscalls++;
@@ -544,14 +541,14 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         STRACE_WARN("No matching record found for %s (%d)", 
                 syscall_name ? syscall_name : "unknown", num);
         
-        /* 🔥 如果连续多个系统调用找不到匹配，可能trace已经偏移，子进程应该退出 */
+        /* Exit child process in Fuzzing mode if too many unmatched syscalls */
         if (g_rr_framework && 
             g_rr_framework->mode == RR_MODE_FUZZING && 
             g_rr_framework->child_pid == 0 && 
-            g_strace_state.error_syscalls > 5) {  // 容忍5次失败
-            STRACE_WARN("🎯 Too many unmatched syscalls in child process (%zu errors), exiting", 
+            g_strace_state.error_syscalls > 5) {  // Tolerance limit
+            STRACE_WARN("Too many unmatched syscalls in child process (%zu errors), exiting", 
                    g_strace_state.error_syscalls);
-            exit(1);  // 异常退出，父进程会检测到
+            exit(1);  /* Abnormal exit; parent will detect */
         }
         
         if (g_strace_state.skip_unmatched) {
@@ -564,22 +561,22 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     g_strace_state.matched_syscalls++;
     
-    /* 更新全局索引 */
+    /* Update global index */
     g_strace_current_index = g_strace_state.current_record_index;
     
     STRACE_VERBOSE("Found matching record: %s, ret=%ld", record->syscall_name, record->ret_value);
 
-    /* 🔥 修复：初始化变异状态为false */
+    /* Initialize mutation state to false */
     g_strace_state.current_syscall_was_fuzzed = false;
 
-    /* 动态跟踪：系统调用进入 (✅ silent mode时不发送) */
+    /* Dynamic Tracking: Syscall Enter (Skipped in silent mode) */
     if (!g_rr_framework->silent_replay_mode) {
         rr_dynamic_trace_syscall_enter(
             env, 
             num, 
             (uint64_t*)args, 
             g_strace_state.current_record_index,
-            false  /* 尚未变异 */
+            false  /* Not mutated yet */
         );
     } else {
         RR_INFO("🔇 Silent mode: skipping trace for syscall[%u] %s", 
@@ -588,19 +585,18 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
     
     /* 🔥 修复：uname 不使用固定字符串，从 trace 获取或返回 -1 让宿主执行 */
     
-    // 保存原始参数用于比较
+    // Save original arguments for comparison
     abi_long orig_args[RR_MAX_SYSCALL_ARGS];
     for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         orig_args[i] = args[i];
     }
-    (void)orig_args;  /* 可能在调试关闭时未使用 */
+    (void)orig_args;  /* Prevents unused-variable warning when debug is disabled */
     
-    // 使用优化的参数处理
-    // 步骤1: 应用记录的参数和FD映射（来自trace）
+    // Step 1: Apply recorded arguments and FD mapping (from trace)
     rr_apply_syscall_args_optimized(record, args);
     rr_apply_fd_mapping_optimized(num, args);
     
-    // 输出trace参数修改信息
+    // Log trace parameter modification details
     bool args_modified = false;
     for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         if (orig_args[i] != args[i]) {
@@ -614,80 +610,80 @@ abi_long rr_replay_syscall_strace_optimized(CPUArchState *env, int num, abi_long
         STRACE_DEBUG("TRACE_REPLAY: %s parameter replacement from trace completed", record->syscall_name);
     }
     
-    /* ===== 🔥 关键修复：Fuzz变异注入点 ===== */
+    /* Fuzz Mutation Injection Point */
     /* 
-     * 步骤2: 在Fuzzing模式下，对已重放的参数进行变异
+     * Step 2: In Fuzzing mode, mutate replayed parameters.
      * 
-     * 执行顺序：
-     * 1. 参数从trace恢复（上面完成）
-     * 2. 应用Fuzz变异（这里）
-     * 3. 执行真实系统调用（下面返回-1）
+     * Execution Order:
+     * 1. Parameters restored from trace (completed above).
+     * 2. Apply Fuzz mutations (here).
+     * 3. Execute real syscall (return -1 below).
      * 
-     * 注意：g_rr_framework可能为NULL（如果使用纯strace模式）
+     * Note: g_rr_framework might be NULL in pure strace mode.
      */
     if (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING) {
-        // 使用strace的记录索引作为syscall_index
+        // Use strace record index as syscall_index
         uint32_t syscall_index = (uint32_t)g_strace_state.current_record_index;
         
         STRACE_VERBOSE("Applying fuzz mutations at syscall_index=%u (%s)", 
                    syscall_index, record->syscall_name);
         
-        /* 🔥 修复：保存当前参数，应用变异后再检测 */
+        /* Save current parameters, detect changes after mutation */
         abi_long pre_fuzz_args[RR_MAX_SYSCALL_ARGS];
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             pre_fuzz_args[i] = args[i];
         }
-        (void)pre_fuzz_args;  /* 可能在调试关闭时未使用 */
+        (void)pre_fuzz_args;  /* Prevents unused-variable warning when debug is disabled */
         
-        // 🔥 修复：调用Fuzz引擎应用变异并获取结果
+        // Mutate syscall parameters using Fuzz engine
         int mutation_result = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
-
-        // 🔥 修复：检测参数是否被Fuzz变异 (结合返回值)
-        bool fuzz_modified = (mutation_result > 0);  // buffer mutations
-
-        // 额外检查参数变化（用于调试和统计）
+ 
+        // Detect if parameters were mutated (including buffer mutations indicated by return value)
+        bool fuzz_modified = (mutation_result > 0);  // Buffer mutations
+ 
+        // Additional check for argument changes (for debugging/statistics)
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (pre_fuzz_args[i] != args[i]) {
-                fuzz_modified = true;  // 任何参数变化都算作变异
+                fuzz_modified = true;  // Any argument change counts as mutation
                 STRACE_VERBOSE("FUZZ_MUTATED: %s arg[%d] %ld -> %ld",
                           record->syscall_name, i, (long)pre_fuzz_args[i], (long)args[i]);
             }
         }
         
         if (fuzz_modified) {
-            STRACE_INFO("🎯 FUZZING: %s at index %u - parameters mutated",
+            STRACE_INFO("FUZZING: %s at index %u - parameters mutated",
                    record->syscall_name, syscall_index);
         }
-
-        // 🔥 修复：保存变异状态供动态跟踪使用
+ 
+        // Save mutation state for dynamic tracking
         g_strace_state.current_syscall_was_fuzzed = fuzz_modified;
     }
     
-    // 保存当前记录供POST-HOOK使用
+    // Save current record for POST-HOOK
     g_current_record_strace = record;
-
-    /* 🔥 修复：设置标记，告诉 post_hook 这条记录已经被处理 */
+ 
+    /* Set flag to indicate that this record has been consumed */
     g_syscall_already_consumed = true;
-
-    /* ✅ 新增：检查是否有IO返回值覆盖 */
+ 
+    /* Check for IO return value overrides */
     if (g_rr_framework && g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
         abi_long original_ret = record->ret_value;
-        abi_long mutated_ret = rr_fuzz_get_retval_override();  // 这会自动清除标志
-
-        RR_INFO("🎯 IO RETVAL OVERRIDE: %s: %ld → %ld (NOT executing real syscall)",
+        abi_long mutated_ret = rr_fuzz_get_retval_override();  /* Clears the flag */
+ 
+        RR_INFO("IO RETVAL OVERRIDE: %s: %ld → %ld (Executing mutated retval instead of real syscall)",
                 record->syscall_name, original_ret, mutated_ret);
-
-        fprintf(stderr, "[STRACE] 🎯 RETVAL OVERRIDE: %s %ld → %ld (pure replay with mutated retval)\n",
+ 
+        fprintf(stderr, "[STRACE] RETVAL OVERRIDE: %s %ld → %ld (Pure replay with mutated retval)\n",
                 record->syscall_name, (long)original_ret, (long)mutated_ret);
         fflush(stderr);
-
-        // ✅ 直接返回变异的返回值，不执行真实系统调用
-        // 这对read()等IO syscalls很重要 - 我们要控制它们的返回值来触发不同代码路径
+ 
+        // Directly return mutated value without executing real syscall. 
+        // Essential for IO syscalls to control return values and trigger different code paths.
         return mutated_ret;
     }
-
+ 
     STRACE_VERBOSE("Hybrid replay+fuzz mode: executing real syscall with modified args");
-    return -1;  // 返回-1让QEMU执行真实系统调用
+    return -1;  // Return -1 to allow QEMU to execute real syscall
 }
 
 void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long ret, abi_long *args) {
@@ -699,12 +695,12 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
     STRACE_DEBUG("Optimized post-hook for %s, ret=%ld", 
              syscall_name ? syscall_name : "unknown", (long)ret);
     
-    // 使用优化的POST处理
+    // Use optimized POST treatment
     rr_syscall_post_hook_optimized(num, g_current_record_strace, ret, args);
     
-    /* 动态跟踪：系统调用退出 (✅ silent mode时不发送) */
+    /* Dynamic Tracking: Syscall Exit (Skipped in silent mode) */
     if (!g_rr_framework->silent_replay_mode) {
-        // 🔥 修复：使用实际的变异状态而不是整体fuzzing模式
+        // Use actual mutation state instead of global mode
         bool was_fuzzed = g_strace_state.current_syscall_was_fuzzed;
         rr_dynamic_trace_syscall_exit(
             env,
@@ -716,25 +712,25 @@ void rr_strace_syscall_post_hook_optimized(CPUArchState *env, int num, abi_long 
         );
     }
     
-    /* ✅ 检查是否到达fork_point，关闭silent mode */
+    /* Check if fork_point reached to disable silent mode */
     if (g_rr_framework->silent_replay_mode) {
-        uint32_t target_fork_point = g_rr_framework->checkpoint_target;  // 借用这个字段存fork_point
+        uint32_t target_fork_point = g_rr_framework->checkpoint_target;  /* fork_point stored here */
         if (g_strace_state.current_record_index >= target_fork_point) {
             g_rr_framework->silent_replay_mode = false;
-            RR_INFO("✅ Reached fork_point[%u], switching to normal mode", target_fork_point);
+            RR_INFO("Reached fork_point[%u], switching to normal mode", target_fork_point);
             
-            // ✅ 现在发送iteration消息（child正式开始）
+            // Send iteration message (Child officially starts)
             if (g_dynamic_trace_pipe_fd >= 0) {
                 rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
             }
         }
     }
     
-    // 清理当前记录
+    // Cleanup current record
     g_current_record = NULL;
 }
 
-/* ==================== 配置接口 ==================== */
+/* Configuration Interface */
 
 void rr_strace_set_mode_optimized(bool strict_mode, bool skip_unmatched, int max_lookahead) {
     g_strace_state.strict_mode = strict_mode;
@@ -759,8 +755,8 @@ void rr_strace_get_replay_stats_optimized(uint64_t *total, uint64_t *matched,
     if (errors) *errors = g_strace_state.error_syscalls;
 }
 
-/* ==================== 兼容性包装器函数 ==================== */
-/* 这些函数提供与 rr_main.c 期望的函数名兼容性 */
+/* Compatibility Wrapper Functions */
+/* Provides name compatibility for rr_main.c */
 
 bool rr_strace_replay_enabled(void) {
     return rr_strace_replay_enabled_optimized();

@@ -1,15 +1,15 @@
 /**
- * RR-Fuzz Checkpoint机制（完整实现）
- * 用于中间点动态fork，节省replay开销
+ * RR-Fuzz Checkpoint Mechanism
+ * Supports dynamic forking from intermediate points to save replay overhead.
  */
 
 #include "../core/rr_framework.h"
 #include <sys/mman.h>
 
-// 简化实现：不保存状态，只标记checkpoint目标
+// Lightweight implementation: only marks checkpoint target, does not save full state.
 
 /**
- * 设置checkpoint目标（用于checkpoint fork）
+ * Set checkpoint target (used for checkpoint-based forking).
  */
 int rr_save_lightweight_checkpoint(uint32_t index) {
     if (!g_rr_framework) {
@@ -23,14 +23,14 @@ int rr_save_lightweight_checkpoint(uint32_t index) {
 }
 
 /**
- * 恢复checkpoint（重置trace position）
+ * Restore checkpoint (resets trace position).
  */
 int rr_restore_lightweight_checkpoint(void) {
     if (!g_rr_framework) {
         return -1;
     }
     
-    // 调用replay模块的重置函数
+    // Call reset function in the replay module
     rr_reset_trace_position();
     g_rr_framework->replay_index = 0;
     

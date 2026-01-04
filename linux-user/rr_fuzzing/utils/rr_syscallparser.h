@@ -1,5 +1,5 @@
 /**
- * RR-Fuzz Strace解析器模块头文件
+ * RR-Fuzz Strace Parser Module Header
  */
 
 #ifndef RR_SYSCALLPARSER_H
@@ -58,7 +58,7 @@ typedef struct {
     char *filename;
 } rr_strace_parser_t;
 
-/* API函数声明 */
+/* API Function Declarations */
 rr_strace_parser_t *rr_strace_parser_init(const char *filename);
 int rr_strace_parser_load(rr_strace_parser_t *parser);
 rr_strace_record_t *rr_strace_parser_get_next(rr_strace_parser_t *parser);
@@ -69,7 +69,7 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record);
 void rr_strace_print_record(const rr_strace_record_t *record);
 void rr_strace_get_stats(rr_strace_parser_t *parser, size_t *total_records, size_t *current_index);
 
-/* 辅助函数声明 */
+/* Helper Function Declarations */
 long rr_strace_parse_number(const char *str);
 rr_strace_arg_type_t rr_strace_identify_arg_type(const char *arg_str);
 int rr_strace_parse_flags(const char *flag_str, const char *syscall_name, int arg_index);

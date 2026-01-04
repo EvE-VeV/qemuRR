@@ -1,6 +1,6 @@
 /**
- * RR-Fuzz记录模块
- * 实现Record模式的系统调用记录逻辑，对应design.md中的rr_record.c
+ * RR-Fuzz Recording Module
+ * Implements system call recording logic for Record mode.
  */
 
 #define RR_DEBUG 1
@@ -24,12 +24,12 @@ static rr_aux_data_t *record_aux_scalar(uint8_t mask, const abi_long *value)
 }
 
 /**
- * 辅助函数：将 arg_data 转换为 aux_data（用于 fuzzing）
+ * Helper function: Convert arg_data to aux_data (used for fuzzing)
  * @param record: syscall record
- * @param arg_index: 参数索引 (0-7)
- * @param data: 数据指针（如果为 NULL，使用 record->arg_data[arg_index]）
- * @param size: 数据大小（如果为 0，使用 record->arg_size[arg_index]）
- * @return: 成功返回 true，失败返回 false
+ * @param arg_index: argument index (0-7)
+ * @param data: data pointer (if NULL, use record->arg_data[arg_index])
+ * @param size: data size (if 0, use record->arg_size[arg_index])
+ * @return: true on success, false on failure
  */
 static bool rr_promote_arg_to_aux(syscall_record_t *record, int arg_index, 
                                    const uint8_t *data, size_t size)
@@ -38,19 +38,19 @@ static bool rr_promote_arg_to_aux(syscall_record_t *record, int arg_index,
         return false;
     }
     
-    /* 如果没有提供数据，尝试使用 arg_data */
+    /* If no data provided, try using arg_data */
     if (!data) {
         data = record->arg_data[arg_index];
         if (!data) return false;
     }
     
-    /* 如果没有提供大小，尝试使用 arg_size */
+    /* If no size provided, try using arg_size */
     if (size == 0) {
         size = record->arg_size[arg_index];
         if (size == 0) return false;
     }
     
-    /* 创建 aux_data */
+    /* Create aux_data */
     uint8_t *aux_data_copy = g_malloc(size);
     if (!aux_data_copy) return false;
     
@@ -63,7 +63,7 @@ static bool rr_promote_arg_to_aux(syscall_record_t *record, int arg_index,
         return false;
     }
     
-    /* 添加到 aux_data 链表 */
+    /* Add to aux_data list */
     rr_aux_append(&record->aux_data, aux);
     record->has_aux_data = true;
     
@@ -71,7 +71,7 @@ static bool rr_promote_arg_to_aux(syscall_record_t *record, int arg_index,
 }
 
 /**
- * 释放syscall_record_t及其关联数据
+ * Disposes of a syscall_record_t and its associated data
  */
 void rr_record_dispose(syscall_record_t *record)
 {
@@ -79,7 +79,7 @@ void rr_record_dispose(syscall_record_t *record)
         return;
     }
 
-    /* 释放所有arg_data */
+    /* Free all arg_data */
     for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         if (record->arg_data[i]) {
             g_free(record->arg_data[i]);
@@ -87,48 +87,47 @@ void rr_record_dispose(syscall_record_t *record)
         }
     }
 
-    /* 释放aux_data链表 */
+    /* Free aux_data list */
     if (record->aux_data) {
         rr_aux_free(record->aux_data);
         record->aux_data = NULL;
     }
 
-    /* 释放记录本身 */
+    /* Free record itself */
     g_free(record);
 }
 
 /**
- * @brief 初始化 Record 模式并打开 trace 文件用于记录系统调用
+ * @brief Initializes Record mode and opens the trace file for syscall recording.
  * 
- * 该函数是 RR-Fuzz Record 模式的入口点，负责：
- * 1. 打开二进制 trace 文件（.dat 格式）
- * 2. 写入 trace 文件头（包含 magic 和 version）
- * 3. 初始化 Basic Block (BB) trace 子系统
+ * This function serves as the entry point for RR-Fuzz Record mode. It is responsible for:
+ * 1. Opening the binary trace file (.dat format).
+ * 2. Writing the trace file header (including magic and version).
+ * 3. Initializing the Basic Block (BB) trace subsystem.
  * 
- * **Trace 文件格式**:
+ * **Trace File Format**:
  * ```
  * Header: [magic=0x52525254 ("RRTR")][version=1][record_count (placeholder)]
  * Body:   [syscall_record_1][syscall_record_2]...[syscall_record_N]
  * ```
  * 
- * @param trace_file Trace 文件路径。如果为 NULL，使用默认文件名 "rr_trace.dat"
+ * @param trace_file Path to the trace file. If NULL, defaults to "rr_trace.dat".
  * 
  * @return int
- *         - 0: 初始化成功，trace 文件已打开并写入文件头
- *         - -1: 初始化失败（文件无法打开）
+ *         - 0: Initialization successful; trace file opened and header written.
+ *         - -1: Initialization failed (e.g., file cannot be opened).
  * 
- * @note 该函数只应被调用一次（在 rr_framework_init 中）
- * @note Trace 文件使用二进制格式，不兼容文本编辑器直接查看
- * @note record_count 在文件头中是占位符，会在 rr_stop_recording() 时更新为实际值
- * @note BB trace 初始化失败不会导致整体失败，只会记录警告
+ * @note This function should be called exactly once (within rr_framework_init).
+ * @note The trace file uses a binary format and is not directly viewable in local text editors.
+ * @note record_count in the header is a placeholder; it is updated with the actual count in rr_stop_recording().
+ * @note Failure to initialize BB trace does not fail the entire process; a warning is logged instead.
  * 
- * @warning 如果文件已存在会被覆盖（"wb" 模式）
- * @warning 必须确保在程序退出前调用 rr_stop_recording() 以正确更新文件头
+ * @warning Existing trace files will be overwritten ("wb" mode).
+ * @warning Ensure rr_stop_recording() is called before process exit to correctly update the header.
  * 
- * @see rr_stop_recording() 对应的停止函数，会更新 record_count 并关闭文件
- * @see rr_record_syscall() 每个系统调用都会调用该函数写入 trace
- * @see rr_bb_trace_init() BB trace 子系统初始化
- * @see g_trace_file 全局 trace 文件句柄
+ * @see rr_stop_recording() for closing the trace and updating metadata.
+ * @see rr_record_syscall() for writing individual syscalls.
+ * @see rr_bb_trace_init() for BB trace initialization.
  */
 int rr_start_recording(const char *trace_file)
 {
@@ -146,16 +145,16 @@ int rr_start_recording(const char *trace_file)
         return -1;
     }
 
-    /* 写入文件头 */
+    /* Write file header */
     uint32_t magic = 0x52525254; // "RRTR"
     uint32_t version = 1;
-    uint32_t placeholder_count = 0; // 占位符，将在结束时更新
+    uint32_t placeholder_count = 0; // Placeholder, updated at end
     RR_VERBOSE("Writing trace file header: magic=0x%x, version=%u", magic, version);
     fwrite(&magic, sizeof(magic), 1, g_trace_file);
     fwrite(&version, sizeof(version), 1, g_trace_file);
     fwrite(&placeholder_count, sizeof(placeholder_count), 1, g_trace_file);
 
-    /* 初始化BB trace */
+    /* Initialize BB trace */
     if (rr_bb_trace_init(trace_file) < 0) {
         RR_WARN("Failed to initialize BB trace (continuing without BB trace)");
     } else {
@@ -167,21 +166,21 @@ int rr_start_recording(const char *trace_file)
 }
 
 /**
- * 停止记录
+ * Stop recording
  */
 void rr_stop_recording(void)
 {
-    /* 清理BB trace */
+    /* Cleanup BB trace */
     rr_bb_trace_cleanup();
     
     if (g_trace_file) {
         RR_VERBOSE("STOP_RECORDING: Finalizing trace file");
 
-        /* 获取文件大小 */
+        /* Get file size */
         fseek(g_trace_file, 0, SEEK_END);
         long file_size = ftell(g_trace_file);
 
-        /* 写入轨迹长度到文件头 */
+        /* Write trace length to file header */
         uint32_t record_count = g_rr_framework ? g_rr_framework->trace_length : 0;
         RR_VERBOSE("STOP_RECORDING: Updating header with record_count=%u, file_size=%ld", record_count, file_size);
 
@@ -204,8 +203,7 @@ void rr_stop_recording(void)
 }
 
 /**
- * 捕获字符串参数数据
- * 实现design.md中提到的指针参数解引用
+ * Captures string parameter data (dereferences pointer arguments)
  */
 uint8_t *rr_capture_string(CPUArchState *env, target_ulong addr, size_t *len)
 {
@@ -218,7 +216,7 @@ uint8_t *rr_capture_string(CPUArchState *env, target_ulong addr, size_t *len)
     size_t str_len = 0;
     target_ulong current = addr;
 
-    /* 简单实现：逐字节读取直到遇到\0，最多读取 PATH_MAX 字节 */
+    /* Simple implementation: read byte-by-byte until \0, up to RR_MAX_PATH_LENGTH bytes */
     while (str_len < RR_MAX_PATH_LENGTH) {
         uint8_t byte;
         if (cpu_memory_rw_debug(env_cpu(env), current, &byte, 1, 0) != 0) {
@@ -236,7 +234,7 @@ uint8_t *rr_capture_string(CPUArchState *env, target_ulong addr, size_t *len)
         return NULL;
     }
 
-    /* 分配并读取完整字符串（包括\0） */
+    /* Allocate and read full string (including \0) */
     uint8_t *data = g_malloc(str_len + 1);
     if (cpu_memory_rw_debug(env_cpu(env), addr, data, str_len + 1, 0) != 0) {
         g_free(data);
@@ -249,7 +247,7 @@ uint8_t *rr_capture_string(CPUArchState *env, target_ulong addr, size_t *len)
 }
 
 /**
- * 捕获缓冲区参数数据
+ * Captures buffer parameter data
  */
 uint8_t *rr_capture_buffer(CPUArchState *env, target_ulong addr, size_t size)
 {
@@ -267,7 +265,7 @@ uint8_t *rr_capture_buffer(CPUArchState *env, target_ulong addr, size_t size)
 }
 
 /**
- * 检测系统调用是否创建FD
+ * Detects if a syscall creates an FD
  */
 static bool syscall_creates_fd(int syscall_nr, abi_long ret)
 {
@@ -304,43 +302,42 @@ static bool syscall_creates_fd(int syscall_nr, abi_long ret)
 }
 
 /**
- * @brief 使用 aux_data 系统智能捕获系统调用参数数据 (EnvFuzz 风格)
+ * Smartly captures syscall parameter data using aux_data system
  * 
- * 这是推荐的参数捕获方式，会根据系统调用类型自动捕获关键数据并存储为 aux_data 链表。
- * 相比传统的 capture_syscall_args()，这种方式更灵活，支持外部文件存储大数据，
- * 并且包含智能阈值控制避免捕获过大的数据。
+ * Recommended capture method: automatically captures key data based on syscall type.
+ * Supports external storage for large data and threshold-based skipping.
  * 
- * **捕获策略 (按优先级)**:
- * 1. **非确定性数据** (必须捕获): getrandom (关键！)
- * 2. **I/O 数据**: read/write (有大小限制，受 rr_aux_should_record 控制)
- * 3. **内存管理**: mmap/brk/munmap/mprotect (记录地址和参数)
- * 4. **进程管理**: fork/clone (记录返回的 PID)
- * 5. **网络数据**: recv/send 系列 (有大小限制)
- * 6. **ioctl**: 根据 cmd 判断是否捕获输出缓冲区
+ * Capture Strategy (by priority):
+ * 1. Non-deterministic data: getrandom (Critical!)
+ * 2. I/O data: read/write (Subject to rr_aux_should_record thresholds)
+ * 3. Memory management: mmap/brk/munmap/mprotect (Records addresses and params)
+ * 4. Process management: fork/clone (Records returned PID)
+ * 5. Network data: recv/send series (Subject to size limits)
+ * 6. ioctl: Capture output buffer based on command
  * 
- * **aux_data 类型**:
- * - AUX_BUFFER: 字节数组（如 read/write 的缓冲区）
- * - AUX_STRUCT: 结构体（如 mmap_info, mm_params）
- * - AUX_SCALAR: 标量值（如 brk 的返回地址）
+ * aux_data types:
+ * - AUX_BUFFER: Byte array (e.g., read/write buffer)
+ * - AUX_STRUCT: Structure (e.g., mmap_info, mm_params)
+ * - AUX_SCALAR: Scalar value (e.g., brk return address)
+ *
+ * @param env CPU architecture state pointer (for reading guest memory).
+ * @param syscall_nr Syscall number.
+ * @param args Syscall arguments array (8 arguments).
+ * @param ret Syscall return value.
+ * @param record Syscall record structure; captured aux_data is added to record->aux_data list.
  * 
- * @param env CPU 架构状态指针（用于读取 guest 内存）
- * @param syscall_nr 系统调用编号
- * @param args 系统调用参数数组（8个参数）
- * @param ret 系统调用返回值
- * @param record 系统调用记录结构体，捕获的 aux_data 会添加到 record->aux_data 链表
+ * @note Automatically sets record->has_aux_data = true if any data is captured.
+ * @note Uses smart thresholds: <= 4KB always capture, 4KB-64KB partial capture, > 64KB skip.
+ * @note getrandom data is always captured regardless of size (critical for deterministic replay).
  * 
- * @note 会自动设置 record->has_aux_data = true 如果捕获了任何数据
- * @note 使用智能阈值: <= 4KB 总是捕获, 4KB-64KB 部分捕获, > 64KB 跳过
- * @note getrandom 数据无论大小都会被捕获（确定性重放的关键）
+ * @warning If use_legacy_capture is also enabled, it will double-capture with capture_syscall_args().
+ * @warning Output syscalls (write/send) data is not used during replay (requires real execution).
  * 
- * @warning ⚠️ 如果同时启用 use_legacy_capture，会与 capture_syscall_args() 产生重复捕获
- * @warning Output syscalls (write/send) 的数据在 replay 时不会被使用（需要真实执行）
- * 
- * @see rr_aux_create() 创建 aux_data 节点
- * @see rr_aux_append() 添加 aux_data 到链表
- * @see rr_aux_should_record() 判断数据是否应该被记录的策略
- * @see rr_capture_buffer() 从 guest 内存读取缓冲区
- * @see rr_record_syscall() 调用此函数的位置
+ * @see rr_aux_create() Create aux_data node.
+ * @see rr_aux_append() Append aux_data to list.
+ * @see rr_aux_should_record() Policy for determining if data should be recorded.
+ * @see rr_capture_buffer() Read buffer from guest memory.
+ * @see rr_record_syscall() Location where this function is called.
  */
 static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
                                     const abi_long *args, abi_long ret, syscall_record_t *record)
@@ -349,7 +346,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 
     switch (syscall_nr) {
         case TARGET_NR_brk: {
-            /* 记录 brk 返回的新堆顶地址 */
+            /* Record new heap top address returned by brk */
             if (ret > 0) {
                 rr_aux_data_t *aux = record_aux_scalar(0, &ret);
                 if (aux) {
@@ -389,7 +386,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
         case TARGET_NR_mprotect:
         case TARGET_NR_mremap:
         case TARGET_NR_madvise: {
-            /* 记录这些内存管理调用的参数，用于重放阶段的校验 */
+            /* Record memory management parameters for replay validation */
             rr_aux_mm_params_t mm_aux = {
                 .addr = (uint64_t)args[0],
                 .len = (uint64_t)args[1],
@@ -440,7 +437,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
             break;
 
         case TARGET_NR_write:
-            /* write 的数据在调用前就存在 */
+            /* write data exists before the call */
             if (args[2] > 0 && args[1] != 0) {
                 if (rr_aux_should_record(args[2], args[0], syscall_nr)) {
                     uint8_t *data = rr_capture_buffer(env, args[1], args[2]);
@@ -461,7 +458,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 #else
         case 318: /* x86_64 getrandom */
 #endif
-            /* 关键的非确定性调用 - 总是记录 */
+            /* Critical non-deterministic call - always record */
             RR_VERBOSE("AUX_CAPTURE: getrandom ret=%ld, args[0]=0x%lx", (long)ret, (unsigned long)args[0]);
             if (ret > 0 && args[0] != 0) {
                 uint8_t *data = rr_capture_buffer(env, args[0], ret);
@@ -481,7 +478,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_openat
         case TARGET_NR_openat:
-            /* 捕获文件路径 */
+            /* Capture file path */
             if (args[1] != 0) {
                 size_t len;
                 uint8_t *data = rr_capture_string(env, args[1], &len);
@@ -517,7 +514,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_sendto
         case TARGET_NR_sendto:
-            /* sendto 的数据在调用前就存在（类似 write）*/
+            /* sendto data exists before the call (like write) */
             RR_VERBOSE("AUX_CAPTURE: sendto - args[2]=%ld, args[1]=0x%lx, args[0]=%d", (long)args[2], (unsigned long)args[1], (int)args[0]);
             if (args[2] > 0 && args[1] != 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
                 bool should_record = rr_aux_should_record(args[2], args[0], syscall_nr);
@@ -542,7 +539,7 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom:
-            /* 捕获接收到的数据 */
+            /* Capture received data */
             if (ret > 0 && args[1] != 0) {
                 if (rr_aux_should_record(ret, args[0], syscall_nr)) {
                     uint8_t *data = rr_capture_buffer(env, args[1], ret);
@@ -560,14 +557,13 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
 #endif
 
         default:
-            /* 其他系统调用暂不支持 aux_data */
+            /* Other syscalls do not support aux_data yet */
             break;
     }
 }
 
 /**
- * 智能捕获系统调用参数数据 (传统方式 - 保持向后兼容)
- * 实现design.md中的智能判断数据长度逻辑
+ * Smartly captures syscall parameter data (Legacy method - kept for backward compatibility)
  */
 static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                                  const abi_long *args, abi_long ret, syscall_record_t *record)
@@ -577,7 +573,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         case TARGET_NR_open:
 #endif
         case TARGET_NR_openat:
-            /* 第一个参数(或第二个对于openat)是文件路径字符串 */
+            /* Path string (first arg or second for openat) */
 #ifdef TARGET_NR_open
             if (syscall_nr == TARGET_NR_openat) {
 #else
@@ -592,7 +588,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         /* TARGET_NR_read 已在 capture_syscall_args_aux 中处理（syscall 执行后） */
 
         case TARGET_NR_write:
-            /* 第二个参数是数据，第三个参数是大小 */
+            /* Second arg is data, third is size */
             if (args[2] > 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 if (record->arg_data[1]) {
@@ -605,19 +601,19 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 
         case TARGET_NR_faccessat:
-            /* 第二个参数是文件路径字符串 */
+            /* Second arg is file path string */
             record->arg_data[1] = rr_capture_string(env, args[1], &record->arg_size[1]);
             break;
 
         case TARGET_NR_execve:
-            /* 第一个参数是程序路径 */
+            /* First arg is program path */
             record->arg_data[0] = rr_capture_string(env, args[0], &record->arg_size[0]);
             // TODO: 捕获argv和envp数组
             break;
 
 #ifdef TARGET_NR_uname
         case TARGET_NR_uname:
-            /* 第一个参数是struct utsname *，需要在syscall返回后捕获 */
+            /* First arg is struct utsname *, captured after syscall returns */
             if (args[0] != 0) {
                 record->arg_data[0] = rr_capture_buffer(env, args[0], sizeof(struct utsname));
                 if (record->arg_data[0]) {
@@ -633,7 +629,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 #ifdef TARGET_NR_fstatat64
         case TARGET_NR_fstatat64:
 #endif
-            /* 第二个参数是路径字符串，第三个参数是stat结构体 */
+            /* Second arg is path, third is stat struct */
             if (args[1] != 0) {
                 record->arg_data[1] = rr_capture_string(env, args[1], &record->arg_size[1]);
             }
@@ -646,7 +642,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 
         case TARGET_NR_getdents64:
-            /* 第二个参数是目录项缓冲区 */
+            /* Second arg is directory entries buffer */
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_GETDENTS_BUF_SIZE) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 if (record->arg_data[1]) {
@@ -657,7 +653,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_stat
         case TARGET_NR_stat:
-            /* 第一个参数是路径字符串，第二个参数是stat结构体 */
+            /* First arg is path, second is stat struct */
             record->arg_data[0] = rr_capture_string(env, args[0], &record->arg_size[0]);
             if (ret == 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct stat));
@@ -670,7 +666,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_lstat
         case TARGET_NR_lstat:
-            /* 第一个参数是路径字符串，第二个参数是stat结构体 */
+            /* First arg is path, second is stat struct */
             record->arg_data[0] = rr_capture_string(env, args[0], &record->arg_size[0]);
             if (ret == 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct stat));
@@ -683,7 +679,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_fstat
         case TARGET_NR_fstat:
-            /* 第二个参数是stat结构体 */
+            /* Second arg is stat struct */
             if (ret == 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct stat));
                 if (record->arg_data[1]) {
@@ -695,7 +691,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_access
         case TARGET_NR_access:
-            /* 第一个参数是路径字符串 */
+            /* First arg is path string */
             record->arg_data[0] = rr_capture_string(env, args[0], &record->arg_size[0]);
             break;
 #endif
@@ -706,22 +702,22 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 #ifdef TARGET_NR_pwrite64
         case TARGET_NR_pwrite64:
 #endif
-            /* 捕获缓冲区数据 */
+            /* Capture buffer data */
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
 #ifdef TARGET_NR_pread64
                 if (syscall_nr == TARGET_NR_pread64 && ret > 0) {
-                    /* pread64: 需要在调用后捕获读取的数据 */
+                    /* pread64: capture data after call */
                     record->arg_data[1] = rr_capture_buffer(env, args[1], ret);
                     record->arg_size[1] = ret;
                 }
 #endif
 #ifdef TARGET_NR_pwrite64
                 if (syscall_nr == TARGET_NR_pwrite64) {
-                    /* pwrite64: 需要在调用前捕获要写入的数据 */
+                    /* pwrite64: capture data before call */
                     record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                     record->arg_size[1] = args[2];
                     
-                    /* 🔥 添加 aux_data for fuzzing */
+                    /* Add aux_data for fuzzing */
                     rr_promote_arg_to_aux(record, 1, NULL, 0);
                 }
 #endif
@@ -755,7 +751,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         // I/O向量操作
 #ifdef TARGET_NR_readv
         case TARGET_NR_readv:
-            /* 捕获 iovec 结构体数组（简化：只记录 iovec 结构本身） */
+            /* Capture iovec array (simplified: only records the struct array) */
             if (ret > 0 && args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
                 size_t iov_size = sizeof(struct iovec) * args[2];
                 record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
@@ -767,13 +763,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_writev
         case TARGET_NR_writev:
-            /* 捕获 iovec 结构体数组（简化处理） */
+            /* Capture iovec array (simplified) */
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_IOVEC_COUNT) {
                 size_t iov_size = sizeof(struct iovec) * args[2];
                 record->arg_data[1] = rr_capture_buffer(env, args[1], iov_size);
                 record->arg_size[1] = iov_size;
                 
-                /* 🔥 添加 aux_data for fuzzing */
+                /* Add aux_data for fuzzing */
                 rr_promote_arg_to_aux(record, 1, NULL, 0);
                 /* TODO: 完整实现需要遍历每个 iovec 捕获实际数据缓冲区 */
             }
@@ -804,28 +800,28 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_flock
         case TARGET_NR_flock:
-            /* flock 参数简单（fd, operation），不需要捕获额外数据 */
+            /* flock parameters are simple (fd, operation), no extra data capture required */
             break;
 #endif
 
-        // getrandom - 关键的非确定性调用
+        // getrandom - Critical non-deterministic call
 #ifdef TARGET_NR_getrandom
         case TARGET_NR_getrandom:
 #else
         case 318: /* x86_64 getrandom */
 #endif
-            /* 捕获实际返回的随机数据 */
+            /* Capture actual random data returned */
             if (ret > 0 && args[0] != 0) {
                 record->arg_data[0] = rr_capture_buffer(env, args[0], ret);
                 record->arg_size[0] = ret;
             }
             break;
 
-        // execve系统调用已在前面处理
+        // execve syscall is already handled earlier
 
 #ifdef TARGET_NR_wait4
         case TARGET_NR_wait4:
-            /* 捕获status结构体 */
+            /* Capture status structure */
             if (ret >= 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(int));
                 record->arg_size[1] = sizeof(int);
@@ -833,17 +829,17 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
-        // 信号处理
+        // Signal handling
 #ifdef TARGET_NR_rt_sigaction
         case TARGET_NR_rt_sigaction:
-            /* 捕获sigaction结构体 */
+            /* Capture sigaction structure */
             if (args[1] != 0) {
-                // 新的sigaction结构体
+                // New sigaction structure
                 record->arg_data[1] = rr_capture_buffer(env, args[1], 152); // sizeof(struct sigaction)
                 record->arg_size[1] = 152;
             }
             if (ret == 0 && args[2] != 0) {
-                // 旧的sigaction结构体（返回值）
+                // Old sigaction structure (return value)
                 record->arg_data[2] = rr_capture_buffer(env, args[2], 152);
                 record->arg_size[2] = 152;
             }
@@ -852,25 +848,25 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_rt_sigprocmask
         case TARGET_NR_rt_sigprocmask:
-            /* 捕获信号掩码 */
+            /* Capture signal mask */
             if (args[1] != 0) {
-                // 新的信号掩码
+                // New signal mask
                 record->arg_data[1] = rr_capture_buffer(env, args[1], 8); // sizeof(sigset_t)
                 record->arg_size[1] = 8;
             }
             if (ret == 0 && args[2] != 0) {
-                // 旧的信号掩码（返回值）
+                // Old signal mask (return value)
                 record->arg_data[2] = rr_capture_buffer(env, args[2], 8);
                 record->arg_size[2] = 8;
             }
             break;
 #endif
 
-        // ioctl - 复杂的设备控制调用
+        // ioctl - complex device control call
         case TARGET_NR_ioctl:
-            /* ioctl的参数非常复杂，依赖于具体的command */
+            /* ioctl parameters are complex and depend on the specific command */
             if (ret == 0 && args[2]) {
-                /* 对于成功的 ioctl,尝试捕获输出缓冲区 */
+                /* For successful ioctl, try to capture output buffer */
                 unsigned long cmd = args[1];
                 
                 /* 提取 ioctl 方向和大小信息 */
@@ -879,11 +875,11 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                 int ioc_dir = (cmd >> 30) & 0x03;
                 int ioc_size = (cmd >> 16) & 0x3FFF;
                 
-                /* 如果有输出 (_IOC_READ) 且有合理大小 */
+                /* If there is output (_IOC_READ) and it has reasonable size */
                 if ((ioc_dir & 2) && ioc_size > 0 && ioc_size < RR_MAX_IOCTL_PAYLOAD) {
                     uint8_t *buf = g_malloc0(ioc_size);
                     if (cpu_memory_rw_debug(env_cpu(env), args[2], buf, ioc_size, 0) == 0) {
-                        /* 使用 AUX_IOCTL_OUTPUT 类型记录输出缓冲区 */
+                        /* Record output buffer using AUX_IOCTL_OUTPUT type */
                         record->aux_data = rr_aux_create(AUX_IOCTL_OUTPUT, 2, buf, ioc_size);
                         record->has_aux_data = true;
                         RR_VERBOSE("ioctl: Captured %d bytes output buffer for cmd=0x%lx", 
@@ -897,19 +893,19 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             }
             break;
 
-        // 内存管理相关
+        // Memory management related
 #ifdef TARGET_NR_mremap
         case TARGET_NR_mremap:
-            /* mremap需要地址重映射支持 */
-            // 不捕获参数数据，依赖地址重映射机制
+            /* mremap needs address remapping support */
+            // Do not capture parameter data; rely on address remapping mechanism
             break;
 #endif
 
-        // 网络相关系统调用
+        // Networking related syscalls
 #ifdef TARGET_NR_socket
         case TARGET_NR_socket:
-            /* socket创建，参数简单，主要是返回的fd */
-            // 不需要捕获特殊数据，FD映射机制会处理
+            /* socket creation, parameters are simple, mainly the returned fd */
+            // No need to capture special data; FD mapping mechanism will handle it
             break;
 #endif
 
@@ -931,13 +927,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 #endif
             /* 捕获sockaddr结构体 */
             if (ret >= 0 && args[1] != 0 && args[2] != 0) {
-                // 先读取地址长度
+                // Read address length first
                 uint32_t addr_len;
                 if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
                     if (addr_len > 0 && addr_len <= 128) {
                         record->arg_data[1] = rr_capture_buffer(env, args[1], addr_len);
                         record->arg_size[1] = addr_len;
-                        // 同时捕获地址长度
+                        // Also capture address length
                         record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(uint32_t));
                         record->arg_size[2] = sizeof(uint32_t);
                     }
@@ -947,19 +943,19 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_sendto
         case TARGET_NR_sendto:
-            /* 捕获要发送的数据和目标地址 */
+            /* Capture data to be sent and target address */
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_BUFFER_TOTAL) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 record->arg_size[1] = args[2];
                 
-                /* 🔥 关键修复：同时创建 aux_data for fuzzing */
+                /* 🔥 Key Fix: Simultaneously create aux_data for fuzzing */
                 rr_promote_arg_to_aux(record, 1, NULL, 0);
             }
             if (args[4] != 0 && args[5] > 0 && args[5] <= RR_MAX_SOCKADDR_SIZE) {
                 record->arg_data[4] = rr_capture_buffer(env, args[4], args[5]);
                 record->arg_size[4] = args[5];
                 
-                /* 目标地址也可以 fuzz（可选） */
+                /* Target address can also be fuzzed (optional) */
                 rr_promote_arg_to_aux(record, 4, NULL, 0);
             }
             break;
@@ -967,16 +963,16 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom:
-            /* 捕获接收到的数据和源地址 */
+            /* Capture received data and source address */
             if (ret > 0 && args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], ret);
                 record->arg_size[1] = ret;
                 
-                /* 接收数据也可以用于 fuzzing（用于回放时的比对/变异） */
+                /* Received data can also be used for fuzzing (comparison/mutation during replay) */
                 rr_promote_arg_to_aux(record, 1, NULL, 0);
             }
             if (args[4] != 0 && args[5] != 0) {
-                // 捕获源地址和地址长度
+                // Capture source address and address length
                 uint32_t addr_len;
                 if (cpu_memory_rw_debug(env_cpu(env), args[5], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
                     if (addr_len > 0 && addr_len <= 128) {
@@ -992,7 +988,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_bind
         case TARGET_NR_bind:
-            /* 捕获 sockaddr 结构体 */
+            /* Capture sockaddr structure */
             if (args[1] != 0 && args[2] > 0 && args[2] <= RR_MAX_SOCKADDR_SIZE) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], args[2]);
                 record->arg_size[1] = args[2];
@@ -1002,13 +998,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_listen
         case TARGET_NR_listen:
-            /* listen 参数简单（fd, backlog），不需要捕获额外数据 */
+            /* listen parameters are simple (fd, backlog), no extra data capture required */
             break;
 #endif
 
 #ifdef TARGET_NR_getsockname
         case TARGET_NR_getsockname:
-            /* 捕获本地地址（输出参数） */
+            /* Capture local address (output parameter) */
             if (ret == 0 && args[1] != 0 && args[2] != 0) {
                 uint32_t addr_len;
                 if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
@@ -1025,7 +1021,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_getpeername
         case TARGET_NR_getpeername:
-            /* 捕获对端地址（输出参数） */
+            /* Capture peer address (output parameter) */
             if (ret == 0 && args[1] != 0 && args[2] != 0) {
                 uint32_t addr_len;
                 if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
@@ -1042,7 +1038,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_setsockopt
         case TARGET_NR_setsockopt:
-            /* 捕获 socket 选项数据（输入参数） */
+            /* Capture socket option data (input parameter) */
             if (args[3] != 0 && args[4] > 0 && args[4] <= RR_MAX_IOCTL_PAYLOAD) {
                 record->arg_data[3] = rr_capture_buffer(env, args[3], args[4]);
                 record->arg_size[3] = args[4];
@@ -1052,7 +1048,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_getsockopt
         case TARGET_NR_getsockopt:
-            /* 捕获 socket 选项数据（输出参数） */
+            /* Capture socket option data (output parameter) */
             if (ret == 0 && args[3] != 0 && args[4] != 0) {
                 uint32_t opt_len;
                 if (cpu_memory_rw_debug(env_cpu(env), args[4], (uint8_t*)&opt_len, sizeof(uint32_t), 0) == 0) {
@@ -1069,37 +1065,37 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_recvmsg
         case TARGET_NR_recvmsg:
-            /* recvmsg 使用 msghdr 结构，包含 iovec、控制消息等 */
+            /* recvmsg uses msghdr structure, containing iovec, control messages, etc. */
             if (ret > 0 && args[1] != 0) {
-                /* 捕获整个 msghdr 结构（简化处理） */
+                /* Capture entire msghdr structure (simplified) */
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct msghdr));
                 record->arg_size[1] = sizeof(struct msghdr);
                 
                 /* 🔥 添加 aux_data for fuzzing */
                 rr_promote_arg_to_aux(record, 1, NULL, 0);
-                /* TODO: 完整实现需要递归捕获 iovec 和 control message */
+                /* TODO: Full implementation requires recursive capture of iovec and control messages */
             }
             break;
 #endif
 
 #ifdef TARGET_NR_sendmsg
         case TARGET_NR_sendmsg:
-            /* sendmsg 同样使用 msghdr 结构 */
+            /* sendmsg also uses msghdr structure */
             if (args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct msghdr));
                 record->arg_size[1] = sizeof(struct msghdr);
                 
                 /* 🔥 添加 aux_data for fuzzing */
                 rr_promote_arg_to_aux(record, 1, NULL, 0);
-                /* TODO: 完整实现需要递归捕获 iovec */
+                /* TODO: Full implementation requires recursive capture of iovec */
             }
             break;
 #endif
 
-        // 管道相关
+        // Pipe related
 #ifdef TARGET_NR_pipe
         case TARGET_NR_pipe:
-            /* 捕获返回的两个文件描述符 */
+            /* Capture the two returned file descriptors */
             if (ret == 0 && args[0] != 0) {
                 record->arg_data[0] = rr_capture_buffer(env, args[0], 2 * sizeof(int));
                 record->arg_size[0] = 2 * sizeof(int);
@@ -1109,7 +1105,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_pipe2
         case TARGET_NR_pipe2:
-            /* 类似pipe但有额外的flags参数 */
+            /* Similar to pipe but with additional flags parameter */
             if (ret == 0 && args[0] != 0) {
                 record->arg_data[0] = rr_capture_buffer(env, args[0], 2 * sizeof(int));
                 record->arg_size[0] = 2 * sizeof(int);
@@ -1117,22 +1113,22 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
-        // 资源限制
+        // Resource limits
         case TARGET_NR_prlimit64:
-            /* 捕获rlimit结构体 */
+            /* Capture rlimit structure */
             if (args[2] != 0) {
-                // 新的资源限制
+                // New resource limit
                 record->arg_data[2] = rr_capture_buffer(env, args[2], 16); // sizeof(struct rlimit64)
                 record->arg_size[2] = 16;
             }
             if (ret == 0 && args[3] != 0) {
-                // 旧的资源限制（返回值）
+                // Old resource limit (return value)
                 record->arg_data[3] = rr_capture_buffer(env, args[3], 16);
                 record->arg_size[3] = 16;
             }
             break;
 
-        // Phase 2: 扩展 Syscall 支持
+        // Phase 2: Expanded Syscall Support
         
 #ifdef TARGET_NR_fcntl
         case TARGET_NR_fcntl:
@@ -1141,26 +1137,26 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
         case TARGET_NR_fcntl64:
 #endif
 #if defined(TARGET_NR_fcntl) || defined(TARGET_NR_fcntl64)
-            /* fcntl 的第三个参数取决于 cmd */
+            /* fcntl's third argument depends on cmd */
             {
                 int cmd = (int)args[1];
                 switch (cmd) {
                     case F_GETFD:
                     case F_GETFL:
                     case F_GETOWN:
-                        // 这些命令没有第三个参数
+                        // These commands have no third argument
                         break;
                     case F_DUPFD:
                     case F_DUPFD_CLOEXEC:
                     case F_SETFD:
                     case F_SETFL:
                     case F_SETOWN:
-                        // 这些命令的第三个参数是整数，已在 args 中
+                        // These commands have an integer third argument, already in args
                         break;
                     case F_GETLK:
                     case F_SETLK:
                     case F_SETLKW:
-                        // 这些命令使用 struct flock
+                        // These commands use struct flock
                         if (args[2] != 0) {
                             record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct flock));
                             record->arg_size[2] = sizeof(struct flock);
@@ -1173,7 +1169,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_poll
         case TARGET_NR_poll:
-            /* 捕获 pollfd 数组 */
+            /* Capture pollfd array */
             if (args[0] != 0 && args[1] > 0 && args[1] <= RR_MAX_IOVEC_COUNT) {
                 size_t pollfd_size = sizeof(struct pollfd) * args[1];
                 record->arg_data[0] = rr_capture_buffer(env, args[0], pollfd_size);
@@ -1184,7 +1180,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_ppoll
         case TARGET_NR_ppoll:
-            /* 类似 poll，但还有 timespec 和 sigmask */
+            /* Similar to poll, but with timespec and sigmask */
             if (args[0] != 0 && args[1] > 0 && args[1] <= RR_MAX_IOVEC_COUNT) {
                 size_t pollfd_size = sizeof(struct pollfd) * args[1];
                 record->arg_data[0] = rr_capture_buffer(env, args[0], pollfd_size);
@@ -1200,7 +1196,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_epoll_wait
         case TARGET_NR_epoll_wait:
-            /* 捕获 epoll_event 数组（输出） */
+            /* Capture epoll_event array (output) */
             if (ret > 0 && args[1] != 0) {
                 size_t events_size = sizeof(struct epoll_event) * ret;
                 record->arg_data[1] = rr_capture_buffer(env, args[1], events_size);
@@ -1211,7 +1207,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_epoll_pwait
         case TARGET_NR_epoll_pwait:
-            /* 类似 epoll_wait，但还有 sigmask */
+            /* Similar to epoll_wait but with sigmask */
             if (ret > 0 && args[1] != 0) {
                 size_t events_size = sizeof(struct epoll_event) * ret;
                 record->arg_data[1] = rr_capture_buffer(env, args[1], events_size);
@@ -1222,7 +1218,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_select
         case TARGET_NR_select:
-            /* 捕获 fd_set 结构体 */
+            /* Capture fd_set structure */
             if (args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(fd_set));
                 record->arg_size[1] = sizeof(fd_set);
@@ -1244,7 +1240,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_pselect6
         case TARGET_NR_pselect6:
-            /* pselect6 类似 select，但使用 timespec 而不是 timeval */
+            /* pselect6 is similar to select but uses timespec instead of timeval */
             if (args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(fd_set));
                 record->arg_size[1] = sizeof(fd_set);
@@ -1271,13 +1267,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_nanosleep
         case TARGET_NR_nanosleep:
-            /* 捕获 timespec 结构体（输入和输出） */
+            /* Capture timespec structure (input and output) */
             if (args[0] != 0) {
                 record->arg_data[0] = rr_capture_buffer(env, args[0], sizeof(struct timespec));
                 record->arg_size[0] = sizeof(struct timespec);
             }
             if (ret == 0 && args[1] != 0) {
-                /* 剩余时间（可选，仅在被中断时） */
+                /* Remaining time (optional, only if interrupted) */
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct timespec));
                 record->arg_size[1] = sizeof(struct timespec);
             }
@@ -1286,7 +1282,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_clock_nanosleep
         case TARGET_NR_clock_nanosleep:
-            /* clock_nanosleep 类似 nanosleep 但有时钟 ID */
+            /* clock_nanosleep is similar to nanosleep but with clock ID */
             if (args[2] != 0) {
                 record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct timespec));
                 record->arg_size[2] = sizeof(struct timespec);
@@ -1300,7 +1296,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_timer_create
         case TARGET_NR_timer_create:
-            /* timer_create 返回 timer_t (timer ID) */
+            /* timer_create returns timer_t (timer ID) */
             if (ret == 0 && args[2] != 0) {
                 record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(int)); // timer_t is int
                 record->arg_size[2] = sizeof(int);
@@ -1315,13 +1311,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_timer_settime
         case TARGET_NR_timer_settime:
-            /* 设置定时器 */
+            /* Set timer */
             if (args[2] != 0) {
                 record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct itimerspec));
                 record->arg_size[2] = sizeof(struct itimerspec);
             }
             if (ret == 0 && args[3] != 0) {
-                /* 旧值（可选） */
+                /* Old value (optional) */
                 record->arg_data[3] = rr_capture_buffer(env, args[3], sizeof(struct itimerspec));
                 record->arg_size[3] = sizeof(struct itimerspec);
             }
@@ -1330,13 +1326,13 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_timerfd_create
         case TARGET_NR_timerfd_create:
-            /* timerfd_create 参数简单，返回 fd */
+            /* timerfd_create parameters are simple, returns fd */
             break;
 #endif
 
 #ifdef TARGET_NR_timerfd_settime
         case TARGET_NR_timerfd_settime:
-            /* 设置 timerfd */
+            /* Set timerfd */
             if (args[2] != 0) {
                 record->arg_data[2] = rr_capture_buffer(env, args[2], sizeof(struct itimerspec));
                 record->arg_size[2] = sizeof(struct itimerspec);
@@ -1350,7 +1346,7 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
 
 #ifdef TARGET_NR_signalfd
         case TARGET_NR_signalfd:
-            /* 捕获信号掩码 */
+            /* Capture signal mask */
             if (args[1] != 0) {
                 record->arg_data[1] = rr_capture_buffer(env, args[1], 8); // sizeof(sigset_t)
                 record->arg_size[1] = 8;
@@ -1368,31 +1364,32 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
-        // 可以继续添加更多系统调用的特殊处理
+        // More syscall special handling can be added here
         default:
-            // 对于未特殊处理的系统调用，不捕获参数数据
+            // For non-specially handled syscalls, do not capture parameter data
             break;
     }
 }
 
 /**
- * @brief 记录单个系统调用到 trace 文件
+ * @brief Records a single syscall to the trace file.
  * 
- * 这是 Record 模式下的核心函数，负责捕获系统调用的完整信息并序列化到 trace 文件。
- * 每次 guest 程序执行系统调用后，该函数都会被 rr_syscall_post_hook() 调用一次。
+ * Core function in Record mode, responsible for capturing full syscall info
+ * and serializing it to the trace file. Called once by rr_syscall_post_hook()
+ * after each guest syscall execution.
  * 
- * **记录内容**:
- * 1. 基本信息: syscall号、参数、返回值、索引
- * 2. FD 信息: 是否创建/使用文件描述符
- * 3. 参数数据: 对于 I/O 系统调用，捕获缓冲区内容
- * 4. Aux data: EnvFuzz 风格的辅助数据（推荐）
+ * **Recorded Content**:
+ * 1. Basic info: syscall number, arguments, return value, index.
+ * 2. FD info: whether it creates/uses a file descriptor.
+ * 3. Parameter data: for I/O syscalls, capture buffer contents.
+ * 4. Aux data: EnvFuzz-style auxiliary data (recommended).
  * 
- * **捕获策略**:
- * - 默认使用 aux_data 系统 (capture_syscall_args_aux)
- * - 如果 use_legacy_capture=true，则同时使用传统方式
- * - ⚠️ 双重捕获问题: 同时启用两种方式会导致内存浪费
+ * **Capture Strategy**:
+ * - Uses the aux_data system by default (capture_syscall_args_aux).
+ * - If use_legacy_capture=true, also uses the traditional method.
+ * - ⚠️ Double capture issue: enabling both results in memory waste.
  * 
- * **文件写入格式** (二进制):
+ * **File Format** (Binary):
  * ```
  * [index:uint32][syscall_nr:int32][args:8*abi_long][retval:abi_long]
  * [arg_sizes:8*size_t][creates_fd:bool][uses_fd:bool][created_fd:int32]
@@ -1400,38 +1397,38 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
  * [aux_data_magic:0x41555844][aux_data_entries...]
  * ```
  * 
- * @param env CPU 架构状态指针（用于读取 guest 内存）
- * @param num 系统调用编号
- * @param args 系统调用参数数组（8个参数）
- * @param ret 系统调用返回值
+ * @param env CPU architecture state pointer (for reading guest memory).
+ * @param num Syscall number.
+ * @param args Syscall argument array (8 arguments).
+ * @param ret Syscall return value.
  * 
  * @return int
- *         - 0: 记录成功
- *         - -1: 记录失败（trace 文件未打开或写入错误）
+ *         - 0: Record successful.
+ *         - -1: Record failed (trace file not open or write error).
  * 
- * @note 会自动更新 g_rr_framework->trace_length
- * @note 每 100 条记录会执行一次 fflush() 以减少 I/O 开销
- * @note 创建的 syscall_record_t 会被添加到全局链表 (trace_head/trace_tail)
+ * @note Automatically updates g_rr_framework->trace_length.
+ * @note Calls fflush() every 100 records to reduce I/O overhead.
+ * @note Created syscall_record_t added to global list (trace_head/trace_tail).
  * 
- * @warning 🔥 已知问题: 如果 use_legacy_capture=true，会发生双重捕获
- *          - capture_syscall_args() 会调用 rr_promote_arg_to_aux() 创建 aux_data
- *          - capture_syscall_args_aux() 再次捕获相同数据
- *          - 结果: aux_data 链表中有重复条目，浪费内存和磁盘空间
- * @warning 不应在 record 阶段添加 FD 映射（由 rr_syscall_post_hook 统一处理）
+ * @warning 🔥 Known issue: If use_legacy_capture=true, double capture occurs.
+ *          - capture_syscall_args() calls rr_promote_arg_to_aux() to create aux_data.
+ *          - capture_syscall_args_aux() captures the same data again.
+ *          - Result: Duplicate entries in aux_data list, wasting memory and disk space.
+ * @warning Do NOT add FD mappings during recording (handled by rr_syscall_post_hook).
  * 
- * @see rr_start_recording() 必须先调用该函数打开 trace 文件
- * @see rr_syscall_post_hook() 调用此函数的位置
- * @see capture_syscall_args() 传统参数捕获方式
- * @see capture_syscall_args_aux() 推荐的 aux_data 捕获方式
- * @see syscall_creates_fd() 判断系统调用是否创建 FD
- * @see g_trace_file 全局 trace 文件句柄
+ * @see rr_start_recording() Must be called first to open trace file.
+ * @see rr_syscall_post_hook() Caller site.
+ * @see capture_syscall_args() Traditional parameter capture.
+ * @see capture_syscall_args_aux() Recommended aux_data capture.
+ * @see syscall_creates_fd() Determine if syscall creates an FD.
+ * @see g_trace_file Global trace file handle.
  */
 int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long ret)
 {
     RR_VERBOSE("RECORD_SYSCALL: Called for syscall %d, ret=%ld", num, (long)ret);
 
-    /* 🔥 修复：不跳过任何 syscall，确保 record/replay 一致 */
-    /* 之前 skip 的 mmap/brk/getpid 会导致 replay 无法匹配 */
+    /* 🔥 Fix: Do not skip any syscalls to ensure record/replay consistency */
+    /* Previously skipped mmap/brk/getpid caused replay mismatch */
 
     if (!g_trace_file) {
         RR_ERROR("Record syscall called but no trace file open");
@@ -1441,7 +1438,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     RR_VERBOSE("RECORD_SYSCALL: Trace file is open, continuing with recording");
     RR_SYSCALL_TRACE("Recording syscall %d, ret=%ld", num, (long)ret);
 
-    /* 创建记录 */
+    /* Create record */
     syscall_record_t *record = g_malloc0(sizeof(syscall_record_t));
     record->index = g_rr_framework->trace_length++;
     record->syscall_nr = num;
@@ -1451,37 +1448,36 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     RR_VERBOSE("RECORD_SYSCALL: Recording index=%u, syscall=%d, ret=%ld",
             record->index, record->syscall_nr, (long)record->retval);
     
-    /* 更新BB trace的syscall索引 */
+    /* Update syscall index for BB trace */
     rr_bb_trace_update_syscall_idx(record->index);
 
-    /* 检测FD创建 */
+    /* Detect FD creation */
     record->creates_fd = syscall_creates_fd(num, ret);
     if (record->creates_fd) {
         record->created_fd = (int32_t)ret;
         RR_FD_TRACE("Syscall %d creates FD: %d", num, record->created_fd);
-        /* 注意: FD映射在 rr_syscall_post_hook 中统一处理，不在record阶段添加 */
+        /* NOTE: FD mapping is handled in rr_syscall_post_hook; do not add during recording */
     }
 
-    /* 智能捕获参数数据 */
+    /* Smartly capture syscall parameter data */
     /* 
-     * 🔥 修复双重捕获问题：
-     * - 默认只使用 aux_data (EnvFuzz风格)
-     * - 仅当配置 use_legacy_capture=true 时才使用传统方式
-     * - 避免重复捕获相同数据
+     * Resolve double-capture issues:
+     * - Only use aux_data (EnvFuzz style) by default
+     * - Only use legacy method if use_legacy_capture=true
      */
     if (g_rr_config.use_legacy_capture) {
         RR_VERBOSE("RECORD_SYSCALL: Using legacy capture for syscall %d", num);
         capture_syscall_args(env, num, args, ret, record);
     }
     
-    /* 使用 aux_data 系统捕获（推荐方式） */
+    /* Capture using aux_data system (recommended) */
     RR_VERBOSE("RECORD_SYSCALL: About to call capture_syscall_args_aux for syscall %d, ret=%ld, record=%p", 
                num, (long)ret, record);
     capture_syscall_args_aux(env, num, args, ret, record);
     RR_VERBOSE("RECORD_SYSCALL: After capture_syscall_args_aux, record=%p, has_aux_data=%d, aux_data=%p", 
                record, record->has_aux_data, record->aux_data);
 
-    /* 添加到轨迹链表 */
+    /* Add to trace linked list */
     if (g_rr_framework->trace_tail) {
         g_rr_framework->trace_tail->next = record;
     } else {
@@ -1489,10 +1485,10 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     }
     g_rr_framework->trace_tail = record;
 
-    /* 写入文件 - 逐字段写入以避免结构体对齐问题 */
+    /* Write to file - field by field to avoid alignment issues */
     RR_VERBOSE("RECORD_SYSCALL: Writing record to trace file (index=%u, syscall=%d)", record->index, num);
     
-    // 写入基本字段（使用二进制缓冲区）
+    // Write basic fields (using binary buffer)
     uint8_t buffer[8]; // 4 bytes for uint32_t + 4 bytes for int
 
     // Pack data manually into buffer
@@ -1515,7 +1511,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         return -1;
     }
 
-    /* 🔥 修复：减少频繁的 fflush，只在每 100 条记录时刷新一次 */
+    /* 🔥 Fix: Reduce frequent fflush; refresh every 100 records */
     if (g_rr_framework->trace_length % 100 == 0) {
         fflush(g_trace_file);
     }
@@ -1530,7 +1526,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         return -1;
     }
 
-    /* 写入参数数据 */
+    /* Write parameter data */
     int arg_count = 0;
     for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         if (record->arg_data[i] && record->arg_size[i] > 0) {
@@ -1542,15 +1538,15 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         }
     }
 
-    /* 写入结束标记 */
+    /* Write end marker */
     int end_marker = -1;
     fwrite(&end_marker, sizeof(int), 1, g_trace_file);
 
-    /* 写入 aux_data（如果有） */
+    /* Write aux_data (if any) */
     RR_VERBOSE("RECORD_SYSCALL: Before aux write - record=%p, has_aux_data=%d, aux_data=%p", 
                record, record->has_aux_data, record->aux_data);
     if (record->has_aux_data && record->aux_data) {
-        /* 写入 aux_data 标记 */
+        /* Write aux_data marker */
         uint32_t aux_magic = 0x41555844; // "AUXD"
         long pos_before = ftell(g_trace_file);
         RR_VERBOSE("RECORD_SYSCALL: Writing AUXD magic 0x%08x at pos %ld", aux_magic, pos_before);
@@ -1561,7 +1557,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         long pos_after = ftell(g_trace_file);
         RR_VERBOSE("RECORD_SYSCALL: After writing AUXD, pos=%ld (delta=%ld)", pos_after, pos_after - pos_before);
         
-        /* 统计 aux_data 数量 */
+        /* Count aux_data entries */
         uint32_t aux_count = 0;
         rr_aux_data_t *curr = record->aux_data;
         while (curr) {
@@ -1570,7 +1566,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
         }
         fwrite(&aux_count, sizeof(uint32_t), 1, g_trace_file);
         
-        /* 写入每个 aux_data */
+        /* Write each aux_data entry */
         curr = record->aux_data;
         while (curr) {
             fwrite(&curr->kind, sizeof(uint8_t), 1, g_trace_file);
@@ -1583,32 +1579,32 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
             curr = curr->next;
         }
     } else {
-        /* 写入无 aux_data 标记 */
+        /* Write no aux_data marker */
         uint32_t no_aux = 0;
         RR_VERBOSE("RECORD_SYSCALL: Writing no_aux marker (has_aux_data=%d, aux_data=%p)", 
                    record->has_aux_data, record->aux_data);
         fwrite(&no_aux, sizeof(uint32_t), 1, g_trace_file);
     }
 
-    /* 🔥 重要：每次写完 record 后立即 flush，确保数据完整性 */
+    /* Always flush after writing record to ensure data integrity */
     fflush(g_trace_file);
     
     if (num == 44) {
-        RR_INFO("🎯 RECORDED SENDTO: index=%u, has_aux=%d", record->index, record->has_aux_data);
+        RR_INFO("RECORDED SENDTO: index=%u, has_aux=%d", record->index, record->has_aux_data);
     }
     RR_VERBOSE("RECORD_SYSCALL: Successfully recorded syscall %d (index=%u, args=%d, aux=%s, total_syscalls=%u)",
                num, record->index, arg_count, record->has_aux_data ? "yes" : "no", g_rr_framework->trace_length);
     RR_LOG("Recorded syscall %d: %s -> %ld", record->index,
            (num >= 0 && num < 400) ? "syscall" : "unknown", (long)ret);
 
-    /* 优化：每100个记录更新一次头部，减少 fseek 开销 */
+    /* Optimization: Update header every 100 records to reduce fseek overhead */
     if (g_rr_framework->trace_length % 100 == 0) {
         long header_pos = ftell(g_trace_file);
         RR_VERBOSE("RECORD_SYSCALL: Before header update - ftell=%ld", header_pos);
-        fseek(g_trace_file, sizeof(uint32_t) * 2, SEEK_SET);  // 跳过magic和version
+        fseek(g_trace_file, sizeof(uint32_t) * 2, SEEK_SET);  // Skip magic and version
         uint32_t record_count = g_rr_framework->trace_length;
         fwrite(&record_count, sizeof(record_count), 1, g_trace_file);
-        fseek(g_trace_file, header_pos, SEEK_SET);  // 恢复位置
+        fseek(g_trace_file, header_pos, SEEK_SET);  // Restore position
         long after_seek = ftell(g_trace_file);
         RR_VERBOSE("RECORD_SYSCALL: After header update - ftell=%ld (should be %ld)", after_seek, header_pos);
         fflush(g_trace_file);

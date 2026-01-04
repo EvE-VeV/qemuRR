@@ -37,7 +37,8 @@ def main():
             output_dir=args.output,
             mutator=mutator,
             enable_persistent=True,
-            target_args=args.args
+            target_args=args.args,
+            enable_tree_viz=True
         )
         
         # Run Fuzzing

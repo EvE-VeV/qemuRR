@@ -95,14 +95,14 @@ class IterationResult:
     def __str__(self) -> str:
         """友好的字符串表示"""
         if self.is_success():
-            parts = [f"Iteration {self.iteration_id}: ✅ {self.status.value}"]
+            parts = [f"Iteration {self.iteration_id}: {self.status.value}"]
             if self.new_coverage:
                 parts.append(f"(+{self.new_paths} paths)")
             if self.crashes_found > 0:
-                parts.append(f"(💥 {self.crashes_found} crashes)")
+                parts.append(f"({self.crashes_found} crashes)")
             return " ".join(parts)
         else:
-            return (f"Iteration {self.iteration_id}: ❌ {self.status.value} - "
+            return (f"Iteration {self.iteration_id}: {self.status.value} - "
                    f"{self.error_component}: {self.error_message}")
 
 

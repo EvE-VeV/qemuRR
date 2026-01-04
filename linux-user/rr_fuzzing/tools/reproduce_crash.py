@@ -53,13 +53,13 @@ def parse_mutations(mutations):
         
         # Analyze mutation type
         if mut['cmd'] == 2:
-            print(f"  Type: REPLACE_BUFFER (替换缓冲区)")
+            print(f"  Type: REPLACE_BUFFER (Replace buffer)")
         elif mut['cmd'] == 4:
-            print(f"  Type: BOUNDARY_VALUE (边界值)")
+            print(f"  Type: BOUNDARY_VALUE (Boundary value)")
         elif mut['cmd'] == 6:
-            print(f"  Type: LIGHT_MUTATION (轻度变异)")
+            print(f"  Type: LIGHT_MUTATION (Light mutation)")
         elif mut['cmd'] == 7:
-            print(f"  Type: TRUNCATE (截断)")
+            print(f"  Type: TRUNCATE (Truncate)")
         else:
             print(f"  Type: Unknown (cmd={mut['cmd']})")
 
@@ -72,10 +72,10 @@ def reproduce_with_qemu(crash_dir, metadata, qemu_path):
     # Find trace file
     trace_file = crash_dir / f"{metadata['crash_id']}.bin"
     if not trace_file.exists():
-        print(f"❌ Error: Trace file not found: {trace_file}")
+        print(f"Error: Trace file not found: {trace_file}")
         return False
     
-    print(f"\n✓ Found trace file: {trace_file}")
+    print(f"\nFound trace file: {trace_file}")
     print(f"  Size: {trace_file.stat().st_size} bytes")
     
     # We need to determine the target binary
@@ -83,9 +83,9 @@ def reproduce_with_qemu(crash_dir, metadata, qemu_path):
     target_binary = Path(__file__).parent / "tests/programs/vulnerable/fuzz_target_vulnerable"
     
     if not target_binary.exists():
-        print(f"\n⚠️  Warning: Target binary not found at expected location")
+        print(f"\nWarning: Target binary not found at expected location")
         print(f"   Expected: {target_binary}")
-        print(f"\n💡 To reproduce manually:")
+        print(f"\nTo reproduce manually:")
         print(f"   1. Set environment: RR_MODE=fuzzing RR_TRACE_FILE={trace_file}")
         print(f"   2. Run: {qemu_path} <target_binary>")
         return False
@@ -99,7 +99,7 @@ def reproduce_with_qemu(crash_dir, metadata, qemu_path):
         'RR_DEBUG_LEVEL': '1'
     })
     
-    print(f"\n▶ Running crash reproduction...")
+    print(f"\nRunning crash reproduction...")
     print(f"  QEMU: {qemu_path}")
     print(f"  Target: {target_binary}")
     print(f"  Trace: {trace_file}")
@@ -114,27 +114,27 @@ def reproduce_with_qemu(crash_dir, metadata, qemu_path):
         
         # Check if crash reproduced
         if result.returncode == 134:  # SIGABRT (128 + 6)
-            print("\n✅ CRASH REPRODUCED!")
+            print("\nCRASH REPRODUCED!")
             print(f"   Exit code: {result.returncode} (SIGABRT)")
             if b"stack smashing detected" in result.stderr:
                 print(f"   Type: Stack buffer overflow")
             return True
         elif result.returncode == 139:  # SIGSEGV (128 + 11)
-            print("\n✅ CRASH REPRODUCED!")
+            print("\nCRASH REPRODUCED!")
             print(f"   Exit code: {result.returncode} (SIGSEGV)")
             return True
         else:
-            print(f"\n⚠️  Process exited with code {result.returncode}")
+            print(f"\nWarning: Process exited with code {result.returncode}")
             if result.stderr:
                 print(f"\nStderr output:")
                 print(result.stderr.decode('utf-8', errors='replace')[:500])
             return False
             
     except subprocess.TimeoutExpired:
-        print("\n⚠️  Reproduction timed out (possible hang)")
+        print("\nWarning: Reproduction timed out (possible hang)")
         return False
     except Exception as e:
-        print(f"\n❌ Error during reproduction: {e}")
+        print(f"\nError during reproduction: {e}")
         return False
 
 def analyze_crash_completeness(metadata):
@@ -148,38 +148,38 @@ def analyze_crash_completeness(metadata):
     
     # Check for missing fields
     if metadata.get('exit_code') is None and metadata.get('signal') is None:
-        issues.append("❌ Missing exit_code and signal information")
-        recommendations.append("💡 Fork server should populate these fields from waitpid()")
+        issues.append("Error: Missing exit_code and signal information")
+        recommendations.append("Fork server should populate these fields from waitpid()")
     
     # Check mutations
     if not metadata.get('mutations'):
-        issues.append("❌ No mutation information saved")
+        issues.append("Error: No mutation information saved")
     else:
         # Check mutation details
         for mut in metadata['mutations']:
             if mut.get('mutation_type') == 'unknown':
-                issues.append(f"⚠️  Mutation type unknown for syscall {mut['syscall_index']}")
+                issues.append(f"Warning: Mutation type unknown for syscall {mut['syscall_index']}")
         
         if len([m for m in metadata['mutations'] if m.get('mutation_type') == 'unknown']) == len(metadata['mutations']):
-            recommendations.append("💡 Mutator should record mutation types in FuzzInstruction")
+            recommendations.append("Mutator should record mutation types in FuzzInstruction")
     
     # Check for syscall names
     has_syscall_info = any('syscall_name' in mut for mut in metadata.get('mutations', []))
     if not has_syscall_info:
-        issues.append("⚠️  No syscall names saved (only indices)")
-        recommendations.append("💡 Consider saving syscall names for better readability")
+        issues.append("Warning: No syscall names saved (only indices)")
+        recommendations.append("Consider saving syscall names for better readability")
     
     # Check for stack trace
     if 'stack_trace' not in metadata:
-        issues.append("⚠️  No stack trace information")
-        recommendations.append("💡 Consider integrating GDB/LLDB for stack traces")
+        issues.append("Warning: No stack trace information")
+        recommendations.append("Consider integrating GDB/LLDB for stack traces")
     
     # Print results
-    print(f"\n✓ Crash ID: {metadata['crash_id']}")
-    print(f"✓ Crash Hash: {metadata['crash_hash']}")
-    print(f"✓ Timestamp: {metadata['timestamp']}")
-    print(f"✓ Mutation Count: {len(metadata.get('mutations', []))}")
-    print(f"✓ Trace File: Available (.bin)")
+    print(f"\nCrash ID: {metadata['crash_id']}")
+    print(f"Crash Hash: {metadata['crash_hash']}")
+    print(f"Timestamp: {metadata['timestamp']}")
+    print(f"Mutation Count: {len(metadata.get('mutations', []))}")
+    print(f"Trace File: Available (.bin)")
     
     if issues:
         print("\n📋 Issues Found:")
@@ -194,13 +194,13 @@ def analyze_crash_completeness(metadata):
     # Overall assessment
     print("\n" + "-"*60)
     if len(issues) == 0:
-        print("✅ Metadata is COMPLETE and sufficient for reproduction")
+        print("Metadata is COMPLETE and sufficient for reproduction")
         return True
-    elif len([i for i in issues if i.startswith('❌')]) == 0:
-        print("⚠️  Metadata is SUFFICIENT but could be improved")
+    elif len([i for i in issues if i.startswith('Error:')]) == 0:
+        print("Metadata is SUFFICIENT but could be improved")
         return True
     else:
-        print("❌ Metadata has CRITICAL gaps for reproduction")
+        print("Metadata has CRITICAL gaps for reproduction")
         return False
 
 def main():
@@ -216,7 +216,7 @@ def main():
     # Load metadata
     meta_file = Path(args.crash_meta)
     if not meta_file.exists():
-        print(f"❌ Error: Metadata file not found: {meta_file}")
+        print(f"Error: Metadata file not found: {meta_file}")
         return 1
     
     crash_dir = meta_file.parent
@@ -240,16 +240,16 @@ def main():
         success = reproduce_with_qemu(crash_dir, metadata, args.qemu)
         if success:
             print("\n" + "="*60)
-            print("✅ CRASH SUCCESSFULLY REPRODUCED!")
+            print("CRASH SUCCESSFULLY REPRODUCED!")
             print("="*60)
             return 0
         else:
             print("\n" + "="*60)
-            print("⚠️  CRASH REPRODUCTION INCOMPLETE")
+            print("CRASH REPRODUCTION INCOMPLETE")
             print("="*60)
             return 2
     else:
-        print(f"\n⚠️  QEMU not found at: {args.qemu}")
+        print(f"\nWarning: QEMU not found at: {args.qemu}")
         print("   Skipping reproduction attempt")
     
     return 0

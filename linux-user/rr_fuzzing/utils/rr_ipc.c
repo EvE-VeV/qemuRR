@@ -1,11 +1,12 @@
 /**
- * RR-Fuzz IPC通信模块
- * 实现Conductor与QEMU之间的管道和共享内存通信
+ * RR-Fuzz IPC Communication Module
+ * Implements pipe and shared memory-based communication between Conductor and QEMU.
  */
 
 #ifndef RR_DEBUG
 #define RR_DEBUG 1
 #endif
+
 
 #include "../core/rr_framework.h"
 #include "../core/rr_constants.h"
@@ -61,6 +62,43 @@ int rr_ipc_init(void)
     }
 
     RR_INFO("IPC system initialized");
+
+    #define RR_SAFE_IPC_FD_START 200
+
+    if (g_rr_framework->cmd_pipe_fd >= 0) {
+        int safe_fd = RR_SAFE_IPC_FD_START;
+        /* Force close destination FD first to be safe */
+        if (g_rr_framework->cmd_pipe_fd != safe_fd) {
+            if (dup2(g_rr_framework->cmd_pipe_fd, safe_fd) < 0) {
+                RR_ERROR("Failed to relocate CMD pipe to FD %d", safe_fd);
+            } else {
+                close(g_rr_framework->cmd_pipe_fd);
+                g_rr_framework->cmd_pipe_fd = safe_fd;
+                
+                /* Make it blocking to avoid busy loop in fork server */
+                fcntl(safe_fd, F_SETFL, 0); 
+                RR_INFO("Relocated CMD pipe to safe FD %d", safe_fd);
+            }
+        }
+    }
+
+    if (g_rr_framework->status_pipe_fd >= 0) {
+        int safe_fd = RR_SAFE_IPC_FD_START + 1;
+        /* Force close destination FD first to be safe */
+        if (g_rr_framework->status_pipe_fd != safe_fd) {
+            if (dup2(g_rr_framework->status_pipe_fd, safe_fd) < 0) {
+                RR_ERROR("Failed to relocate STATUS pipe to FD %d", safe_fd);
+            } else {
+                close(g_rr_framework->status_pipe_fd);
+                g_rr_framework->status_pipe_fd = safe_fd;
+                
+                /* Make it blocking */
+                fcntl(safe_fd, F_SETFL, 0);
+                RR_INFO("Relocated STATUS pipe to safe FD %d", safe_fd);
+            }
+        }
+    }
+    
     return 0;
 }
 
@@ -121,10 +159,19 @@ int rr_ipc_send_crash_status(int status, int exit_code, int signal_number)
 int rr_ipc_receive_command(void)
 {
     if (g_rr_framework->cmd_pipe_fd < 0) return 0;
+    
     char cmd;
+    /* Blocking read (due to fcntl F_SETFL 0 in init) */
     ssize_t n = read(g_rr_framework->cmd_pipe_fd, &cmd, 1);
+    
     if (n == 1) return (unsigned char)cmd;
-    if (n == 0) return 'Q';
+    
+    if (n == 0) return 'Q'; /* EOF */
+    
+    if (n < 0) {
+        RR_WARN("IPC read failed: %s", strerror(errno));
+    }
+    
     return 0;
 }
 

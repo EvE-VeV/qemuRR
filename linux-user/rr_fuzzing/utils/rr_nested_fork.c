@@ -1,6 +1,6 @@
 /**
- * RR-Fuzz Autonomous Nested Fork模块
- * 实现子进程自主决定嵌套fork的功能
+ * RR-Fuzz Autonomous Nested Fork Module
+ * Implements autonomous child process nested forking.
  */
 
 #include <unistd.h>
@@ -12,7 +12,7 @@
 #include "rr_dynamic_trace.h"
 
 /**
- * 检查一个syscall是否是IO类syscall
+ * Check if a syscall is an I/O class syscall.
  */
 bool is_io_syscall(int syscall_nr) {
     const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
@@ -24,52 +24,51 @@ bool is_io_syscall(int syscall_nr) {
 }
 
 /**
- * 判断是否应该在当前syscall触发嵌套fork
+ * Determine whether to trigger a nested fork at the current syscall.
  * 
- * 策略：
- * 1. 必须是autonomous child (depth > 0)
- * 2. 必须是IO syscall
- * 3. 限制每个进程的fork次数（防止fork炸弹）
- * 4. 只在第一个IO syscall触发（简化测试）
+ * Strategy:
+ * 1. Must be an autonomous child (depth > 0).
+ * 2. Must be an I/O syscall.
+ * 3. Limit the number of forks per process (prevent fork bombs).
+ * 4. Currently triggers only on the first I/O syscall (simplified for testing).
  */
 /**
- * @brief 判断是否触发嵌套 Fork (Nested Fork Heuristic)
+ * @brief Determine whether to trigger a Nested Fork (Nested Fork Heuristic).
  * 
- * 决定当前子进程是否应该进一步 Fork 出孙进程 (Grandchildren)。
- * 这是一个高级特性，允许在 Trace 的深处进行局部探索。
+ * Portions of the trace may be explored by forking grandchildren from child processes.
  * 
- * **触发条件**:
- * 1. 必须是 Autonomous Child (由 Fork Server 创建)。
- * 2. 嵌套深度 < 2 (防止 Fork 炸弹)。
- * 3. 每个进程限制 Fork 次数 (当前限制为 1)。
- * 4. **硬编码触发**: 当前仅在第 5 个 Syscall 触发 (用于演示/测试)。
+ * **Trigger Conditions**:
+ * 1. Must be an Autonomous Child (created by Fork Server).
+ * 2. Nesting depth < 2 (prevents fork bombs).
+ * 3. Limit total forks per process (currently limited to 1).
+ * 4. **Hardcoded Trigger**: Currently triggers on the 5th syscall for testing.
  * 
- * @param syscall_nr 系统调用号
- * @return true 触发嵌套 Fork
+ * @param syscall_nr Syscall number.
+ * @return true if nested fork should trigger.
  */
 bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long ret) {
-    /* 只有autonomous child才能嵌套fork */
+    /* Only autonomous children can perform nested forks */
     if (!g_rr_framework->is_autonomous_child) {
         return false;
     }
     
-    /* 限制depth（最多2层嵌套：parent→child→grandchild） */
+    /* Limit depth (Max 2 levels: parent → child → grandchild) */
     if (g_rr_framework->current_depth > 1) {
         return false;
     }
     
-    /* 限制每个进程的fork次数（防止fork炸弹） */
-    const uint32_t MAX_FORKS_PER_PROCESS = 1;  // ✅ 每个child只fork一次
+    /* Limit forks per process to prevent fork bombs */
+    const uint32_t MAX_FORKS_PER_PROCESS = 1;  /* Each child forks once */
     if (g_rr_framework->forks_this_iteration >= MAX_FORKS_PER_PROCESS) {
         return false;
     }
     
-    /* ✅ 在任何成功的syscall触发（高概率，用于展示） */
+    /* Trigger on any successful syscall (high probability for demonstration) */
     if (ret < 0) {
         return false;
     }
     
-    /* ✅ 只在第5个syscall触发（简化） */
+    /* Trigger on the 5th syscall (simplified logic) */
     static __thread int syscall_count = 0;
     syscall_count++;
     
@@ -77,16 +76,16 @@ bool rr_should_nested_fork(int syscall_nr, const char *syscall_name, abi_long re
         return false;
     }
     
-    RR_INFO("🔥 Nested fork trigger: %s (depth=%u, syscall_nr=%d)", 
+    RR_INFO("Nested fork trigger: %s (depth=%u, syscall_nr=%d)", 
             syscall_name, g_rr_framework->current_depth, syscall_nr);
     
     return true;
 }
 
 /**
- * 执行autonomous nested fork - 真正的多级动态fork实现！
+ * Execute autonomous nested fork - multi-level dynamic fork implementation.
  * 
- * Child在执行中自主决定fork出多个grandchildren
+ * Children may autonomously decide to fork multiple grandchildren during execution.
  */
 #define NUM_NESTED_VARIANTS 2
 
@@ -94,18 +93,18 @@ extern FILE *g_trace_file;
 extern char *g_rr_trace_path;
 
 /**
- * @brief 执行自主嵌套 Fork (Autonomous Nested Fork)
+ * @brief Execute Autonomous Nested Fork.
  * 
- * 这是真正的"多级 Fork"实现。当前进程 (Child) 暂停，
- * 并 Fork 出多个 (默认2个) 孙进程 (Grandchild) 并行探索。
+ * Implementation of multi-level forking. The current child process pauses
+ * and forks multiple (default 2) grandchildren for parallel exploration.
  * 
- * **机制**:
- * 1. Fork 出 N 个 Grandchild。
- * 2. Grandchild 重新打开 Trace 文件 (以获得独立的文件指针)。
- * 3. Grandchild 继承当前状态继续执行。
- * 4. **Parent (Child) 等待所有 Grandchild 完成**，维持进程树结构。
+ * **Mechanism**:
+ * 1. Fork N grandchildren.
+ * 2. Grandchildren reopen the trace file for independent file pointers.
+ * 3. Grandchildren inherit state and continue execution.
+ * 4. **Parent (Child) waits for all grandchildren to complete** to maintain process tree structure.
  * 
- * @param fork_index 当前的系统调用索引
+ * @param fork_index Current syscall index.
  */
 void rr_autonomous_nested_fork(int fork_index) {
     RR_INFO("🔄 Autonomous nested fork at syscall[%d] (depth=%u, iteration=%u)", 
@@ -113,13 +112,13 @@ void rr_autonomous_nested_fork(int fork_index) {
     
     g_rr_framework->forks_this_iteration++;
     
-    /* ✅ 真正的nested fork实现！*/
-    // const int NUM_NESTED_VARIANTS = 2;  // 每次fork出2个grandchildren
+    /* Nested fork implementation */
+    // const int NUM_NESTED_VARIANTS = 2;  // Fork 2 grandchildren
     
     pid_t my_pid = getpid();
     pid_t grandchild_pids[NUM_NESTED_VARIANTS];
     
-    // 保存当前状态（trace file需要每个grandchild独立）
+    // Save current state (trace file must be independent for each grandchild)
     // extern FILE *g_trace_file;
     // extern char *g_rr_trace_path;
     
@@ -127,9 +126,9 @@ void rr_autonomous_nested_fork(int fork_index) {
         pid_t pid = fork();
         
         if (pid == 0) {
-            /* ═══ Grandchild进程 ═══ */
+            /* --- Grandchild Process --- */
             
-            // ✅ 独立trace file
+            // Independent trace file
             if (g_trace_file && g_rr_trace_path) {
                 fclose(g_trace_file);
                 g_trace_file = fopen(g_rr_trace_path, "rb");
@@ -137,17 +136,17 @@ void rr_autonomous_nested_fork(int fork_index) {
                     RR_ERROR("Grandchild %d: Failed to reopen trace", i);
                     _exit(1);
                 }
-                // 保持当前file position（继承的）
+                // Maintain inherited file position
                 RR_INFO("Grandchild %d: Reopened trace file", i);
             }
             
-            // ✅ 更新状态
+            // Update status
             g_rr_framework->current_depth++;
-            g_rr_framework->is_autonomous_child = true;  // Grandchild也是autonomous
+            g_rr_framework->is_autonomous_child = true;  // Grandchild is also autonomous
             
 #ifdef RR_ENABLE_DYNAMIC_TRACE
             if (g_dynamic_trace_enabled && g_dynamic_trace_pipe_fd >= 0) {
-                // Grandchild发送iteration消息
+                // Grandchild sends iteration message
                 rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
             }
 #endif
@@ -155,11 +154,11 @@ void rr_autonomous_nested_fork(int fork_index) {
             RR_INFO("✅ Grandchild %d started: PID=%d, depth=%u", 
                     i, getpid(), g_rr_framework->current_depth);
             
-            // Grandchild继续执行（从当前replay_index继续）
+            // Grandchild continues execution from current replay_index
             return;
             
         } else if (pid > 0) {
-            /* ═══ Parent (original child) ═══ */
+            /* --- Parent (original child) --- */
             grandchild_pids[i] = pid;
             
 #ifdef RR_ENABLE_DYNAMIC_TRACE
@@ -175,7 +174,7 @@ void rr_autonomous_nested_fork(int fork_index) {
         }
     }
     
-    /* ═══ Parent等待所有grandchildren完成 ═══ */
+    /* --- Parent waits for all grandchildren to complete --- */
     if (getpid() == my_pid) {
         RR_INFO("⏳ Waiting for %d grandchildren to complete...", NUM_NESTED_VARIANTS);
         for (int i = 0; i < NUM_NESTED_VARIANTS; i++) {

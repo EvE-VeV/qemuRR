@@ -1,14 +1,14 @@
 /**
- * RR-Fuzz Fork Server模块
- * 实现高速Fuzzing的Fork Server机制，支持基于系统调用的Fork点
+ * RR-Fuzz Fork Server Module
+ * Implements high-speed fuzzing via fork server mechanism with syscall-based fork points.
  * 
- * 新特性：
- * - 支持基于系统调用名称的Fork点（如"openat", "read"）
- * - Support path pattern matching
- * - 智能Fork点检测（自动P_IO分类）
+ * Features:
+ * - Syscall-based fork points (e.g., "openat", "read")
+ * - Path pattern matching support
+ * - Intelligent fork point detection with automated P_IO classification
  */
 
-/* 确保RR_DEBUG被定义，启用调试日志 */
+/* Ensure RR_DEBUG is defined for debug logging */
 #ifndef RR_DEBUG
 #define RR_DEBUG 1
 #endif
@@ -18,8 +18,8 @@
 #include <fnmatch.h>
 #include <unistd.h>
 #include "../core/rr_framework.h"
-#include "rr_syscall_info.h"  /* 新增：系统调用分类 */
-#include "rr_dynamic_trace.h"  /* 动态跟踪API */
+#include "rr_syscall_info.h"  /* Syscall classification */
+#include "rr_dynamic_trace.h"  /* Dynamic trace API */
 #include "../replay/rr_replay_strace.h"
 
 extern FILE *g_trace_file;
@@ -35,13 +35,13 @@ extern char *g_rr_trace_path;
 #define STATUS_OTHER_SIGNAL  5
 #define STATUS_TIMEOUT       6
 
-// Fork点配置
-static char *g_fork_syscall_name = NULL;      // 目标系统调用名称
-static char *g_fork_syscall_pattern = NULL;   // 路径匹配模式
-static bool g_at_fork_point = false;          // 是否已到达fork点
+// Fork point configuration
+static char *g_fork_syscall_name = NULL;      // Target syscall name
+static char *g_fork_syscall_pattern = NULL;   // Path matching pattern
+static bool g_at_fork_point = false;          // Flag indicating if fork point is reached
 
 /**
- * 重置 Fork 点状态（用于新进程启动时）
+ * Reset fork point state (used for new process initialization)
  */
 void rr_reset_fork_point(void)
 {
@@ -50,28 +50,32 @@ void rr_reset_fork_point(void)
 }
 
 /**
- * @brief 启动 Fork Server 机制
+ * @brief Initialize and start the Fork Server
  * 
- * 初始化 Fork Server 状态，配置目标 fork 点（基于 syscall 名称或路径模式）。
- * 成功后，发送 READY 状态给 Conductor，然后进入 `rr_fork_server_loop` 等待命令。
+ * Configures the target fork point (syscall-based or path pattern).
+ * Sends READY status to Conductor and enters the fork server loop.
  * 
- * **自动检测模式**:
- * 如果 syscall_name 为 NULL，则使用启发式规则自动选择 fork 点（通常是第一个阻塞式 IO，如 read/select）。
+ * **Auto-detection Mode**:
+ * If syscall_name is NULL, use heuristics to select a fork point (usually the first blocking IO).
  * 
- * @param syscall_name 目标系统调用名称（如 "openat"），NULL 表示自动检测
- * @param pattern 路径匹配模式（如 "/target/config*"），用于过滤文件路径
- * @return int 0 成功，-1 失败
+ * @param syscall_name Target syscall name (e.g., "openat"), NULL for auto-detection
+ * @param pattern Path pattern (e.g., "/target/config*") for file path filtering
+ * @return int 0 on success, -1 on failure
  */
 int rr_start_fork_server(const char *syscall_name, const char *pattern)
 {
+    fprintf(stderr, "[DEBUG-FORK] rr_start_fork_server entered\n");
+    fflush(stderr);
     RR_VERBOSE("Starting Fork Server initialization");
 
     if (!rr_framework_enabled()) {
+        fprintf(stderr, "[DEBUG-FORK] Framework NOT enabled! Returning -1\n");
         RR_ERROR("Cannot start Fork Server: framework not enabled");
         return -1;
     }
+    fprintf(stderr, "[DEBUG-FORK] Framework enabled. Proceeding...\n");
 
-    // 自动检测模式：不需要手动配置
+    // Auto-detection mode setup
     if (syscall_name) {
         g_fork_syscall_name = strdup(syscall_name);
         RR_INFO("Fork Server: target syscall = %s", syscall_name);
@@ -88,7 +92,12 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
         RR_INFO("Fork Server: no path pattern (auto-detection)");
     }
 
+    RR_INFO("RR Fork Server Loop Started (PID=%d)", getpid());
+    RR_INFO("Pipe FDs: CMD=%d, STATUS=%d", g_rr_framework->cmd_pipe_fd, g_rr_framework->status_pipe_fd);
+
     g_rr_framework->fork_server_active = true;
+    fprintf(stderr, "[DEBUG-FORK] Set active=true. Sending status...\n");
+    fflush(stderr);
 
     RR_INFO("Fork Server started with syscall-based fork point");
     RR_VERBOSE("Fork Server state: active=%s, syscall=%s, pattern=%s",
@@ -96,19 +105,23 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
                g_fork_syscall_name ? g_fork_syscall_name : "none",
                g_fork_syscall_pattern ? g_fork_syscall_pattern : "none");
 
-    /* 发送Ready状态给Conductor，然后直接返回 */
-    /* fork_server_loop()会处理所有命令（包括第一个） */
+    /* Send Ready status to Conductor; loop handles subsequent commands */
     RR_IPC_TRACE("Sending Ready status to Conductor");
     if (rr_ipc_send_status(1) < 0) { // 1 = Ready
+        fprintf(stderr, "[DEBUG-FORK] Failed to send status!\n");
         RR_WARN("Failed to send Ready status");
+        g_rr_framework->fork_server_active = false;
+        return -1;
     }
     
     RR_INFO("Fork server initialized, ready to receive commands in fork_server_loop()");
+    fprintf(stderr, "[DEBUG-FORK] Status sent. Returning 0\n");
+    fflush(stderr);
     return 0;
 }
 
 /**
- * 停止Fork Server
+ * Stop Fork Server
  */
 void rr_stop_fork_server(void)
 {
@@ -119,14 +132,14 @@ void rr_stop_fork_server(void)
     g_rr_framework->fork_server_active = false;
     g_at_fork_point = false;
 
-    /* 如果有子进程在运行，等待其结束 */
+    /* If child is running, terminate and clean up */
     if (g_rr_framework->child_pid > 0) {
         kill(g_rr_framework->child_pid, SIGTERM);
         waitpid(g_rr_framework->child_pid, NULL, 0);
         g_rr_framework->child_pid = 0;
     }
 
-    /* 清理配置 */
+    /* Clear configuration */
     if (g_fork_syscall_name) {
         free(g_fork_syscall_name);
         g_fork_syscall_name = NULL;
@@ -140,12 +153,12 @@ void rr_stop_fork_server(void)
 }
 
 /**
- * 提取系统调用的路径参数
+ * Extract path argument from system call
  * 
- * @param env CPU环境（用于读取内存）- 必需参数
- * @param syscall_name 系统调用名称
- * @param args 系统调用参数
- * @return 提取的路径字符串，需要调用者释放；失败返回NULL
+ * @param env CPU architecture state for memory access
+ * @param syscall_name System call name
+ * @param args System call arguments
+ * @return Extracted path string (caller must free), NULL on failure
  */
 static char *extract_path_from_syscall(CPUArchState *env, const char *syscall_name, const abi_long *args)
 {
@@ -155,36 +168,36 @@ static char *extract_path_from_syscall(CPUArchState *env, const char *syscall_na
 
     target_ulong path_addr = 0;
     
-    // 根据系统调用类型确定路径参数位置
+    // Determine path parameter index based on syscall type
     if (strcmp(syscall_name, "openat") == 0 || strcmp(syscall_name, "newfstatat") == 0) {
         path_addr = args[1];  // openat(dirfd, pathname, ...)
     } else if (strcmp(syscall_name, "open") == 0 || strcmp(syscall_name, "access") == 0) {
         path_addr = args[0];  // open(pathname, ...)
     } else {
-        return NULL;  // 不支持的系统调用
+        return NULL;  // Unsupported syscall
     }
 
     if (path_addr == 0) {
         return NULL;
     }
 
-    /* 🔥 修复：真实读取 guest 内存中的路径字符串 */
+    /* Directly read path string from guest memory */
     if (!env) {
         RR_WARN("Cannot extract path without CPU env");
         return NULL;
     }
     
-    /* 从 guest 内存读取字符串（最多4KB） */
+    /* Read string (max 4KB) from guest memory */
     char path_buffer[4096];
     size_t len = 0;
     
     while (len < sizeof(path_buffer) - 1) {
         uint8_t byte;
         if (cpu_memory_rw_debug(env_cpu(env), path_addr + len, &byte, 1, 0) != 0) {
-            break; // 内存访问失败
+            break; // Memory access failed
         }
         if (byte == 0) {
-            break; // 字符串结束
+            break; // End of string
         }
         path_buffer[len++] = byte;
     }
@@ -198,24 +211,24 @@ static char *extract_path_from_syscall(CPUArchState *env, const char *syscall_na
 }
 
 /**
- * @brief 检查是否到达 Fork 点 (Fork Point Detection)
+ * @brief Detect if fork point is reached
  * 
- * 在每次系统调用执行前被调用。判断当前 syscall 是否匹配配置的 fork 条件。
+ * Evaluates current syscall against fork configuration.
  * 
- * **判定逻辑**:
- * 1. 检查 syscall 名称是否匹配
- * 2. (可选) 检查 syscall 涉及的文件路径是否匹配 pattern
+ * **Matching Logic**:
+ * 1. Match syscall name.
+ * 2. Match path pattern (if configured).
  * 
- * 如果匹配成功：
- * - 设置 `g_at_fork_point = true`
- * - 发送 `STATUS_AT_FORK_POINT` (2) 给 Conductor
- * - 暂停执行，等待 Fork Server Loop 接管
+ * On match:
+ * - Set g_at_fork_point = true.
+ * - Send STATUS_AT_FORK_POINT (2) to Conductor.
+ * - Pulse execution to allow Loop to take control.
  * 
- * @param env CPU环境 (用于读取 Guest 内存中的路径字符串)
- * @param syscall_nr 系统调用号
- * @param syscall_name 系统调用名称
- * @param args 系统调用参数
- * @return true 到达 fork 点 (将触发暂停), false 继续执行
+ * @param env CPU architecture state
+ * @param syscall_nr Target syscall number
+ * @param syscall_name Target syscall name
+ * @param args Target syscall arguments
+ * @return true if fork point is reached, false otherwise
  */
 bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_name, const abi_long *args)
 {
@@ -223,30 +236,30 @@ bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_
         return false;
     }
 
-    // 如果已经到达fork点，直接返回true
+    // If already at fork point, return true
     if (g_at_fork_point) {
         return true;
     }
 
-    // 如果没有配置syscall名称，使用旧的索引模式（兼容性）
+    // If syscall name is not configured, disable detection (compatibility mode)
     if (!g_fork_syscall_name) {
         RR_WARN("No fork syscall configured, fork point detection disabled");
         return false;
     }
 
-    // 检查系统调用名称是否匹配
+    // Check if syscall name matches
     if (!syscall_name || strcmp(syscall_name, g_fork_syscall_name) != 0) {
         return false;
     }
 
     RR_VERBOSE("Found target syscall: %s", syscall_name);
 
-    // 如果没有路径模式，直接匹配系统调用名称
+    // Match based on syscall name if no path pattern is provided
     if (!g_fork_syscall_pattern) {
         g_at_fork_point = true;
         RR_INFO("Reached fork point: %s (no path pattern)", syscall_name);
         
-        /* 发送到达Fork点的状态 */
+        /* Notify Conductor that fork point is reached */
         RR_IPC_TRACE("Sending At Fork Point status");
         if (rr_ipc_send_status(2) < 0) { // 2 = At Fork Point
             RR_WARN("Failed to send At Fork Point status");
@@ -255,24 +268,24 @@ bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_
         return true;
     }
 
-    // 有路径模式，需要进一步检查路径
+    // Match based on path if pattern is provided
     char *path = extract_path_from_syscall(env, syscall_name, args);
     if (!path) {
         RR_VERBOSE("Could not extract path from %s, skipping pattern match", syscall_name);
         return false;
     }
 
-    // 使用fnmatch进行模式匹配
+    // Use fnmatch for pattern matching
     int match_result = fnmatch(g_fork_syscall_pattern, path, FNM_PATHNAME);
     free(path);
 
     if (match_result == 0) {
-        // 模式匹配成功
+        // Successful match
         g_at_fork_point = true;
         RR_INFO("Reached fork point: %s matching pattern '%s'", 
                syscall_name, g_fork_syscall_pattern);
         
-        /* 发送到达Fork点的状态 */
+        /* Notify Conductor that fork point is reached */
         RR_IPC_TRACE("Sending At Fork Point status");
         if (rr_ipc_send_status(2) < 0) { // 2 = At Fork Point
             RR_WARN("Failed to send At Fork Point status");
@@ -286,53 +299,53 @@ bool rr_check_fork_point(CPUArchState *env, int syscall_nr, const char *syscall_
 }
 
 /**
- * @brief Fork Server 主循环 (核心性能引擎)
+ * @brief Fork Server Main Loop
  * 
- * 这是 RR-Fuzz 的心脏。当父进程到达 Fork 点后，进入此循环等待 Python Conductor 的指令。
- * 通过管道 (Pipe) 接收单字节命令，通过共享内存 (SHM) 交换复杂数据。
+ * Handles instructions from Python Conductor when reaching a fork point.
+ * Commands are received via pipe; complex data exchanged via SHM.
  * 
- * **支持命令**:
- * - **'F' (Fork)**: 标准 Persistent Mode。
- *    - 从 SHM 加载 fuzz 指令
- *    - Fork 子进程
- *    - 子进程重置状态 (trace pos, replay index) 并执行
- *    - 父进程等待子进程结束，报告状态 (Crash/Normal)
- * 
- * - **'B' (Batch Fork)**: 并发探索模式。
- *    - 一次性 Fork 多个子进程 (Variants)，每个应用不同的变异
- *    - 利用多核并行加速
- * 
- * - **'C' (Checkpoint Fork / Mid-Point)**: 高级深路径 Fuzzing。
- *    - 允许在 Trace 的**中间任意位置**进行 Fork
- *    - 如果父进程未到达目标点，先继续 Replay
- *    - 到达后 Fork，子进程直接继承状态继续运行 (无需从头 Replay)
- * 
- * - **'E' (Baseline)**: 基线执行。
- *    - 完整运行 Trace 不进行变异，用于收集覆盖率基准
+ * **Commands**:
+ * - **'F' (Fork)**: Standard Persistent Mode execution.
+ * - **'B' (Batch Fork)**: Concurrent execution of multiple variants.
+ * - **'C' (Checkpoint Fork)**: Mid-point fork for deep path fuzzing.
+ * - **'E' (Baseline)**: Baseline execution without mutations for coverage reference.
  * 
  * @return int 
- *         - 1: 如果是子进程，返回 1 继续执行 syscalls
- *         - 0: 父进程退出循环 (通常不会发生，除非收到停止信号)
+ *         - 1: Child process (resume execution)
+ *         - 0: Parent process shutdown
  */
 int rr_fork_server_loop(void)
 {
+    fprintf(stderr, "[DEBUG-FORK-LOOP] Entered. active=%d\n", g_rr_framework->fork_server_active);
+    fflush(stderr);
+
     /* 
-     * 注意：不再检查 g_at_fork_point，因为调用此函数时
-     * 已经确认到达了 fork 点（通过 rr_check_auto_fork_point）
+     * Note: No longer check g_at_fork_point here since entry into this
+     * loop implies fork point detection (via rr_check_auto_fork_point).
      */
 
     while (g_rr_framework->fork_server_active) {
-        /* 接收Conductor命令 */
-        int cmd = rr_ipc_receive_command();
-        RR_INFO("Info: Fork server loop: received command '%c' (%d)", cmd > 0 && cmd < 128 ? cmd : '?', cmd);
+        int cmd;
+
+        /* CHECKPOINT FIX: Auto-resume logic to prevent deadlock */
+        if (g_rr_framework->resume_from_checkpoint) {
+            RR_INFO("🔄 Checkpoint Resume: Automatically scheduling 'C' command logic");
+            g_rr_framework->resume_from_checkpoint = false;
+            cmd = 'C';
+        } else {
+            /* Receive Conductor command */
+            cmd = rr_ipc_receive_command();
+        }
+        
+        RR_INFO("Info: Fork server loop: processing command '%c' (%d)", cmd > 0 && cmd < 128 ? cmd : '?', cmd);
 
         switch (cmd) {
-            // 新增：批量fork命令（用于动态多路径探索）
-            case 'B': // Batch fork命令
+            // NEW: Batch fork command (for dynamic multi-path exploration)
+            case 'B': // Batch fork command
                 {
                     RR_INFO("Info: Batch fork command received");
                     
-                    /* 从共享内存读取variants信息 */
+                    /* Read variant info from shared memory */
                     if (!g_rr_framework->shared_memory) {
                         RR_ERROR("No shared memory for batch fork");
                         rr_ipc_send_status(-1);
@@ -349,11 +362,11 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Batch fork: %d variants", num_variants);
                     
-                    /* 批量fork多个子进程 */
+                    /* Batch fork multiple child processes */
                     pid_t child_pids[10] = {0};
                     
                     for (int variant_idx = 0; variant_idx < num_variants; variant_idx++) {
-                        /* 加载variant的mutations到全局指令数组 */
+                        /* Load variant mutations into the global instruction array */
                         FuzzVariant *variant = &shm->variants[variant_idx];
                         g_instruction_count = variant->instruction_count;
                         memcpy(g_fuzz_instructions, variant->instructions,
@@ -361,13 +374,13 @@ int rr_fork_server_loop(void)
                         
                         RR_INFO("  Variant %d: %zu instructions", variant_idx, g_instruction_count);
                         
-                        /* Fork子进程 */
+                        /* Fork child process */
                         pid_t pid = fork();
                         
                         if (pid == 0) {
-                            /* ═══ 子进程 ═══ */
+                            /* ═══ Child Process ═══ */
                             
-                            /* 关闭IPC FD */
+                            /* Close IPC FDs */
                             if (g_rr_framework->cmd_pipe_fd >= 0) {
                                 close(g_rr_framework->cmd_pipe_fd);
                                 g_rr_framework->cmd_pipe_fd = -1;
@@ -377,7 +390,7 @@ int rr_fork_server_loop(void)
                                 g_rr_framework->status_pipe_fd = -1;
                             }
                             
-                            /* 重置trace */
+                            /* Reset trace state */
                             RR_INFO("Child variant %d: Re-opening trace", variant_idx);
                             if (g_trace_file) { fclose(g_trace_file); g_trace_file = NULL; }
                             rr_start_replay(g_rr_trace_path);
@@ -388,11 +401,11 @@ int rr_fork_server_loop(void)
                                 g_current_record = NULL;
                             }
                             
-                            /* 修复: 子进程保持dynamic trace启用 */
-                            // g_rr_framework->fork_server_active = false;  // 保持为true
+                            /* FIX: Keep dynamic trace enabled in child process */
+                            // g_rr_framework->fork_server_active = false;  // Keep as true
                             g_rr_framework->child_pid = 0;
                             
-                            /* 关键修复: 直接设置全局变量启用dynamic trace */
+                            /* CRITICAL FIX: Directly set global variable to enable dynamic trace */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
                             // extern int g_dynamic_trace_pipe_fd;
                             // extern bool g_dynamic_trace_enabled;
@@ -411,33 +424,33 @@ int rr_fork_server_loop(void)
 #endif
                             
                             RR_INFO("Child variant %d ready (PID=%d)", variant_idx, getpid());
-                            return 1;  // 继续执行
+                            return 1;  // Continue execution
                             
                         } else if (pid > 0) {
-                            /* ═══ 父进程 ═══ */
+                            /* Parent Process */
                             child_pids[variant_idx] = pid;
                             
-                            /* 发送fork事件到tree visualizer */
+                            /* Send fork event to tree visualizer */
                             rr_dynamic_trace_fork(getpid(), pid, g_rr_framework->replay_index);
                             
                             RR_INFO("  Forked variant %d: PID=%d", variant_idx, pid);
                             
                         } else {
-                            /* Fork失败 */
+                            /* Fork failed */
                             RR_ERROR("fork() failed for variant %d: %s", variant_idx, strerror(errno));
                             rr_ipc_send_status(-1);
                             break;
                         }
                     }
                     
-                    /* 父进程：等待所有子进程完成 */
+                    /* Parent Process: Wait for all children to complete */
                     RR_INFO("Parent: Waiting for %d children...", num_variants);
                     
                     for (int i = 0; i < num_variants; i++) {
                         int status;
                         waitpid(child_pids[i], &status, 0);
                         
-                        /* 分析退出状态 */
+                        /* Analyze exit status */
                         int result_status = STATUS_NORMAL_EXIT;
                         if (WIFEXITED(status)) {
                             int exit_code = WEXITSTATUS(status);
@@ -458,7 +471,7 @@ int rr_fork_server_loop(void)
                             }
                         }
                         
-                        /* 发送status（每个子进程一个） */
+                        /* Send status (one for each child) */
                         rr_ipc_send_status(result_status);
                     }
                     
@@ -467,38 +480,38 @@ int rr_fork_server_loop(void)
                 }
                 break;
             
-            case 'F': // Fork命令
+            case 'F': // Fork command
                 {
-                    /* 读取共享内存中的iteration_id */
+                    /* Read iteration_id from shared memory */
                     if (g_rr_framework->shared_memory) {
                         FuzzSharedMemory *shm = (FuzzSharedMemory *)g_rr_framework->shared_memory;
                         g_rr_framework->current_iteration_id = shm->iteration_id;
                         RR_VERBOSE("Case 'F': iteration_id=%u from shared memory", shm->iteration_id);
                     }
                     
-                    /* ===== 关键修复：在fork前从共享内存加载Fuzz指令 ===== */
+                    /* ===== CRITICAL FIX: Load Fuzz instructions from shared memory BEFORE fork ===== */
                     if (g_rr_framework->shared_memory) {
                         RR_VERBOSE("Loading fuzz instructions from shared memory before fork");
                         
-                        // 从共享内存读取并验证Fuzz指令
+                        // Read and validate Fuzz instructions from shared memory
                         int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory);
                         if (load_result < 0) {
                             RR_ERROR("Failed to load fuzz instructions from shared memory");
-                            rr_ipc_send_status(-1); // 发送错误状态
-                            break; // 不执行fork
+                            rr_ipc_send_status(-1); // Send error status
+                            break; // Do not execute fork
                         }
                         
                         RR_VERBOSE("Fuzz instructions loaded successfully, proceeding to fork");
                     } else {
-                        // 没有共享内存，正常replay模式（无变异）
+                        // No shared memory, normal replay mode (no mutations)
                         RR_VERBOSE("No shared memory configured, running without mutations");
                     }
                     
-                    /* 执行fork创建子进程 */
+                    /* Execute fork to create child process */
                     pid_t pid = fork();
                     
                     if (pid == 0) {
-                        /* 子进程：关闭继承的IPC FD，防止干扰父进程通信 */
+                        /* Child Process: Close inherited IPC FDs to avoid interference */
                         if (g_rr_framework->cmd_pipe_fd >= 0) {
                             close(g_rr_framework->cmd_pipe_fd);
                             g_rr_framework->cmd_pipe_fd = -1;
@@ -508,31 +521,42 @@ int rr_fork_server_loop(void)
                             g_rr_framework->status_pipe_fd = -1;
                         }
                         
-                        /* 🔥 关键修复：子进程重新打开 trace 文件，确保独立的 offset */
+                        /* 🔥 CRITICAL FIX: Child process re-opens trace file to ensure independent offset */
                         RR_INFO("Child: Re-opening trace file for independent offset");
+                        fprintf(stderr, "[DEBUG-CHILD] Child PID=%d re-opening trace. Path=%s\n", 
+                                getpid(), g_rr_trace_path ? g_rr_trace_path : "NULL");
+                        fflush(stderr);
+
                         if (g_trace_file) {
                             fclose(g_trace_file);
                             g_trace_file = NULL;
                         }
                         if (g_rr_trace_path) {
-                            rr_start_replay(g_rr_trace_path);
+                            if (rr_start_replay(g_rr_trace_path) < 0) {
+                                fprintf(stderr, "[DEBUG-CHILD] rr_start_replay failed!\n");
+                                RR_ERROR("Child: Failed to start replay");
+                            } else {
+                                fprintf(stderr, "[DEBUG-CHILD] rr_start_replay success.\n");
+                            }
                         } else {
                             RR_ERROR("Child: No trace path available to re-open!");
+                            fprintf(stderr, "[DEBUG-CHILD] g_rr_trace_path is NULL!\n");
                             rr_reset_trace_position();
                         }
+                        fflush(stderr);
                         
-                        /* 🔥 P0修复：重置replay_index到0 */
+                        /* Reset replay_index to 0 */
                         RR_INFO("Child: Resetting replay_index to 0");
                         g_rr_framework->replay_index = 0;
                         
-                        /* 🔥 P0修复：清空当前record */
+                        /* Clear current record */
                         if (g_current_record) {
                             RR_INFO("Child: Disposing current record");
                             rr_record_dispose(g_current_record);
                             g_current_record = NULL;
                         }
                         
-                        /* 🔥 关键修复：子进程重新加载Fuzz指令 */
+                        /* 🔥 CRITICAL FIX: Child process reloads Fuzz instructions */
                         if (g_rr_framework->shared_memory) {
                             RR_INFO("Child: Reloading fuzz instructions from shared memory");
                             int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory);
@@ -541,16 +565,16 @@ int rr_fork_server_loop(void)
                             } else {
                                 RR_INFO("🎉 Child: Successfully reloaded %zu fuzz instructions", g_instruction_count);
                                 
-                                // DEBUG: 立即验证reload后的状态
+                                // DEBUG: Immediately verify status after reload
                                 /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] PID=%d, IMMEDIATELY after reload:\\n\", getpid());\n                                fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\\n\", \n                                        g_instruction_count, &g_instruction_count);\n                                if (g_instruction_count > 0) {\n                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\\n\",\n                                            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);\n                                } */
                                 fflush(stderr);
                             }
                         }
                         
-                        /* 继续执行Fuzzing */
+                        /* Continue Fuzzing execution */
                         g_rr_framework->child_pid = 0;
-                        /* 修复: 保持trace pipe启用 */
-                        // g_rr_framework->fork_server_active = false;  // 保持为true
+                        /* FIX: Keep trace pipe enabled */
+                        // g_rr_framework->fork_server_active = false;  // Keep as true
                         
 #ifdef RR_ENABLE_DYNAMIC_TRACE
                         // extern int g_dynamic_trace_pipe_fd;
@@ -560,7 +584,7 @@ int rr_fork_server_loop(void)
                             RR_INFO("Child (F cmd): Forced trace enabled (PID=%d, fd=%d)", 
                                     getpid(), g_dynamic_trace_pipe_fd);
                             
-                            /* 发送iteration消息 (使用current_iteration_id，如果未设置则为0) */
+                            /* Send iteration message (use current_iteration_id, or 0 if not set) */
                             uint32_t iter_id = g_rr_framework->current_iteration_id;
                             rr_dynamic_trace_iteration(iter_id, getpid());
                             RR_INFO("Child (F cmd): Sent iteration %u message", iter_id);
@@ -570,43 +594,43 @@ int rr_fork_server_loop(void)
                         RR_INFO("Child process started for fuzzing execution (PID=%d)", getpid());
                         RR_INFO("Child will execute syscalls from BEGINNING (early fork mode)");
                         
-                        // DEBUG: 返回前再次检查
+                        // DEBUG: Check again before return
                         fprintf(stderr, "[DEBUG-CHILD-BEFORE-RETURN] PID=%d, before returning:\n", getpid());
                         fprintf(stderr, "[DEBUG-CHILD-BEFORE-RETURN]   g_instruction_count=%zu\n", g_instruction_count);
                         fflush(stderr);
                         
-                        /* FIX: 返回1让控制权回到rr_do_syscall
+                        /* FIX: Return 1 to give control back to rr_do_syscall
                          * 
-                         * 重要：由于我们在第一个syscall之前就fork了（early fork），
-                         *      子进程返回后会继续执行第一个syscall
-                         *      然后是第二个、第三个...直到所有syscalls
+                         * IMPORTANT: Since we fork before the first syscall (early fork),
+                         *      the child process will continue to execute the first syscall,
+                         *      then the second, third... until all syscalls.
                          *      
-                         * Mutation会在每个syscall执行时自动应用（apply_mutations_for_syscall）
-                         * Coverage会自动收集（共享内存bitmap）
+                         * Mutations are automatically applied during each syscall execution (apply_mutations_for_syscall).
+                         * Coverage is automatically collected (shared memory bitmap).
                          */
                         RR_INFO("Child: Returning to execute syscalls with mutations (PID=%d)", getpid());
                         
-                        return 1; // 返回1表示子进程应该继续执行
+                        return 1; // Return 1 indicating child should continue execution
                         
                     } else if (pid > 0) {
-                        /* 父进程：等待子进程完成 */
+                        /* Parent Process: Wait for child to complete */
                         g_rr_framework->child_pid = pid;
                         
-                        /* 动态跟踪：记录fork事件 */
-                        rr_dynamic_trace_fork(getpid(), pid, 0);  // 修复: 启用fork追踪
+                        /* Dynamic trace: Record fork event */
+                        rr_dynamic_trace_fork(getpid(), pid, 0);  // FIX: Enable fork tracing
                         
                         RR_VERBOSE("Parent process waiting for child PID=%d", pid);
                         
                         int status;
                         
-                        /* 🔥 关键修复：添加超时机制，防止无限等待 */
+                        /* Add timeout mechanism to prevent indefinite waiting */
                         int wait_result = waitpid(pid, &status, WNOHANG);
                         if (wait_result == 0) {
-                            // 子进程还在运行，等待一段时间
+                            // Child still running, wait for a while
                             RR_VERBOSE("Child still running, waiting with timeout...");
                             
                             int timeout_count = 0;
-                            while (wait_result == 0 && timeout_count < 5000) { // 5秒超时
+                            while (wait_result == 0 && timeout_count < 5000) { // 5-second timeout
                                 usleep(1000); // 1ms (Reduced from 100ms)
                                 wait_result = waitpid(pid, &status, WNOHANG);
                                 timeout_count++;
@@ -615,41 +639,41 @@ int rr_fork_server_loop(void)
                             if (wait_result == 0) {
                                 RR_WARN("Child process timeout, forcibly terminating PID=%d", pid);
                                 kill(pid, SIGKILL);
-                                waitpid(pid, &status, 0); // 等待清理
-                                rr_ipc_send_status(3); // 发送Normal Exit而不是Error
+                                waitpid(pid, &status, 0); // Cleanup
+                                rr_ipc_send_status(3); // Send Normal Exit instead of Error
                                 g_rr_framework->child_pid = 0;
-                                // 不break，继续正常流程，让Python继续下一轮
+                                // Continue normal flow; let Python proceed to next iteration
                             }
                         }
                         
-                        /* FIX: 分析执行结果并发送给Conductor 
+                        /* FIX: Analyze execution results and send to Conductor 
                          * 
-                         * 在persistent mode中，父进程需要告诉Conductor：
-                         * 1. 子进程的执行结果（crash or normal）
-                         * 2. 父进程仍然alive并ready for下一轮
+                         * In persistent mode, the parent needs to tell the Conductor:
+                         * 1. Child execution result (crash or normal).
+                         * 2. Parent is still alive and ready for the next iteration.
                          * 
-                         * 关键：发送STATUS_AT_FORK_POINT (2)而不是STATUS_NORMAL_EXIT (3)
-                         *      这样Conductor才知道不要wait QEMU进程exit
+                         * CRITICAL: Send STATUS_AT_FORK_POINT (2) instead of STATUS_NORMAL_EXIT (3).
+                         *      This allows the Conductor to know NOT to wait for the QEMU process to exit.
                          */
                         if (WIFEXITED(status)) {
                             int exit_code = WEXITSTATUS(status);
                             RR_VERBOSE("Child exited normally with code %d", exit_code);
                             
-                            // ✅ 关键修复：检测 QEMU 的退出码 (128 + 信号量)
-                            // 某些情况下 QEMU 会捕获信号并以 128+sig 退出
+                            // ✅ CRITICAL FIX: Detect QEMU exit code (128 + signal)
+                            // In some cases, QEMU catches signals and exits with 128+sig.
                             if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
                                 int sig = exit_code - 128;
                                 RR_INFO("Crash Found: Child exited with crash-like code %d (Signal %d)", exit_code, sig);
                                 rr_ipc_send_status(4); // STATUS_CRASH
                             } else {
-                                // 发送AT_FORK_POINT表示父进程ready，而不是发送NORMAL_EXIT
+                                // Send AT_FORK_POINT indicating parent is ready, instead of NORMAL_EXIT
                                 rr_ipc_send_status(2); // 2 = AT_FORK_POINT
                             }
                             
                         } else if (WIFSIGNALED(status)) {
                             int sig = WTERMSIG(status);
                             
-                            // 检测是否为崩溃信号
+                            // Check for crash signals
                             if (sig == SIGSEGV || sig == SIGABRT || sig == SIGBUS || 
                                 sig == SIGILL || sig == SIGFPE) {
                                 RR_INFO("Crash: CRASH DETECTED: Child crashed with signal %d (%s)", 
@@ -667,20 +691,20 @@ int rr_fork_server_loop(void)
                         
                         g_rr_framework->child_pid = 0;
                         
-                        /* 重置 fork 点状态，准备下次迭代 */
+                        /* Reset fork point state for next iteration */
                         g_at_fork_point = false;
                         RR_VERBOSE("Reset fork point for next iteration");
                         RR_VERBOSE("Completed execution (child process finished)");
                         
                     } else {
-                        /* Fork失败 */
+                        /* Fork failed */
                         RR_ERROR("fork() failed: %s", strerror(errno));
                         rr_ipc_send_status(-1); // Error
                     }
                 }
                 break;
 
-            // 新增：Baseline execution命令（完整执行但不fork）
+            // NEW: Baseline execution command (full execution without fork)
             case 'E': // Baseline execution - Full trace replay without fork
                 {
                     RR_INFO("Baseline execution command received");
@@ -720,21 +744,21 @@ int rr_fork_server_loop(void)
                         g_rr_framework->current_iteration_id = iteration_id;
                         g_rr_framework->baseline_mode = true;
 
-                        // 🔥 关键修复：设置为REPLAY模式以正确使用trace数据
+                        // 🔥 CRITICAL FIX: Set to REPLAY mode to use trace data correctly
                         g_rr_framework->mode = RR_MODE_REPLAY;
-                        g_rr_framework->replay_index = 0;  // 从头开始replay
+                        g_rr_framework->replay_index = 0;  // Start replay from beginning
                         RR_INFO("✅ Baseline child: Switched to REPLAY mode for proper trace execution");
 
-                        // 🔥 确保replay系统正确初始化 (使用绝对路径)
+                        // 🔥 Ensure replay system is correctly initialized (using absolute path)
                         if (g_rr_config.trace_file) {
-                            // 🔥 构建绝对路径，确保子进程能找到文件
+                            // 🔥 Construct absolute path to ensure child process can find the file
                             char abs_trace_path[1024];
                             if (g_rr_config.trace_file[0] == '/') {
-                                // 已经是绝对路径
+                                // Already absolute path
                                 strncpy(abs_trace_path, g_rr_config.trace_file, sizeof(abs_trace_path) - 1);
                                 abs_trace_path[sizeof(abs_trace_path) - 1] = '\0';
                             } else {
-                                // 相对路径，需要构建绝对路径
+                                // Relative path, build absolute path
                                 if (!getcwd(abs_trace_path, sizeof(abs_trace_path))) {
                                     RR_ERROR("Baseline child: Failed to get current working directory");
                                     _exit(1);
@@ -743,7 +767,7 @@ int rr_fork_server_loop(void)
                                 snprintf(abs_trace_path + len, sizeof(abs_trace_path) - len, "/%s", g_rr_config.trace_file);
                             }
 
-                            // 🔥 重置replay状态并初始化
+                            // 🔥 Reset replay state and initialize
                             // extern void rr_reset_trace_position(void);
                             rr_reset_trace_position();
 
@@ -782,8 +806,8 @@ int rr_fork_server_loop(void)
                 }
                 break;
 
-            // 新增：Checkpoint fork命令（中间点动态fork）
-            case 'C': // Checkpoint fork命令 - Mid-Point Fork
+            // New: Checkpoint fork command (mid-point dynamic fork)
+            case 'C': // Checkpoint fork command - Mid-Point Fork
                 {
                     RR_INFO("Mid-Point Fork command received");
                     
@@ -795,50 +819,57 @@ int rr_fork_server_loop(void)
                     
                     FuzzSharedMemory *shm = (FuzzSharedMemory *)g_rr_framework->shared_memory;
                     uint32_t fork_point = shm->fork_point;
-                    uint32_t depth = shm->current_depth;  // 新增：读取depth
-                    uint32_t iteration_id = shm->iteration_id;  // 新增：读取iteration_id
+                    uint32_t depth = shm->current_depth;  // Read depth
+                    uint32_t iteration_id = shm->iteration_id;  // Read iteration_id
                     int num_variants = shm->num_variants;
                     
                     RR_INFO("Info: Fork command: fork_point=%u, variants=%d, depth=%u, iteration=%u",
                             fork_point, num_variants, depth, iteration_id);
-                    
-                    /* TRUE MID-POINT FORK 策略：
+
+                    /* TRUE MID-POINT FORK STRATEGY:
                      * 
-                     * 关键架构变更：
-                     * 1. Parent已经通过之前的执行到达了某个状态（可能是syscall[N]）
-                     * 2. 如果当前replay_index < fork_point：
-                     *    - 设置target，让parent返回到主循环继续replay
-                     *    - 到达fork_point后，会在下次进入fork_server_loop时处理fork
-                     * 3. 如果当前replay_index >= fork_point：
-                     *    - 立即fork，children继承parent的完整状态
-                     * 4. Children不需要从头replay，直接从当前点继续！
+                     * Architectural Changes:
+                     * 1. Parent state reached (e.g., syscall[N]).
+                     * 2. If current replay_index < fork_point:
+                     *    - Set target; parent returns to main loop to continue replay.
+                     *    - Fork handled on next entry to fork_server_loop when fork_point is reached.
+                     * 3. If current replay_index >= fork_point:
+                     *    - Fork immediately; children inherit complete parent state.
+                     * 4. Children resume from the current point; no replay from start needed.
                      */
                     
                     uint32_t current_index = g_rr_framework->replay_index;
                     RR_INFO("📍 Current replay_index=%u, target fork_point=%u", current_index, fork_point);
                     
                     if (current_index < fork_point) {
-                        /* Parent还没到fork_point，需要继续replay */
-                        RR_INFO("Warning:  Parent未到达fork_point，简化处理：从头replay");
+                        /* Parent hasn't reached fork_point yet.
+                         * We need to return control to the main loop to execute syscalls
+                         * until we reach the target index.
+                         */
+                        RR_INFO("Parent at index %u, target %u - Returning to ADVANCE", 
+                                current_index, fork_point);
                         
-                        /* 简化方案：重置到开头，children自己replay到fork_point */
-                        rr_reset_trace_position();
-                        g_rr_framework->replay_index = 0;
-                        if (g_current_record) {
-                            rr_record_dispose(g_current_record);
-                            g_current_record = NULL;
-                        }
+                        g_rr_framework->checkpoint_target = fork_point;
+                        g_rr_framework->silent_replay_mode = true;
+                        
+                        /* Return special code 2 to signal "Advance state" */
+                        return 2;
                     } else {
-                        /* Parent已在fork_point或之后，直接fork！*/
-                        RR_INFO("Parent已到达fork_point，立即fork children");
+                        /* Parent already at or past fork_point, fork immediately! */
+                        RR_INFO("Parent already at fork_point %u, verifying consistency...", fork_point);
+                        
+                        /* Ideally we should be exactly at fork_point. If > fork_point, we overshot. */
+                        if (current_index > fork_point) {
+                             RR_WARN("Parent overshot target! current=%u, target=%u. "
+                                     "Continuing anyway (may miss mutations)", current_index, fork_point);
+                        }
                     }
                     
-                    // 并发fork所有variants - 真正的动态多级fork！
+                    // Concurrent fork of all variants - dynamic multi-level fork support
                     pid_t child_pids[10] = {0};
                     int status;
                     
-                    /* 检查parent的strace replay状态 */
-                    // extern bool rr_strace_replay_enabled(void);
+                    /* Check parent strace replay state */
                     bool parent_strace_enabled = rr_strace_replay_enabled();
                     RR_INFO("🔍 DEBUG: Parent strace_replay_enabled=%d before fork", parent_strace_enabled);
                     
@@ -848,12 +879,12 @@ int rr_fork_server_loop(void)
                         memcpy(g_fuzz_instructions, variant->instructions,
                                sizeof(FuzzInstruction) * g_instruction_count);
                         
-                        RR_INFO("Forking variant %d/%d (并发)...", variant_idx + 1, num_variants);
+                        RR_INFO("Forking variant %d/%d (Concurrent)...", variant_idx + 1, num_variants);
                         
                         pid_t pid = fork();
                         
                         if (pid == 0) {
-                            /* ═══ 子进程 ═══ */
+                            /* ═══ Child Process ═══ */
                             if (g_rr_framework->cmd_pipe_fd >= 0) {
                                 close(g_rr_framework->cmd_pipe_fd);
                                 g_rr_framework->cmd_pipe_fd = -1;
@@ -863,23 +894,20 @@ int rr_fork_server_loop(void)
                                 g_rr_framework->status_pipe_fd = -1;
                             }
                             
-                            /* 关键修复：每个child重新打开trace file，完全隔离！*/
-                            // extern FILE *g_trace_file;  // 定义在rr_replay.c
-                            // extern char *g_rr_trace_path;
-                            
+                            /* Each child reopens trace file for full isolation */
                             if (g_trace_file != NULL && g_rr_trace_path) {
-                                // 关闭继承的FILE*
+                                // Close inherited FILE*
                                 fclose(g_trace_file);
-                                g_trace_file = NULL;  // 🔥 必须设置为NULL，避免dangling pointer
+                                g_trace_file = NULL;  // Set to NULL to avoid dangling pointers
 
-                                // 🔥 构建绝对路径，确保子进程能找到文件
+                                // 🔥 Construct absolute path to ensure child process can find the file
                                 char abs_trace_path[1024];
                                 if (g_rr_trace_path[0] == '/') {
-                                    // 已经是绝对路径
+                                    // Use absolute path
                                     strncpy(abs_trace_path, g_rr_trace_path, sizeof(abs_trace_path) - 1);
                                     abs_trace_path[sizeof(abs_trace_path) - 1] = '\0';
                                 } else {
-                                    // 相对路径，需要构建绝对路径
+                                    // Build absolute path
                                     if (!getcwd(abs_trace_path, sizeof(abs_trace_path))) {
                                         RR_ERROR("Checkpoint child %d: Failed to get current working directory", variant_idx);
                                         _exit(1);
@@ -888,7 +916,7 @@ int rr_fork_server_loop(void)
                                     snprintf(abs_trace_path + len, sizeof(abs_trace_path) - len, "/%s", g_rr_trace_path);
                                 }
 
-                                // 🔥 重新初始化replay系统（会重新打开trace文件）
+                                /* Re-initialize replay system (reopens trace file) */
                                 // extern int rr_start_replay(const char *trace_file);
                                 if (rr_start_replay(abs_trace_path) < 0) {
                                     RR_ERROR("Checkpoint child %d: Failed to initialize replay system with path: %s", variant_idx, abs_trace_path);
@@ -898,9 +926,9 @@ int rr_fork_server_loop(void)
                                 RR_INFO("Child %d: Reopened trace file independently and reset replay state", variant_idx);
                             }
                             
-                            /* 修复：Strace replay也需要重新初始化trace parser */
+                            /* Strace replay needs to re-initialize trace parser */
                             if (rr_strace_replay_enabled()) {
-                                /* 重新初始化strace replay parser以获得独立的FILE* */
+                                /* Re-initialize strace replay parser to get independent FILE* */
                                 // extern int rr_strace_replay_cleanup(void);
                                 // extern int rr_strace_replay_init(const char *trace_file);
                                 
@@ -919,7 +947,7 @@ int rr_fork_server_loop(void)
                                 }
                             }
 
-                            /* 🔥 关键修复：子进程重新加载Fuzz指令 (Checkpoint fork命令) */
+                            /* Reload Fuzz instructions for child process (Checkpoint fork) */
                             if (g_rr_framework->shared_memory) {
                                 RR_INFO("Child %d: Reloading fuzz instructions from shared memory", variant_idx);
                                 int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory);
@@ -928,7 +956,7 @@ int rr_fork_server_loop(void)
                                 } else {
                                     RR_INFO("🎉 Child %d: Successfully reloaded %zu fuzz instructions", variant_idx, g_instruction_count);
 
-                                    // DEBUG: 立即验证reload后的状态
+                                    // DEBUG: Immediately verify state after reload
                                     /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] Child %d PID=%d, IMMEDIATELY after reload:\n", variant_idx, getpid());
                                     fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\n",
                                             g_instruction_count, &g_instruction_count);
@@ -942,26 +970,46 @@ int rr_fork_server_loop(void)
                                 RR_WARN("Child %d: No shared memory available for instruction loading", variant_idx);
                             }
 
-                            /* 真正的mid-point fork实现！*/
+                            /* True mid-point fork implementation: Sync File Pointer */
                             if (fork_point > 0) {
-                                RR_INFO("Info: Child %d: Mid-point fork from syscall[%u]", variant_idx, fork_point);
+                                RR_INFO("Info: Child %d: Syncing trace file to fork_point %u", variant_idx, fork_point);
                                 
-                                // Silent replay: 快速replay到fork_point，不发送dynamic trace
-                                g_rr_framework->silent_replay_mode = true;
-                                g_rr_framework->checkpoint_target = fork_point;  // 保存fork_point
-                                g_rr_framework->replay_index = 0;
-                                if (g_current_record) {
-                                    rr_record_dispose(g_current_record);
-                                    g_current_record = NULL;
+                                /* File is at beginning (reopened). CPU is at fork_point. */
+                                /* We must fast-forward the FILE POINTER to match CPU state */
+                                
+                                syscall_record_t *tmp_rec = NULL;
+                                int seek_count = 0;
+                                
+                                /* Read and discard records until we reach fork_point */
+                                while (seek_count < fork_point) {
+                                    /* Extern read_next_record(void) declared in rr_framework.h */
+                                    tmp_rec = read_next_record();
+
+                                    if (tmp_rec) {
+                                        /* record_sys_nr unused but kept for potential debug */
+                                        (void)tmp_rec->syscall_nr; 
+                                    }
+                                    
+                                    if (!tmp_rec) {
+                                        RR_ERROR("Child %d: Failed to sync trace - EOF at %d / %u", 
+                                                 variant_idx, seek_count, fork_point);
+                                        break;
+                                    }
+                                    rr_record_dispose(tmp_rec);
+                                    seek_count++;
                                 }
                                 
-                                RR_INFO("  → Fast-forwarding 0 to %u (silent)", fork_point);
+                                RR_INFO("  → Synced file pointer by skipping %d records", seek_count);
                                 
-                                // Silent replay会在replay module中执行
-                                // 当replay_index达到fork_point时，replay module会关闭silent mode
+                                /* DO NOT reset replay_index to 0! */
+                                /* CPU and Trace File are now BOTH at fork_point */
+                                /* g_rr_framework->replay_index is inherited and correct (fork_point) */
+                                
+                                g_rr_framework->silent_replay_mode = false;
+                                g_rr_framework->checkpoint_target = 0; 
                                 
                             } else {
-                                // fork_point=0: 从头开始
+                                // fork_point=0: Start from beginning
                                 RR_INFO("Child %d: Starting from beginning (fork_point=0)", variant_idx);
                                 g_rr_framework->replay_index = 0;
                                 if (g_current_record) {
@@ -971,33 +1019,40 @@ int rr_fork_server_loop(void)
                                 g_rr_framework->silent_replay_mode = false;
                             }
                             
-                            /* 更新子进程状态 */
+                            /* Update child process state */
                             g_rr_framework->current_depth = depth + 1;
-                            // 第一层children（depth+1=1）也应该能够nested fork！
-                            g_rr_framework->is_autonomous_child = true;  // 所有children都是autonomous
+                            // First layer children (depth+1=1) can also nested fork
+                            g_rr_framework->is_autonomous_child = true;  // Children are autonomous
                             g_rr_framework->current_iteration_id = iteration_id;
-
-                            // 🔥 关键修复：设置为FUZZING模式以正确应用变异
+ 
+                            // Set to FUZZING mode for proper mutation application
                             g_rr_framework->mode = RR_MODE_FUZZING;
                             RR_INFO("✅ Child %d: Switched to FUZZING mode for mutation application", variant_idx);
                             
-                            /* TRUE MID-POINT FORK: Child继承parent的完整状态！*/
+                            /* TRUE MID-POINT FORK: Child inherits complete parent state */
                             /* 
-                             * 关键：fork()已经复制了：
-                             * - replay_index（继承parent的fork_point）
-                             * - g_trace_file（文件描述符被复制）
-                             * - g_current_record（内存状态）
-                             * - CPU/Memory状态（COW机制）
+                             * note: fork() copies:
+                             * - replay_index (inherited from parent fork_point)
+                             * - g_trace_file (file descriptors copied)
+                             * - g_current_record (memory state)
+                             * - CPU/Memory state (COW mechanism)
                              * 
-                             * Child将从fork_point继续执行，不需要重新replay前面的syscalls！
+                             * Child continues from fork_point; no need to replay previous syscalls.
                              */
                             
                             
-                            /* Child从fork_point继续 */
+                            /* Child continues from fork_point */
                             RR_INFO("TRUE Mid-Point Fork: Child %d starting from replay_index=%d (fork_point=%u)", 
                                     variant_idx, g_rr_framework->replay_index, fork_point);
                             
                             g_rr_framework->child_pid = 0;
+
+                            /* 🔥 CRITICAL FIX: Disable checkpoint logic for children */
+                            /* Children must NEVER re-enter the checkpointing loop */
+                            g_rr_framework->checkpoint_target = 0;
+                            g_rr_framework->fork_server_active = false;
+                            g_rr_framework->resume_from_checkpoint = false;
+
                             
 #ifdef RR_ENABLE_DYNAMIC_TRACE
                             // extern int g_dynamic_trace_pipe_fd;
@@ -1007,16 +1062,16 @@ int rr_fork_server_loop(void)
                                 RR_INFO("Child %d: Dynamic trace enabled (PID=%d, continuing from index %d)", 
                                         variant_idx, getpid(), g_rr_framework->replay_index);
                                 
-                                /* 发送iteration消息 (不发送fork消息，由parent发送) */
+                                /* Send iteration message (do not send fork message, as it is sent by parent) */
                                 rr_dynamic_trace_iteration(iteration_id, getpid());
                             }
 #endif
                             
-                            /* Child继续执行，从当前replay_index开始处理后续syscalls */
+                            /* Child continues execution, processing subsequent syscalls starting from the current replay_index */
                             RR_INFO("🔍 DEBUG: About to return 1, silent_replay_mode=%d, checkpoint_target=%u",
                                     g_rr_framework->silent_replay_mode, g_rr_framework->checkpoint_target);
                             
-                            /* 检查strace replay是否启用 */
+                            /* Check if strace replay is enabled */
                             // extern bool rr_strace_replay_enabled(void);
                             bool strace_enabled = rr_strace_replay_enabled();
                             RR_INFO("🔍 DEBUG: Child %d strace_replay_enabled=%d", variant_idx, strace_enabled);
@@ -1024,24 +1079,24 @@ int rr_fork_server_loop(void)
                             return 1;
                             
                         } else if (pid > 0) {
-                            /* ═══ Parent: 记录child PID，继续fork其他children（并发） ═══ */
+                            /* Parent: Record child PID, continue forking other children (Concurrent) */
                             child_pids[variant_idx] = pid;
                             rr_dynamic_trace_fork(getpid(), pid, fork_point);
-                            RR_INFO("  Forked variant %d: PID=%d (并发，不等待)", variant_idx, pid);
-                            // ❌ 不要wait！让children并发执行！
+                            RR_INFO("  Forked variant %d: PID=%d (Concurrent, no wait)", variant_idx, pid);
+                            // Do not wait; let children execute concurrently
                         } else {
                             RR_ERROR("Fork failed for variant %d", variant_idx);
                             break;
                         }
                     }
                     
-                    // 等待所有children完成（并发执行后统一等待）
+                    // Wait for all children to complete
                     RR_INFO("⏳ Waiting for %d children to complete...", num_variants);
                     for (int i = 0; i < num_variants && i < 10; i++) {
                         if (child_pids[i] > 0) {
                             waitpid(child_pids[i], &status, 0);
                             
-                            // 分析child的退出状态并提取详细信息
+                            // Analyze child exit status and extract detailed information
                             int result_status = STATUS_NORMAL_EXIT;
                             int exit_code = 0;
                             int signal_number = 0;
@@ -1065,7 +1120,7 @@ int rr_fork_server_loop(void)
                                 }
                             }
                             
-                            // ✅ 发送完整的崩溃信息（包含exit_code和signal）
+                            // Send crash status including exit_code and signal
                             if (result_status == STATUS_CRASH) {
                                 rr_ipc_send_crash_status(result_status, exit_code, signal_number);
                             } else {
@@ -1081,25 +1136,25 @@ int rr_fork_server_loop(void)
                 }
                 break;
 
-            case 'Q': // 退出命令
+            case 'Q': // Quit command
                 RR_LOG("Fork Server received quit command");
-                return -1; // 退出程序
+                return -1; // Terminate execution
 
-            case 'S': // 保存Snapshot命令（预留功能）
-                // TODO: 实现真正的进程状态snapshot
-                // 需要保存：CPU寄存器、内存快照、FD映射等
+            case 'S': // Save Snapshot command (reserved)
+                // TODO: Implement process state snapshotting
+                // Requires saving: CPU registers, memory snapshot, FD mapping, etc.
                 RR_WARN("Snapshot save not implemented (stub only)");
                 rr_ipc_send_status(6); // 6 = Snapshot Saved
                 break;
 
-            case 'L': // 加载Snapshot命令（预留功能）
-                // TODO: 实现从snapshot恢复进程状态
+            case 'L': // Load Snapshot command (reserved)
+                // TODO: Implement restoration from snapshot
                 RR_WARN("Snapshot load not implemented (stub only)");
                 rr_ipc_send_status(7); // 7 = Snapshot Loaded
                 break;
 
-            case 0: // 无命令
-                usleep(1000); // 短暂等待
+            case 0: // No command
+                usleep(1000); // Wait briefly
                 break;
 
             default:
@@ -1112,26 +1167,26 @@ int rr_fork_server_loop(void)
 }
 
 /**
- * 自动检测 Fork 点（改进版，支持Fallback）
+ * Auto-detect Fork Point (Enhanced with Fallback)
  * 
- * 改进点：
- * 1. 支持多种fork策略（strict/relaxed/aggressive/fallback）
- * 2. 添加fallback机制：如果N个syscall未fork，强制fork
+ * Improvements:
+ * 1. Supports multiple fork strategies (strict/relaxed/aggressive/fallback).
+ * 2. Fallback mechanism: Forces fork if N syscalls passed without a fork.
  * 
- * @param syscall_nr 系统调用号
- * @param syscall_name 系统调用名称（可选）
- * @param ret 系统调用返回值
- * @return true 表示应该进入 fork server loop
+ * @param syscall_nr Syscall number
+ * @param syscall_name Syscall name (optional)
+ * @param ret Syscall return value
+ * @return true if fork server loop should be entered
  */
 bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long ret)
 {
-    static int syscalls_since_ready = 0;  // Fallback计数器
+    static int syscalls_since_ready = 0;  // Fallback counter
     
     if (!g_rr_framework->fork_server_active) {
         return false;
     }
     
-    /* 如果已经在 fork point，发送状态并返回 */
+    /* If already at fork point, send status and return */
     if (g_at_fork_point) {
         RR_IPC_TRACE("Sending At Fork Point status (already at fork point)");
         if (rr_ipc_send_status(2) < 0) {
@@ -1140,10 +1195,10 @@ bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long
         return true;
     }
     
-    /* 增加计数器（用于fallback） */
+    /* Increment counter (for fallback) */
     syscalls_since_ready++;
     
-    /* 策略1: 使用配置的fork策略检测 */
+    /* Build-in strategy fork detection */
     const syscall_info_t *info = rr_get_syscall_info(syscall_nr);
     bool should_fork = rr_should_auto_fork(syscall_nr, ret);
     
@@ -1168,15 +1223,15 @@ bool rr_check_auto_fork_point(int syscall_nr, const char *syscall_name, abi_long
             RR_WARN("Failed to send At Fork Point status");
         }
         
-        syscalls_since_ready = 0;  // 重置计数器
+        syscalls_since_ready = 0;  // Reset counter
         return true;
     }
     
-    /* 策略2: Fallback机制 - 如果N个syscall后仍未fork，强制fork */
+    /* Strategy 2: Fallback mechanism - Force fork if N syscalls passed without a fork */
     if (syscalls_since_ready >= g_rr_config.fork_fallback_threshold) {
         const syscall_info_t *info_inner = rr_get_syscall_info(syscall_nr);
         
-        /* 只在合适的syscall上fallback（I/O或FD类） */
+        /* Fallback only on suitable syscalls (I/O or FD related) */
         if (info_inner->class == SYSCALL_CLASS_IO || info_inner->class == SYSCALL_CLASS_FD) {
             g_at_fork_point = true;
             RR_WARN("Warning:  Fallback fork triggered: %s after %d syscalls without fork",

@@ -13982,6 +13982,21 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
     TaskState *ts = get_task_state(cpu);
     abi_long ret;
 
+    /* 🔥 DEBUG PROBE: Check if CONFIG_RR_FUZZING is defined */
+#ifdef CONFIG_RR_FUZZING
+    static bool logged_defined = false;
+    if (!logged_defined) {
+        fprintf(stderr, "[DEBUG-SYSCALL] CONFIG_RR_FUZZING is DEFINED in syscall.c\n");
+        logged_defined = true;
+    }
+#else
+    static bool logged_undefined = false;
+    if (!logged_undefined) {
+        fprintf(stderr, "[DEBUG-SYSCALL] CONFIG_RR_FUZZING is NOT DEFINED in syscall.c\n");
+        logged_undefined = true;
+    }
+#endif
+
 #ifdef DEBUG_ERESTARTSYS
     /* Debug-only code for exercising the syscall-restart code paths
      * in the per-architecture cpu main loops: restart every syscall
@@ -14075,10 +14090,16 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
     record_syscall_return(cpu, num, ret);
 
 #ifdef CONFIG_RR_FUZZING
-    /* RR-Fuzz记录模式的post-hook */
+    /* ✅ BUG FIX #6: Use modified arguments (rr_args) instead of original
+     * 
+     * Critical: In fuzzing/replay mode, rr_do_syscall may modify arguments.
+     * The post-hook must record the ACTUAL arguments that were executed,
+     * not the original ones passed to do_syscall.
+     */
     if (rr_framework_enabled()) {
-        rr_syscall_post_hook(cpu_env, num, ret, arg1, arg2, arg3, arg4,
-                            arg5, arg6, arg7, arg8);
+        rr_syscall_post_hook(cpu_env, num, ret, 
+                            rr_args[0], rr_args[1], rr_args[2], rr_args[3],
+                            rr_args[4], rr_args[5], rr_args[6], rr_args[7]);
     }
 #endif
 

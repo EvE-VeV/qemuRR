@@ -1,11 +1,11 @@
 /**
- * RR-Fuzz 混合重放模块 (当前聚焦映射闭环，P0阶段)
- * Hybrid Replay Mode - 传统二进制 trace 重放
+ * RR-Fuzz Hybrid Replay Module
+ * Traditional binary trace replay functionality.
  * 
- * 负责：
- * - 二进制 trace 的读取和同步
- * - Hybrid 模式的系统调用重放（应用参数 + 执行真实 syscall）
- * - 调度 Pure Replay（当有 aux_data 时）
+ * Responsible for:
+ * - Binary trace reading and synchronization
+ * - Hybrid mode system call replay (parameter application + real syscall execution)
+ * - Pure Replay dispatching (for records with aux_data)
  */
 
 #define RR_DEBUG 1
@@ -15,17 +15,18 @@
 #include "rr_replay_pure.h"
 #include "../core/rr_constants.h"
 #include "../utils/rr_dynamic_trace.h"
+#include "../utils/rr_syscall_tree.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <stdint.h>
 #include "../utils/rr_syscall_dispatch.h"
 
-FILE *g_trace_file = NULL;  // ✅ 改为非static，让fork_server可以访问
-syscall_record_t *g_current_record = NULL;  // 非static，供fork_server访问
-char *g_rr_trace_path = NULL;  // ✅ 保存trace文件路径，供child重新打开
+FILE *g_trace_file = NULL;  // Accessible by fork_server
+syscall_record_t *g_current_record = NULL;  // Accessible by fork_server
+char *g_rr_trace_path = NULL;  // Saves trace file path for child processes
 
-/* 标记：当前系统调用是否已从 trace 读取并递增索引 */
+/* Flag: Indicates if the current syscall has been consumed from trace and index incremented */
 __thread bool g_syscall_already_consumed = false;
 __thread syscall_record_t *g_pending_post_record = NULL;
 
@@ -72,7 +73,7 @@ int rr_start_replay(const char *trace_file)
         RR_INFO("Using default trace file: %s", trace_file);
     }
 
-    /* ✅ 保存trace路径，供child重新打开 */
+    /* Save trace path for children to reopen */
     if (g_rr_trace_path == NULL || strcmp(g_rr_trace_path, trace_file) != 0) {
         if (g_rr_trace_path) free(g_rr_trace_path);
         g_rr_trace_path = strdup(trace_file);
@@ -86,7 +87,7 @@ int rr_start_replay(const char *trace_file)
         RR_INFO("Opening trace file for reading: %s", trace_file);
         g_trace_file = fopen(trace_file, "rb");
         if (!g_trace_file) {
-            RR_ERROR("Failed to open trace file: %s", trace_file);
+            RR_ERROR("Failed to open trace file: %s (%s)", trace_file, strerror(errno));
             return -1;
         }
     }
@@ -137,7 +138,7 @@ void rr_reset_trace_position(void)
     RR_INFO("Resetting trace file position to start");
     rewind(g_trace_file);
     
-    /* 跳过 header (12 bytes: magic + version + count) */
+    /* Skip header (12 bytes: magic + version + count) */
     fseek(g_trace_file, 12, SEEK_SET);
 }
 
@@ -177,37 +178,44 @@ void rr_stop_replay(void)
  *         - 指向新分配并填充的记录结构体的指针
  *         - NULL: 如果到达文件末尾 (EOF) 或发生读取错误
  * 
- * @note 调用者负责释放返回的结构体 (通常由 replay 循环管理)
- * @note 能够自动处理带有或不带有 aux_data 的记录格式
+ * @note Caller is responsible for freeing the returned structure (usually managed by the replay loop).
+ * @note Automatically handles record formats with or without aux_data.
  * 
- * @warning 函数内部使用 g_malloc 分配内存，必须确保释放以避免泄漏
- * @warning 文件读取错误会打印 ERROR 日志但返回 NULL，调用者需区分 EOF 和错误
+ * @warning Uses g_malloc internally; ensure free to avoid leaks.
+ * @warning File read errors print ERROR logs but return NULL; caller must distinguish EOF and error.
  */
-static syscall_record_t *read_next_record(void)
+/* Visible for rr_fork_server.c */
+syscall_record_t *read_next_record(void)
 {
+    /* 🔥 DEBUG: Find who calls this! */
+    
     if (!g_trace_file) {
-        RR_ERROR("READ_NEXT_RECORD: No trace file open");
+        /* Try opening trace file */RR_ERROR("READ_NEXT_RECORD: No trace file open");
         return NULL;
     }
 
     RR_VERBOSE("READ_NEXT_RECORD: Attempting to read next record from trace file");
     syscall_record_t *record = g_malloc0(sizeof(syscall_record_t));
 
-    /* 读取基本记录 - 逐字段读取以避免结构体对齐问题 */
+    /* Read basic record - field by field to avoid alignment issues */
 
-    // 读取手动打包的二进制数据以匹配记录格式
+    // Read manually packed binary data to match record format
     uint8_t buffer[8]; // 4字节index + 4字节syscall_nr
     if (fread(buffer, 8, 1, g_trace_file) != 1) {
-        RR_ERROR("READ_NEXT_RECORD: Failed to read record header");
+        if (feof(g_trace_file)) {
+             RR_VERBOSE("READ_NEXT_RECORD: End of trace file (EOF)");
+        } else {
+             RR_ERROR("READ_NEXT_RECORD: Failed to read record header (Error: %s)", strerror(errno));
+        }
         g_free(record);
         return NULL;
     }
 
-    // 手动解包
+    // Manual unpacking
     record->index = buffer[0] | (buffer[1] << 8) | (buffer[2] << 16) | (buffer[3] << 24);
     record->syscall_nr = (int32_t)(buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24));
 
-    // 读取其余字段
+    // Read remaining fields
     if (fread(record->args, sizeof(abi_long) * 8, 1, g_trace_file) != 1 ||
         fread(&record->retval, sizeof(abi_long), 1, g_trace_file) != 1 ||
         fread(record->arg_size, sizeof(size_t) * 8, 1, g_trace_file) != 1 ||
@@ -229,10 +237,10 @@ static syscall_record_t *read_next_record(void)
     RR_VERBOSE("READ_NEXT_RECORD: Record data - index=%u, syscall=%d, ret=%ld",
                record->index, record->syscall_nr, (long)record->retval);
 
-    /* 读取参数数据 */
+    /* Read parameter data */
     int arg_index;
     while (fread(&arg_index, sizeof(int), 1, g_trace_file) == 1) {
-        if (arg_index == -1) { // 结束标记
+        if (arg_index == -1) { // End marker
             break;
         }
 
@@ -251,14 +259,14 @@ static syscall_record_t *read_next_record(void)
         }
     }
 
-    /* 读取 aux_data（如果有） */
+    /* Read aux_data if available */
     uint32_t aux_marker = 0;
     RR_VERBOSE("READ_NEXT_RECORD: About to read aux_marker at file pos %ld", ftell(g_trace_file));
     if (fread(&aux_marker, sizeof(uint32_t), 1, g_trace_file) == 1) {
         RR_VERBOSE("READ_NEXT_RECORD: Read aux_marker = 0x%08x", aux_marker);
         if (aux_marker == 0x41555844) { // "AUXD" magic
             RR_VERBOSE("READ_NEXT_RECORD: Found AUXD magic, reading aux_data");
-            /* 读取 aux_data 数量 */
+            /* Read aux_data count */
             uint32_t aux_count = 0;
             ssize_t read_result = fread(&aux_count, sizeof(uint32_t), 1, g_trace_file);
             RR_VERBOSE("READ_NEXT_RECORD: fread aux_count result=%zd, aux_count=%u", read_result, aux_count);
@@ -266,7 +274,7 @@ static syscall_record_t *read_next_record(void)
                 RR_VERBOSE("READ_NEXT_RECORD: aux_count = %u", aux_count);
                 record->has_aux_data = true;
                 
-                /* 读取每个 aux_data */
+                /* Read each aux_data exit */
                 for (uint32_t i = 0; i < aux_count; i++) {
                     uint8_t kind, arg_mask;
                     uint32_t size;
@@ -278,7 +286,7 @@ static syscall_record_t *read_next_record(void)
                         break;
                     }
                     
-                    /* 读取数据 */
+                    /* Read data */
                     uint8_t *data = g_malloc(size);
                     if (fread(data, size, 1, g_trace_file) == 1) {
                         rr_aux_data_t *aux = rr_aux_create((rr_aux_kind_t)kind, arg_mask, data, size);
@@ -296,7 +304,7 @@ static syscall_record_t *read_next_record(void)
         } else {
             RR_VERBOSE("READ_NEXT_RECORD: No AUXD magic (marker=0x%08x)", aux_marker);
         }
-        /* 如果 aux_marker == 0，说明没有 aux_data，这是正常的 */
+        /* If aux_marker == 0, there is no aux_data; this is normal */
     } else {
         RR_ERROR("READ_NEXT_RECORD: Failed to read aux_marker at pos %ld", ftell(g_trace_file));
     }
@@ -305,8 +313,7 @@ static syscall_record_t *read_next_record(void)
 }
 
 /**
- * 应用FD映射
- * 实现design.md中的句柄映射逻辑
+ * Apply FD mapping
  */
 static void apply_fd_mapping(abi_long *args, int syscall_nr)
 {
@@ -320,7 +327,7 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
 #ifdef TARGET_NR_fstat
         case TARGET_NR_fstat:
 #endif
-            /* 第一个参数是FD */
+            /* First argument is FD */
             if (args[0] >= 0) {
                 int mapped_fd = rr_fd_mapping_get((int)args[0]);
                 args[0] = mapped_fd;
@@ -330,7 +337,7 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
 #ifdef TARGET_NR_dup2
         case TARGET_NR_dup2:
 #endif
-            /* 两个参数都是FD */
+            /* Both arguments are FDs */
             for (int i = 0; i < 2; i++) {
                 if (args[i] >= 0) {
                     int mapped_fd = rr_fd_mapping_get((int)args[i]);
@@ -345,8 +352,8 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
 #ifdef TARGET_NR_mmap2
         case TARGET_NR_mmap2:
 #endif
-            /* mmap的第5个参数（args[4]）是文件描述符 */
-            if (args[4] >= 0) {  /* 不是匿名映射 */
+            /* 5th argument of mmap (args[4]) is the FD */
+            if (args[4] >= 0) {  /* Not anonymous mapping */
                 int mapped_fd = rr_fd_mapping_get((int)args[4]);
                 if (mapped_fd != (int)args[4]) {
                     RR_VERBOSE("FD_MAPPING: mmap fd %d -> %d", (int)args[4], mapped_fd);
@@ -355,56 +362,56 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
             }
             break;
 
-        // 可以添加更多系统调用的FD映射处理
+        // More syscall FD mapping handling can be added here
         default:
             break;
     }
 }
 
 /* 
- * 注：update_fd_mapping() 函数已移除
- * FD映射功能由 apply_fd_mapping() 处理
- * Pure Replay 功能已移至 rr_replay_pure.c 
+ * NOTE: update_fd_mapping() has been removed.
+ * FD mapping is handled by apply_fd_mapping().
+ * Pure Replay functionality moved to rr_replay_pure.c. 
  */
 
 /**
- * @brief 重放单个系统调用 - Hybrid/Pure 自动分发
+ * @brief Replay a single syscall - Hybrid/Pure automatic dispatch.
  * 
- * 这是 Replay/Fuzzing 模式下的核心函数，根据 trace 中的数据自动选择重放策略：
- * - **Pure Replay**: 如果 record 有 aux_data 且不是 brk/mmap，完全在用户态恢复，不执行真实 syscall
- * - **Hybrid Replay**: 如果没有 aux_data 或是特殊 syscall，应用 FD 映射后执行真实 syscall
+ * Core function in Replay/Fuzzing mode, automatically selecting strategy based on trace data:
+ * - **Pure Replay**: Fully restored in userspace via aux_data; no real syscall executed (except brk/mmap).
+ * - **Hybrid Replay**: Executed as a real syscall with FD/address mappings applied.
  * 
- * **工作流程**:
- * 1. 从 trace 文件读取下一条记录并同步 (syscall_nr 匹配)
- * 2. 检测并退出 silent replay mode（如果到达 fork point）
- * 3. 判断是否可以 Pure Replay
- *    - Yes: 调用 rr_replay_syscall_pure()，直接从 aux_data 恢复，返回记录的 retval
- *    - No: Hybrid 路径，应用 FD/地址映射，返回 -1 让 QEMU 执行真实 syscall
- * 4. Fuzzing 模式：应用 mutation（fuzz_mutate_syscall）
+ * **Workflow**:
+ * 1. Read next record from trace and synchronize (syscall_nr match).
+ * 2. Detect and exit silent replay mode (if fork point reached).
+ * 3. Determine if Pure Replay is possible.
+ *    - Yes: Call rr_replay_syscall_pure(), return recorded retval.
+ *    - No: Hybrid path, apply mappings, return -1 to let QEMU execute real syscall.
+ * 4. Fuzzing mode: apply mutations (fuzz_mutate_syscall).
  * 
- * **Trace 同步机制**:
- * - 如果当前 syscall 与 trace 不匹配，会自动跳过 trace 中的记录直到找到匹配的
- * - 这提供了一定的容错能力，允许 record 和 replay 之间有小的差异
+ * **Trace Synchronization**:
+ * - Automatically skips trace records if current syscall doesn't match until a match is found.
+ * - Provides fault tolerance allowing minor differences between record and replay.
  * 
  * **Special Cases**:
- * - Output syscalls (write/writev): 强制使用 Hybrid，保持 I/O 状态同步
- * - mmap/brk: 强制使用 Hybrid，因为需要 QEMU 管理内存映射
- * 
- * @param env CPU 架构状态指针（用于读/写 guest 内存）
- * @param num 当前系统调用编号
- * @param args 系统调用参数数组（8个参数），Pure Replay 中会修改这些值
+ * - Output syscalls (write/writev): Forced Hybrid to maintain I/O state.
+ * - mmap/brk: Forced Hybrid because QEMU must manage memory mappings.
+ */
+ * @param env CPU architecture state pointer (for guest memory R/W).
+ * @param num Current syscall number.
+ * @param args Syscall argument array (8 arguments); may be modified for Pure Replay.
  * 
  * @return abi_long
- *         - 非 -1: Pure Replay 成功，直接返回记录的 retval 给 QEMU
- *         - -1: Hybrid Replay，让 QEMU 执行真实 syscall（参数可能已被修改）
+ *         - Not -1: Pure Replay successful; returns recorded retval to QEMU.
+ *         - -1: Hybrid Replay; let QEMU execute real syscall (args may be modified).
  * 
- * @note 会自动递增 g_rr_framework->replay_index
- * @note 支持动态跟踪（RR_ENABLE_DYNAMIC_TRACE）用于可视化
- * @note 维护全局状态：g_current_record, g_pending_post_record
+ * @note Automatically increments g_rr_framework->replay_index.
+ * @note Supports Dynamic Trace (RR_ENABLE_DYNAMIC_TRACE) for visualization.
+ * @note Maintains global state: g_current_record, g_pending_post_record.
  * 
- * @warning ⚠️ 复杂的状态管理: g_syscall_already_consumed, g_pending_mmap_recorded_addr 等
- *          需要仔细维护以避免重复消费或遗漏 record
- * @warning Fuzzing mutation 会修改 args 数组，影响后续执行
+ * @warning ⚠️ Complex state management: g_syscall_already_consumed, g_pending_mmap_recorded_addr, etc.
+ *          Must be carefully maintained to avoid double consumption or missed records.
+ * @warning Fuzzing mutation modifies the args array, affecting subsequent execution.
  * 
  * @see rr_start_replay() 必须先调用该函数打开 trace 文件
  * @see rr_replay_syscall_pure() Pure Replay 的实现
@@ -418,8 +425,9 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     RR_VERBOSE("REPLAY_SYSCALL: g_rr_framework=%p", g_rr_framework);
     RR_VERBOSE("REPLAY_SYSCALL: g_trace_file=%p", g_trace_file);
 
-    /* 重置标记 */
+    /* Reset flags */
     g_syscall_already_consumed = false;
+    if (g_rr_framework) g_rr_framework->last_syscall_mutated = false;
 
     if (!g_rr_framework) {
         RR_VERBOSE("REPLAY_SYSCALL: g_rr_framework is NULL, returning -1");
@@ -436,20 +444,16 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     RR_VERBOSE("REPLAY_SYSCALL: Called for syscall %d, replay_index=%u", num, g_rr_framework->replay_index);
     RR_VERBOSE("REPLAY_SYSCALL: g_trace_file=%p, g_current_record=%p", g_trace_file, g_current_record);
 
-    /* 注释：不再使用skip检查，总是尝试从trace读取
-     * 原因：trace可能包含任何syscall（取决于record时的逻辑或trace文件版本）
-     * 如果trace里没有匹配的记录，在查找过程中会自然地返回-1真实执行
-     * 🔥 修复：不跳过任何 syscall，与 record 策略保持一致
-     */
+    /* No skip check: always attempt to read from trace to ensure consistency */
 
-    /* ✅ 检查是否到达fork_point，关闭silent mode */
+    /* Check if fork_point is reached to disable silent mode */
     if (g_rr_framework->silent_replay_mode) {
         uint32_t target_fork_point = g_rr_framework->checkpoint_target;
         if (g_rr_framework->replay_index >= target_fork_point) {
             g_rr_framework->silent_replay_mode = false;
             RR_INFO("✅ [Hybrid] Reached fork_point[%u], switching to normal mode", target_fork_point);
             
-            // ✅ 发送iteration消息
+            // Send iteration message
             // extern int g_dynamic_trace_pipe_fd;
             if (g_dynamic_trace_pipe_fd >= 0) {
                 rr_dynamic_trace_iteration(g_rr_framework->current_iteration_id, getpid());
@@ -457,19 +461,25 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         }
     }
     
-    /* 维护全局索引同步 - design.md的核心要求 */
+    /* Maintain global index synchronization - core requirement from design.md */
     RR_VERBOSE("REPLAY_SYSCALL: replay_index=%u, g_current_record=%p", g_rr_framework->replay_index, g_current_record);
     if (g_rr_framework->replay_index == 0 || !g_current_record) {
         RR_VERBOSE("REPLAY_SYSCALL: Need to read next record");
         RR_VERBOSE("REPLAY_SYSCALL: Reading next record (current_record=%p)", g_current_record);
         g_current_record = read_next_record();
+        
+        if (!g_current_record) {
+             RR_INFO("End of Trace reached (EOF) during replay/fuzzing. Terminating execution.");
+             /* This is normal behavior when trace is exhausted */
+             exit(0);
+        }
         if (!g_current_record) {
             RR_VERBOSE("REPLAY_SYSCALL: read_next_record returned NULL");
-            /* EnvFuzz风格：找不到record时，不崩溃，真实执行 */
+            /* EnvFuzz style: If record is not found, don't crash, execute for real */
             RR_WARN("REPLAY_SYSCALL: End of trace at index %u for syscall %d, executing directly", 
                     g_rr_framework->replay_index, num);
             
-            /* ✅ 修复：真实执行也要发送dynamic trace！*/
+            /* ✅ Fix: Real execution also needs to send dynamic trace! */
             // extern bool g_dynamic_trace_enabled;
             // extern int g_dynamic_trace_pipe_fd;
             RR_INFO("🔍 About to send dynamic trace: silent=%d, enabled=%d, pipe_fd=%d",
@@ -485,10 +495,10 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                         num, g_rr_framework->replay_index);
             }
             
-            /* ✅ 递增replay_index（即使真实执行也要计数）*/
+            /* ✅ Increment replay_index (even for real execution) */
             g_rr_framework->replay_index++;
             
-            return -1;  /* 真实执行系统调用 */
+            return -1;  /* Execute syscall directly */
         }
         RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
                 g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
@@ -497,14 +507,14 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                    
     }
 
-    /* 智能同步 - 如果系统调用不匹配，继续读取直到找到匹配的 */
+    /* Smart synchronization - if syscall doesn't match, continue reading until a match is found */
     while (g_current_record && g_current_record->syscall_nr != num) {
         RR_VERBOSE("REPLAY_SYSCALL: MISMATCH - recorded=%d, actual=%d, skipping",
                 g_current_record->syscall_nr, num);
         RR_VERBOSE("REPLAY_SYSCALL: Skipping unmatched syscall (recorded=%d, actual=%d)",
                    g_current_record->syscall_nr, num);
 
-        /* 动态跟踪：记录被跳过的 syscall（用于 tree 完整性） */
+        /* Dynamic trace: Record skipped syscall (for tree integrity) */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
         uint64_t dummy_args[8] = {0};
         rr_dynamic_trace_syscall_enter(env, g_current_record->syscall_nr, dummy_args, 
@@ -513,18 +523,24 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                                         g_current_record->retval, g_rr_framework->replay_index, 0);
 #endif
 
-        /* 清理当前记录 (使用统一的 dispose 函数) */
+        /* Clear current record (using unified dispose function) */
         rr_record_dispose(g_current_record);
         
-        /* 🔥 关键修复: 跳过record时也要递增 replay_index */
+        /* 🔥 Key Fix: Increment replay_index even when skipping records */
         g_rr_framework->replay_index++;
 
-        /* 读取下一条记录 */
+        /* Read next record */
         g_current_record = read_next_record();
         if (!g_current_record) {
-            /* EnvFuzz风格：找不到record时，不崩溃，真实执行 */
-            RR_WARN("REPLAY_SYSCALL: Syscall %d not found in trace (end of trace), executing directly", num);
-            return -1;  /* 真实执行系统调用 */
+             // Check if Tree Export is enabled (via environment variable)
+             const char *tree_output = getenv("RR_TREE_OUTPUT");
+             // fprintf(stderr, "[REPLAY-DEBUG] EOF reached. tree_output=%s\n", tree_output ? tree_output : "NULL");
+             if (tree_output) {
+                 rr_tree_export_json(tree_output);
+             }
+             
+             RR_VERBOSE("[REPLAY] End of Trace reached (EOF). Terminating execution.");
+             exit(0);
         }
         RR_VERBOSE("REPLAY_SYSCALL: Trying next record index=%u, syscall=%d",
                    g_current_record->index, g_current_record->syscall_nr);
@@ -540,10 +556,10 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     RR_VERBOSE("REPLAY_SYSCALL: Found matching syscall %d at record index %u",
                num, g_current_record->index);
 
-    /* 检查是否应用了mutation */
+    /* Check if mutation is applied */
     int has_mutation = 0;
     if (g_rr_framework->mode == RR_MODE_FUZZING) {
-        /* 预先检查是否有mutation（用于设置is_fuzzed标志） */
+        /* Pre-check for mutations (for setting is_fuzzed flag) */
         for (size_t i = 0; i < g_instruction_count; i++) {
             if (g_fuzz_instructions[i].syscall_index == g_current_record->index) {
                 has_mutation = 1;
@@ -552,7 +568,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         }
     }
 
-    /* 动态跟踪：系统调用进入（二进制重放路径） */
+    /* Dynamic trace: Syscall enter (binary replay path) */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     rr_dynamic_trace_syscall_enter(env, num, (uint64_t*)args, 
                                      g_rr_framework->replay_index, has_mutation);
@@ -560,20 +576,21 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 
     abi_long ret = g_current_record->retval;
 
-    /* ========== 特殊处理 1：Output Syscalls ========== */
-    /* 输出系统调用必须真实执行以维持I/O状态，但需要先消费 record */
-    /* 🔥 注意：对于output syscalls，我们需要在这里先应用mutation，然后再执行真实syscall */
+    /* Special Case 1: Output Syscalls */
+    /* Output syscalls must be executed to maintain I/O state, but record must be consumed */
+    /* Mutations are applied before executing the real syscall */
     if (rr_is_output_syscall(num)) {
-        RR_VERBOSE("REPLAY_SYSCALL: Output syscall %d, consuming record and executing directly", num);
+        RR_INFO("REPLAY_SYSCALL: Output syscall %d (Hybrid Replay), consuming record and executing directly", num);
         
-        /* 🔥 关键修复：在执行output syscall之前先应用mutation */
+        /* Apply mutation before executing output syscall */
         if (g_rr_framework->mode == RR_MODE_FUZZING) {
             uint32_t syscall_index = g_current_record->index;
             RR_INFO("🎯 FUZZING MODE: Applying mutations for OUTPUT syscall %d at index %u", num, syscall_index);
-            rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+            int m_res = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
+            if (m_res > 0) g_rr_framework->last_syscall_mutated = true;
         }
         
-        /* 清理当前记录 */
+        /* Clear current record */
         for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
             if (g_current_record->arg_data[i]) {
                 g_free(g_current_record->arg_data[i]);
@@ -585,17 +602,17 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         g_free(g_current_record);
         g_current_record = NULL;
         
-        /* 推进索引 */
+        /* Advance index */
         g_rr_framework->replay_index++;
         
-        /* 设置标志，防止 post_hook 重复处理 */
+        /* Set flag to prevent post_hook from double processing */
         g_syscall_already_consumed = true;
         
-        return -1; /* 执行真实 syscall */
+        return -1; /* Execute real syscall */
     }
 
-    /* ========== 特殊处理 2：内存管理 Syscalls ========== */
-    /* mmap 等需要真实分配内存，但强制使用 recorded 地址 */
+    /* Special Case 2: Memory Management Syscalls */
+    /* mmap and others require real allocation, but force recorded address */
     bool is_mmap = false;
 #ifdef TARGET_NR_mmap
     if (num == TARGET_NR_mmap) is_mmap = true;
@@ -612,11 +629,11 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
             RR_VERBOSE("REPLAY_SYSCALL: Hybrid mmap referencing recorded addr=0x%lx len=%lu",
                        (unsigned long)info.addr, (unsigned long)info.length);
 
-            /* 记录原始地址和长度，交由 post_hook 建立映射 */
+            /* Record original address and length, let post_hook establish mapping */
             g_pending_mmap_recorded_addr = (target_ulong)info.addr;
             g_pending_mmap_length = (target_ulong)info.length;
 
-            /* 参数使用当前值（不强制 MAP_FIXED） */
+            /* Use current parameters (do not force MAP_FIXED) */
             args[2] = (abi_long)info.prot;
             args[3] = (abi_long)info.flags;
             args[4] = (abi_long)info.fd;
@@ -624,7 +641,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         }
     }
 
-    /* ========== 路径分叉：Pure vs Hybrid ========== */
+    /* ========== Path Bifurcation: Pure vs Hybrid ========== */
     
     if (g_current_record->has_aux_data &&
         !(num == TARGET_NR_brk
@@ -634,48 +651,67 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 #if defined(TARGET_NR_mmap2)
           || num == TARGET_NR_mmap2
 #endif
+        /* 🔥 P0 Fix: Force Hybrid Replay for File Ops (Open/Close) */
+        /* These syscalls MUST go through hybrid path to register FD mappings */
+#if defined(TARGET_NR_open)
+        || num == TARGET_NR_open
+#endif
+#if defined(TARGET_NR_openat)
+        || num == TARGET_NR_openat
+#endif
+#if defined(TARGET_NR_creat)
+        || num == TARGET_NR_creat
+#endif
+#if defined(TARGET_NR_close)
+        || num == TARGET_NR_close
+#endif
+#if defined(TARGET_NR_lseek)
+        || num == TARGET_NR_lseek
+#endif
         )) {
+
         /* 
-         * 路径1：Pure Replay
-         * 当有aux_data时，尝试纯重放（不执行真实syscall）
-         * 🔥 P0修复：在Pure Replay之前先应用Fuzzing变异
+         * Path 1: Pure Replay
+         * If aux_data is available, attempt pure replay without real syscall.
+         * Fuzzing mutations are applied before Pure Replay.
          */
         RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
         
         /* 
-         * 🔥 新策略：对于buffer mutation，先恢复aux_data再应用mutation
-         * 这样mutation可以覆盖已有的数据
+         * Strategy: Restore aux_data to buffer first, then apply mutation 
+         * to allow mutations to overwrite existing data.
          */
         
-        /* 步骤1：先恢复aux_data到buffer（如果有的话） */
+        /* Step 1: Restore aux_data to buffer first (if any) */
         ret = rr_replay_syscall_pure(env, num, args, g_current_record);
         
         if (ret == -1) {
-            /* Pure replay失败，使用hybrid模式 */
+            /* Pure replay failed, use hybrid mode */
             RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
             goto try_hybrid;
         }
         
-        /* 步骤2：在fuzzing模式下，应用mutation覆盖已恢复的数据 */
+        /* Apply mutation to args and restored guest memory in fuzzing mode */
         if (g_rr_framework->mode == RR_MODE_FUZZING) {
             uint32_t syscall_index = g_current_record->index;
             RR_INFO("🎯 FUZZING: Applying mutations AFTER aux_data restore for syscall %d at index %u", 
                     num, syscall_index);
             
-            /* 应用变异到args和已恢复的guest内存 */
+            /* Apply mutations to args and restored guest memory */
             int mutation_result = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
             
             if (mutation_result > 0) {
                 RR_INFO("🎯 FUZZING: Buffer mutation applied, overwrote aux_data");
+                g_rr_framework->last_syscall_mutated = true;
             }
         }
         
-        /* Pure Replay成功：直接返回 */
+        /* Pure Replay success: return directly */
         RR_VERBOSE("REPLAY: Pure replay succeeded, ret=%d", (int)ret);
         goto replay_success;
         
 try_hybrid:
-        /* 继续原来的hybrid逻辑 */
+        /* Continue with existing hybrid logic */
         {}
     }
 
@@ -696,26 +732,26 @@ try_hybrid:
     }
 
     /* 
-     * 路径2：Hybrid Replay（传统模式）
-     * - 应用 FD 映射
-     * - 支持 Fuzzing 变异
-     * - 快照管理
-     * - 执行真实 syscall
+     * Path 2: Hybrid Replay (Traditional mode)
+     * - Apply FD mapping
+     * - Support Fuzzing mutations
+     * - Snapshot management
+     * - Execute real syscall
      */
     RR_VERBOSE("REPLAY_SYSCALL: Hybrid replay path for syscall %d", num);
 
-    /* 🔥 特殊处理：read 返回 0 (EOF) 时，即使没有 aux_data，也应该直接返回 0 */
+    /* 🔥 Special Case: When read returns 0 (EOF), directly return 0 even without aux_data */
     if (num == TARGET_NR_read && ret == 0) {
         RR_VERBOSE("REPLAY_SYSCALL: read returned 0 (EOF), returning directly without real syscall");
         goto replay_success;
     }
 
-    /* ✅ 2025-11-17: IO Return Value Mutation - Hybrid模式下的返回值覆盖 */
-    /* 关键修复: 在执行真实syscall之前检查是否需要覆盖返回值 */
-    /* 如果有覆盖，跳过真实syscall，直接返回覆盖的值 */
+    /* ✅ 2025-11-17: IO Return Value Mutation - Return value override in Hybrid mode */
+    /* Key fix: Check if return value override is needed before executing real syscall */
+    /* If overridden, skip real syscall and return the overridden value directly */
     if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
         abi_long original_ret = ret;
-        ret = rr_fuzz_get_retval_override();  /* 获取覆盖值并清除标志 */
+        ret = rr_fuzz_get_retval_override();  /* Get override value and clear flag */
 
         RR_INFO("🎯 IO RETVAL OVERRIDE (Hybrid): syscall %d (%s): %ld → %ld",
                 num, rr_get_syscall_name_fast(num), (long)original_ret, (long)ret);
@@ -723,7 +759,7 @@ try_hybrid:
         fprintf(stderr, "[REPLAY-HYBRID] 🎯 RETVAL OVERRIDE: %ld → %ld\n", (long)original_ret, (long)ret);
         fflush(stderr);
 
-        /* ✅ 2025-11-17: Hybrid路径的Buffer Fill */
+        /* ✅ 2025-11-17: Buffer Fill in Hybrid path */
         if (rr_fuzz_has_buffer_fill()) {
             target_ulong buf_addr = 0;
             size_t buf_size = 0;
@@ -740,37 +776,35 @@ try_hybrid:
             }
         }
 
-        /* 跳过真实syscall执行，直接返回覆盖的值 */
+        /* Skip real syscall execution, return overridden value directly */
         goto replay_success;
     }
 
-    /* 应用FD映射 */
+    /* Apply FD mapping */
     apply_fd_mapping(args, num);
 
-    /* TODO(P1): Fuzzing变异逻辑将在映射闭环完成后添加 */
+    /* TODO(P1): Fuzzing mutation logic will be added after mapping loop closure is complete */
 
-    /* 自动快照管理 */
+    /* Automatic snapshot management */
     rr_snapshot_auto_manage(num, g_rr_framework->replay_index);
 
-    /* 🔥 Hybrid 模式: 所有syscall都执行真实调用,由post_hook处理映射 */
-    /* mmap等特殊syscall的地址映射在post_hook中完成 */
+    /* 🔥 Hybrid Mode: All syscalls execute real calls, mappings handled by post_hook */
+    /* Address mapping for special syscalls like mmap is completed in post_hook */
 
-    /* 🔥 关键修复: Hybrid 模式在返回前必须清理记录并推进索引 */
+    /* 🔥 Key Fix: Hybrid mode must clean record and advance index before returning */
     g_pending_post_record = g_current_record;
     g_current_record = NULL;
     g_rr_framework->replay_index++;
     
-    /* 设置标记，告诉 post_hook 不要重复处理 */
+    /* Set flag to notify post_hook not to double process */
     g_syscall_already_consumed = true;
     
-    /* 返回 -1，让 QEMU 执行真实 syscall (使用变异后的参数) */
+    /* Return -1 to let QEMU execute real syscall (with mutated arguments) */
     RR_VERBOSE("REPLAY_SYSCALL: Hybrid mode, record cleaned, executing real syscall %d", num);
     return -1;
 
-replay_success:
-    /* Pure Replay 成功路径：已经返回确定性结果，清理记录 */
-
-    /* ✅ 2025-11-17: 在清理record之前，先保存recorded_ret用于调试 */
+    /* Pure Replay success path: Deterministic result returned, clean record */
+    /* Save recorded_ret for debugging before record cleanup */
     abi_long recorded_ret_for_debug = g_current_record ? g_current_record->retval : -999;
 
     g_pending_post_record = g_current_record;
@@ -778,13 +812,13 @@ replay_success:
 
     g_rr_framework->replay_index++;
 
-    /* 设置标记，告诉 post_hook 不要重复处理 */
+    /* Set flag to notify post_hook not to process again */
     g_syscall_already_consumed = true;
 
-    /* ✅ 新增：应用返回值覆盖（IO返回值变异） */
+    /* Apply return value override (IO return value mutation) */
     if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_retval_override()) {
         abi_long original_ret = ret;
-        ret = rr_fuzz_get_retval_override();  // 这会自动清除标志
+        ret = rr_fuzz_get_retval_override();  // This clears the flag automatically
 
         RR_INFO("🎯 IO RETVAL OVERRIDE: syscall %d (%s): recorded=%ld, ret_before=%ld → ret_after=%ld",
                 num, rr_get_syscall_name_fast(num), (long)recorded_ret_for_debug, (long)original_ret, (long)ret);
@@ -794,7 +828,7 @@ replay_success:
         fflush(stderr);
     }
 
-    /* ✅ 2025-11-17: 泛化Buffer Fill - 填充IO buffer内容 */
+    /* Generalized Buffer Fill - Fill IO buffer content */
     if (g_rr_framework->mode == RR_MODE_FUZZING && rr_fuzz_has_buffer_fill()) {
         target_ulong buf_addr = 0;
         size_t buf_size = 0;
@@ -803,7 +837,7 @@ replay_success:
         size_t fill_size = rr_fuzz_get_buffer_fill(&buf_addr, &buf_size, &pattern);
 
         if (fill_size > 0 && buf_addr != 0 && pattern != NULL) {
-            /* 填充guest buffer */
+            /* Fill guest buffer */
             if (cpu_memory_rw_debug(env_cpu(env), buf_addr, (uint8_t *)pattern, fill_size, 1) == 0) {
                 RR_INFO("🎨 BUFFER FILLED: syscall %d (%s): addr=0x%lx, size=%zu",
                         num, rr_get_syscall_name_fast(num), (unsigned long)buf_addr, fill_size);
@@ -819,10 +853,11 @@ replay_success:
         }
     }
 
-    /* 动态跟踪：系统调用退出（二进制重放路径） */
+replay_success:
+    /* Dynamic trace: Syscall exit (binary replay path) */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,
-                                    g_rr_framework->replay_index - 1, has_mutation);
+                                    g_rr_framework->replay_index - 1, false);
 #endif
 
     RR_VERBOSE("REPLAY_SYSCALL: Successfully replayed syscall %u: %d -> %d",

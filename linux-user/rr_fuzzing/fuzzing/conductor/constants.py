@@ -12,31 +12,31 @@ FUZZ_CMD_MUTATE_ARG = 1              # 变异参数
 FUZZ_CMD_REPLACE_BUFFER = 2          # 替换缓冲区
 FUZZ_CMD_MUTATE_FLAGS = 3            # 变异标志
 FUZZ_CMD_BOUNDARY_VALUE = 4          # 边界值
-# 第1阶段: 针对aux_data的新变异命令
-FUZZ_CMD_MUTATE_AUX_BUFFER = 5       # 变异辅助缓冲区
+# Auxiliary data mutation commands
+FUZZ_CMD_MUTATE_AUX_BUFFER = 5       # Mutate aux_data buffer
 FUZZ_CMD_FLIP_BITS = 6               # 位翻转
 FUZZ_CMD_TRUNCATE = 7                # 截断
 FUZZ_CMD_EXTEND = 8                  # 扩展
 FUZZ_CMD_INTERESTING_VALUES = 9      # 特殊值
 FUZZ_CMD_LIGHT_MUTATION = 10         # 轻量变异
-# 第2阶段: 精确内存覆写命令
-FUZZ_CMD_OVERWRITE_AT_OFFSET = 11    # 偏移覆写
+# Precise memory overwrite command
+FUZZ_CMD_OVERWRITE_AT_OFFSET = 11    # Overwrite at specific offset
 
 # ===== 共享内存常量 (必须与rr_constants.h匹配) =====
 FUZZ_MAGIC = 0x46555A5A             # "FUZZ" - 共享内存魔数
 FUZZ_MAX_INSTRUCTIONS = 32          # 最大指令队列长度
 FUZZ_MAX_VARIANTS = 10              # 最大变体数量 (对应FuzzSharedMemory.variants[10])
 FUZZ_INSTRUCTION_DATA = 256         # 每条指令的数据负载大小
-# ✅ 修复: 增加共享内存大小以容纳完整结构
-# Header(36B) + instructions[32](8960B) + variants[10](89640B) = 98636B
-# 向上取整到128KB以提供缓冲空间
-FUZZ_SHM_SIZE = 128 * 1024          # 共享内存大小: 128KB (必须与rr_constants.h匹配)
+# Shared memory configuration - must match C-side rr_constants.h
+# Total size: Header(36B) + instructions[32](8960B) + variants[10](89640B) = 98636B
+# Aligned to 128KB for future-proofing and page alignment
+FUZZ_SHM_SIZE = 128 * 1024          
 
-# ===== 第3阶段: 覆盖率常量 =====
-COVERAGE_MAP_SIZE = 64 * 1024       # 覆盖率位图大小: 64KB
+# Coverage feedback constants
+COVERAGE_MAP_SIZE = 64 * 1024       
 FUZZ_FLAG_CAPTURE_SEED = (1 << 0)   # 请求捕获种子的标志
 
-# ===== 第1阶段: 初始化阶段过滤配置 =====
+# Initialization phase filtering
 # 这些系统调用在初始化阶段不应该被变异
 # 以避免破坏内存布局
 INIT_SYSCALLS = {

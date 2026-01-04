@@ -35,6 +35,12 @@ class BBTraceParser:
     """BB Trace 解析器"""
     
     ENTRY_SIZE = 16  # sizeof(rr_bb_entry_t) = 8 + 4 + 4
+    # C structure definition (rr_framework.h:70-78):
+    # typedef struct rr_bb_entry {
+    #     uint64_t pc;
+    #     uint32_t syscall_idx;
+    #     uint32_t flags;
+    # } rr_bb_entry_t;
     
     def __init__(self, bb_trace_file: str):
         self.bb_trace_file = bb_trace_file
@@ -48,13 +54,13 @@ class BBTraceParser:
     def parse(self) -> bool:
         """解析BB trace文件"""
         if not os.path.exists(self.bb_trace_file):
-            print(f"[BBTraceParser] ❌ BB trace file not found: {self.bb_trace_file}")
+            print(f"Error: BB trace file not found: {self.bb_trace_file}")
             return False
         
         try:
             file_size = os.path.getsize(self.bb_trace_file)
             if file_size % self.ENTRY_SIZE != 0:
-                print(f"[BBTraceParser] ⚠️  Warning: file size {file_size} is not "
+                print(f"Warning: file size {file_size} is not "
                       f"a multiple of entry size {self.ENTRY_SIZE}")
             
             with open(self.bb_trace_file, 'rb') as f:
@@ -75,14 +81,14 @@ class BBTraceParser:
             unique_syscalls = set(entry.syscall_idx for entry in self.entries if entry.syscall_idx > 0)
             self.stats['syscalls_covered'] = len(unique_syscalls)
             
-            print(f"[BBTraceParser] ✅ Parsed {self.stats['total_bbs']} BB entries")
+            print(f"Parsed {self.stats['total_bbs']} BB entries")
             print(f"  Unique PCs:       {self.stats['unique_pcs']}")
             print(f"  Syscalls covered: {self.stats['syscalls_covered']}")
             
             return True
             
         except Exception as e:
-            print(f"[BBTraceParser] ❌ Failed to parse BB trace: {e}")
+            print(f"Error: Failed to parse BB trace: {e}")
             import traceback
             traceback.print_exc()
             return False

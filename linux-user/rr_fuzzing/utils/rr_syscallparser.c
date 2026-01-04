@@ -1,6 +1,6 @@
 /**
- * RR-Fuzz Strace解析器模块实现
- * 提供strace格式的系统调用记录解析功能
+ * RR-Fuzz Strace Parser Module Implementation
+ * Provides functionality for parsing syscall records in strace format.
  */
 
 #include "rr_syscallparser.h"
@@ -19,7 +19,7 @@ static char *strdup(const char *s) {
 }
 #endif
 
-/* ==================== 系统调用名称到编号的映射表 ==================== */
+/* ==================== Syscall Name to Number Mapping Table ==================== */
 
 typedef struct {
     const char *name;
@@ -356,12 +356,12 @@ static const syscall_mapping_t g_syscall_map[] = {
     {"copy_file_range", 326},
     {"preadv2", 327},
     {"pwritev2", 328},
-    {NULL, -1}  /* 结束标记 */
+    {NULL, -1}  /* End marker */
 };
 
-/* ==================== 标志映射函数 ==================== */
+/* ==================== Flag Mapping Functions ==================== */
 
-/* 内存保护标志映射 */
+/* Memory protection flags mapping */
 static int map_prot_flag(const char *flag_str) {
     if (strcmp(flag_str, "PROT_NONE") == 0) return PROT_NONE;
     if (strcmp(flag_str, "PROT_READ") == 0) return PROT_READ;
@@ -370,7 +370,7 @@ static int map_prot_flag(const char *flag_str) {
     return 0;
 }
 
-/* 内存映射标志映射 */
+/* Memory mapping flags mapping */
 static int map_mmap_flag(const char *flag_str) {
     if (strcmp(flag_str, "MAP_SHARED") == 0) return MAP_SHARED;
     if (strcmp(flag_str, "MAP_PRIVATE") == 0) return MAP_PRIVATE;
@@ -412,7 +412,7 @@ static int map_mmap_flag(const char *flag_str) {
     return 0;
 }
 
-/* 文件打开标志映射 */
+/* File open flags mapping */
 static int map_open_flag(const char *flag_str) {
     if (strcmp(flag_str, "O_RDONLY") == 0) return O_RDONLY;
     if (strcmp(flag_str, "O_WRONLY") == 0) return O_WRONLY;
@@ -430,7 +430,7 @@ static int map_open_flag(const char *flag_str) {
     return 0;
 }
 
-/* 访问模式标志映射 */
+/* Access mode flags mapping */
 static int map_access_flag(const char *flag_str) {
     if (strcmp(flag_str, "F_OK") == 0) return F_OK;
     if (strcmp(flag_str, "R_OK") == 0) return R_OK;
@@ -439,10 +439,10 @@ static int map_access_flag(const char *flag_str) {
     return 0;
 }
 
-/* ==================== 辅助函数实现 ==================== */
+/* ==================== Helper Functions Implementation ==================== */
 
 /**
- * 解析十六进制或十进制数字字符串为长整型
+ * Parse a hexadecimal or decimal numeric string into a long integer.
  */
 long rr_strace_parse_number(const char *str) {
     if (!str) return 0;
@@ -454,7 +454,7 @@ long rr_strace_parse_number(const char *str) {
 }
 
 /**
- * 识别参数类型
+ * Identify parameter type.
  */
 rr_strace_arg_type_t rr_strace_identify_arg_type(const char *arg_str) {
     if (!arg_str) return RR_STRACE_ARG_TYPE_INT;
@@ -472,35 +472,35 @@ rr_strace_arg_type_t rr_strace_identify_arg_type(const char *arg_str) {
 }
 
 /**
- * 解析组合标志字符串
+ * Parse combined flags string.
  */
 static int parse_combined_flags(const char *flag_str, int (*map_flag)(const char*)) {
     if (!flag_str || !map_flag) {
         return 0;
     }
     
-    /* 如果是纯数字，直接返回 */
+    /* If it is purely numeric, return directly */
     char *endptr;
     long value = strtol(flag_str, &endptr, 0);
     if (*flag_str != '\0' && *endptr == '\0') {
         return (int)value;
     }
     
-    /* 复制字符串以便进行修改 */
+    /* Copy string to allow modification */
     char flag_copy[256];
     strncpy(flag_copy, flag_str, sizeof(flag_copy) - 1);
     flag_copy[sizeof(flag_copy) - 1] = '\0';
     
-    /* 解析由|分隔的标志 */
+    /* Parse flags separated by '|' */
     int result = 0;
     char *token = strtok(flag_copy, "|");
     while (token) {
-        /* 去除前后空格 */
+        /* Trim leading/trailing whitespace */
         while (*token && isspace(*token)) token++;
         char *end = token + strlen(token) - 1;
         while (end > token && isspace(*end)) *end-- = '\0';
         
-        /* 查找标志值 */
+        /* Look up flag value */
         result |= map_flag(token);
         
         token = strtok(NULL, "|");
@@ -510,45 +510,45 @@ static int parse_combined_flags(const char *flag_str, int (*map_flag)(const char
 }
 
 /**
- * 解析标志
+ * Parse flags.
  */
 int rr_strace_parse_flags(const char *flag_str, const char *syscall_name, int arg_index) {
     if (!flag_str || !syscall_name) return 0;
     
-    /* mmap系统调用 */
+    /* mmap syscall */
     if (strcmp(syscall_name, "mmap") == 0) {
-        if (arg_index == 2) {  /* prot参数 */
+        if (arg_index == 2) {  /* prot parameter */
             return parse_combined_flags(flag_str, map_prot_flag);
-        } else if (arg_index == 3) {  /* flags参数 */
+        } else if (arg_index == 3) {  /* flags parameter */
             return parse_combined_flags(flag_str, map_mmap_flag);
         }
     }
-    /* mprotect系统调用 */
+    /* mprotect syscall */
     else if (strcmp(syscall_name, "mprotect") == 0) {
-        if (arg_index == 2) { /* prot参数 */
+        if (arg_index == 2) { /* prot parameter */
             return parse_combined_flags(flag_str, map_prot_flag);
         }
     }
-    /* open/openat系统调用 */
+    /* open/openat syscall */
     else if (strcmp(syscall_name, "open") == 0) {
-        if (arg_index == 1) {  /* flags参数 */
+        if (arg_index == 1) {  /* flags parameter */
             return parse_combined_flags(flag_str, map_open_flag);
         }
     }
     else if (strcmp(syscall_name, "openat") == 0) {
-        if (arg_index == 2) {  /* flags参数 */
+        if (arg_index == 2) {  /* flags parameter */
             return parse_combined_flags(flag_str, map_open_flag);
         }
     }
-    /* access/faccessat系统调用 */
+    /* access/faccessat syscall */
     else if (strcmp(syscall_name, "access") == 0 || 
              strcmp(syscall_name, "faccessat") == 0) {
-        if (arg_index == 1 || arg_index == 2) {  /* mode参数 */
+        if (arg_index == 1 || arg_index == 2) {  /* mode parameter */
             return parse_combined_flags(flag_str, map_access_flag);
         }
     }
     
-    /* 默认尝试作为数字解析 */
+    /* Default try parsing as number */
     char *endptr;
     long value = strtol(flag_str, &endptr, 0);
     if (*flag_str != '\0' && *endptr == '\0') {
@@ -558,10 +558,10 @@ int rr_strace_parse_flags(const char *flag_str, const char *syscall_name, int ar
     return 0;
 }
 
-/* ==================== 核心API函数实现 ==================== */
+/* ==================== Core API Functions Implementation ==================== */
 
 /**
- * 获取系统调用编号
+ * Get syscall number.
  */
 int rr_strace_get_syscall_number(const char *syscall_name) {
     if (!syscall_name) return -1;
@@ -576,23 +576,23 @@ int rr_strace_get_syscall_number(const char *syscall_name) {
 }
 
 /**
- * 解析单行strace记录
+ * Parse a single line strace record.
  */
 /**
- * @brief 解析单行 Strace 记录
+ * @brief Parse a single strace line
  * 
- * 将一行文本格式的 strace 输出解析为结构化的 `rr_strace_record_t`。
+ * Parses a single line of text strace output into a structured `rr_strace_record_t`.
  * 
- * **解析步骤**:
- * 1. 提取 PID (如果有)。
- * 2. 提取系统调用名称。
- * 3. 提取参数列表 (括号内的内容)。
- * 4. 识别并解析每个参数 (Int/String/Flag/Ptr)。
- * 5. 提取返回值和错误码 (errno)。
+ * **Steps**:
+ * 1. Extract PID (if present).
+ * 2. Extract syscall name.
+ * 3. Extract argument list (content between parentheses).
+ * 4. Identify and parse each argument (Int/String/Flag/Ptr).
+ * 5. Extract return value and error code (errno).
  * 
- * @param line 输入的文本行 (会被修改，strtok/trim)
- * @param record 输出的记录结构体
- * @return int 1 成功, 0 失败
+ * @param line Input text line (modified in-place by strtok/trim).
+ * @param record Output record structure.
+ * @return int 1 on success, 0 on failure.
  */
 int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
     if (!line || !record) return 0;
@@ -602,84 +602,84 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
     char *current = line;
     char *next;
     
-    /* 跳过行首空白 */
+    /* Skip leading whitespace */
     while (*current && isspace(*current)) current++;
     if (!*current) return 0;
     
-    /* 解析PID */
+    /* Parse PID */
     record->pid = strtol(current, &next, 10);
     if (current == next) return 0;
     current = next;
     
-    /* 跳过空白 */
+    /* Skip whitespace */
     while (*current && isspace(*current)) current++;
     if (!*current) return 0;
     
-    /* 查找系统调用名称的结束位置 */
+    /* Find end of syscall name */
     next = strchr(current, '(');
     if (!next) return 0;
     
-    /* 复制系统调用名称 */
+    /* Copy syscall name */
     /* 复制系统调用名称 */
     size_t name_len = next - current;
     if (name_len >= sizeof(record->syscall_name)) name_len = sizeof(record->syscall_name) - 1;
     memcpy(record->syscall_name, current, name_len);
     record->syscall_name[name_len] = '\0';
     
-    /* 移除系统调用名称末尾的空格 */
+    /* Remove trailing whitespace from name */
     char *trim_end = record->syscall_name + name_len - 1;
     while (trim_end >= record->syscall_name && isspace(*trim_end)) {
         *trim_end = '\0';
         trim_end--;
     }
     
-    /* 移动到参数起始位置 */
-    current = next + 1;  /* 跳过 '(' */
+    /* Move to argument start */
+    current = next + 1;  /* Skip '(' */
     
-    /* 查找参数列表结束位置 */
+    /* Find end of argument list */
     next = strchr(current, ')');
     if (!next) return 0;
     
-    /* 复制参数字符串以便处理 */
+    /* Copy argument string for processing */
     char args_buffer[1024] = {0};
     size_t args_len = next - current;
     if (args_len >= sizeof(args_buffer)) args_len = sizeof(args_buffer) - 1;
     memcpy(args_buffer, current, args_len);
     args_buffer[args_len] = '\0';
     
-    /* 解析参数 */
+    /* Parse arguments */
     record->arg_count = 0;
     char *arg_str = args_buffer;
     char *arg_end;
     
     while (*arg_str && record->arg_count < RR_STRACE_MAX_ARGS) {
-        /* 跳过前导空格 */
+        /* Skip leading whitespace */
         while (*arg_str && isspace(*arg_str)) arg_str++;
         if (!*arg_str) break;
         
-        /* 查找参数结束位置 */
+        /* Find argument end */
         if (*arg_str == '"') {
-            /* 字符串参数 */
+            /* String argument */
             arg_end = strchr(arg_str + 1, '"');
             if (arg_end) arg_end = strchr(arg_end, ',');
         } else {
-            /* 非字符串参数 */
+            /* Non-string argument */
             arg_end = strchr(arg_str, ',');
         }
         
-        /* 如果没有更多的逗号，则整个剩余部分是最后一个参数 */
+        /* If no more commas, the remaining part is the last argument */
         if (!arg_end) arg_end = arg_str + strlen(arg_str);
         
-        /* 临时终止参数字符串以便处理 */
+        /* Temporarily null-terminate for processing */
         char saved_char = *arg_end;
         *arg_end = '\0';
         
-        /* 处理参数 */
+        /* Process argument */
         rr_strace_arg_t *arg = &record->args[record->arg_count];
         arg->type = rr_strace_identify_arg_type(arg_str);
         
         if (arg->type == RR_STRACE_ARG_TYPE_STR) {
-            /* 处理字符串参数 (去掉引号) */
+            /* Process string argument (remove quotes) */
             char *str_start = strchr(arg_str, '"');
             char *str_end = strrchr(arg_str, '"');
             if (str_start && str_end && str_start != str_end) {
@@ -692,11 +692,11 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
                 arg->value = 0;
             }
         } else if (arg->type == RR_STRACE_ARG_TYPE_PTR) {
-            /* 处理标志等 */
+            /* Process flags, etc. */
             snprintf(arg->str, RR_STRACE_MAX_STRING_LENGTH, "%s", arg_str);
             arg->value = rr_strace_parse_flags(arg_str, record->syscall_name, record->arg_count);
         } else {
-            /* 处理数字参数 */
+            /* Process numeric argument */
             if (strcmp(arg_str, "NULL") == 0) {
                 arg->value = 0;
             } else {
@@ -706,10 +706,10 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
         
         record->arg_count++;
         
-        /* 恢复字符 */
+        /* Restore character */
         *arg_end = saved_char;
         
-        /* 如果有下一个参数，移到下一个参数的起始位置 */
+        /* Move to start of next argument if any */
         if (*arg_end == ',') {
             arg_str = arg_end + 1;
         } else {
@@ -717,43 +717,43 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
         }
     }
     
-    /* 移动到等号后面解析返回值 */
-    current = next + 1;  /* 跳过 ')' */
+    /* Parse return value after '=' */
+    current = next + 1;  /* Skip ')' */
     
-    /* 查找等号 */
+    /* Find '=' */
     next = strchr(current, '=');
     if (!next) {
-        /* 某些系统调用（如exit_group）没有返回值，但这是有效的记录 */
-        /* 跳过剩余的空白字符，检查是否到了行尾 */
+        /* Some syscalls (e.g., exit_group) have no return value; this is valid */
+        /* Skip trailing whitespace and check for end of line */
         while (*current && isspace(*current)) current++;
         if (*current == '\0') {
-            /* 没有返回值的有效系统调用，设置默认返回值 */
-            record->ret_value = 0;  /* 默认返回值为0 */
+            /* Valid syscall with no return value, use default */
+            record->ret_value = 0;
             record->has_error = 0;
-            return 1;  /* 解析成功 */
+            return 1;
         }
-        return 0;  /* 格式错误 */
+        return 0;  /* Format error */
     }
     
-    current = next + 1;  /* 跳过 '=' */
+    current = next + 1;  /* Skip '=' */
     
-    /* 跳过空白 */
+    /* Skip whitespace */
     while (*current && isspace(*current)) current++;
     if (!*current) return 0;
     
-    /* 解析返回值 */
+    /* Parse return value */
     record->ret_value = strtol(current, &next, 0);
     current = next;
     
-    /* 查找是否有错误信息 */
+    /* Check for error info */
     next = strstr(current, "errno=");
     if (next) {
         record->has_error = 1;
-        current = next + 6;  /* 跳过 "errno=" */
+        current = next + 6;  /* Skip "errno=" */
         record->error_code = strtol(current, &next, 10);
         current = next;
         
-        /* 查找错误描述 (通常在括号内) */
+        /* Find error description (usually in parentheses) */
         next = strchr(current, '(');
         if (next) {
             current = next + 1;
@@ -771,7 +771,7 @@ int rr_strace_parse_line(char *line, rr_strace_record_t *record) {
 }
 
 /**
- * 初始化strace解析器
+ * Initialize strace parser.
  */
 rr_strace_parser_t *rr_strace_parser_init(const char *filename) {
     if (!filename) return NULL;
@@ -791,19 +791,19 @@ rr_strace_parser_t *rr_strace_parser_init(const char *filename) {
 }
 
 /**
- * 加载并解析strace文件
+ * Load and parse strace file.
  */
 /**
- * @brief 加载并解析完整的 Strace 文件
+ * @brief Load and parse a complete Strace file
  * 
- * 读取指定文件，逐行解析系统调用记录。
+ * Reads the specified file and parses syscall records line by line.
  * 
- * **注意**: 
- * - 这是一个内存密集型操作，会将所有记录加载到内存中 (`parser->records`)。
- * - 解析后的记录用于 Replay 驱动。
+ * **Note**: 
+ * - Memory-intensive operation; all records are loaded into memory (`parser->records`).
+ * - Parsed records are used to drive Replay.
  * 
- * @param parser 解析器上下文 (已包含 filename)
- * @return int 0 成功, -1 失败
+ * @param parser Parser context (filename must be initialized).
+ * @return int 0 on success, -1 on failure.
  */
 int rr_strace_parser_load(rr_strace_parser_t *parser) {
     fprintf(stderr, "[FORCE_DEBUG] rr_strace_parser_load called with filename: %s\n", 
@@ -818,7 +818,7 @@ int rr_strace_parser_load(rr_strace_parser_t *parser) {
         return -1;
     }
     
-    /* 先计算记录数 */
+    /* Count records first */
     int count = 0;
     char line[1024];
     while (fgets(line, sizeof(line), file)) {
@@ -830,35 +830,35 @@ int rr_strace_parser_load(rr_strace_parser_t *parser) {
         return -1;
     }
     
-    /* 分配记录数组 */
+    /* Allocate records array */
     parser->records = malloc(count * sizeof(rr_strace_record_t));
     if (!parser->records) {
         fclose(file);
         return -1;
     }
     
-    /* 重新定位文件指针到开头 */
+    /* Rewind file to beginning */
     rewind(file);
     
-    /* 读取并解析每一行 */
+    /* Read and parse each line */
     int i = 0;
-    int skip_execve = 1;  /* 跳过第一个execve调用 */
+    int skip_execve = 1;  /* Skip first execve call */
     while (fgets(line, sizeof(line), file) && i < count) {
-        /* 移除换行符 */
+        /* Remove newline */
         size_t len = strlen(line);
         if (len > 0 && line[len-1] == '\n') {
             line[len-1] = '\0';
         }
         
-        /* 跳过execve调用，因为QEMU用户模式不执行execve */
+        /* Skip execve call, as QEMU user mode does not re-execute execve during replay */
         if (skip_execve && strstr(line, "execve(") != NULL) {
             fprintf(stderr, "[FORCE_DEBUG] Skipping execve record: %s\n", line);
             fflush(stderr);
-            skip_execve = 0;  /* 只跳过第一个execve */
+            skip_execve = 0;  /* Only skip first execve */
             continue;
         }
         
-        /* 解析当前行 */
+        /* Parse current line */
         if (rr_strace_parse_line(line, &parser->records[i])) {
             i++;
         }
@@ -876,7 +876,7 @@ int rr_strace_parser_load(rr_strace_parser_t *parser) {
 }
 
 /**
- * 获取下一条系统调用记录
+ * Get next syscall record.
  */
 rr_strace_record_t *rr_strace_parser_get_next(rr_strace_parser_t *parser) {
     if (!parser || !parser->loaded || parser->current_index >= parser->record_count) {
@@ -887,7 +887,7 @@ rr_strace_record_t *rr_strace_parser_get_next(rr_strace_parser_t *parser) {
 }
 
 /**
- * 重置解析器到开始位置
+ * Reset parser to beginning.
  */
 void rr_strace_parser_reset(rr_strace_parser_t *parser) {
     if (parser) {
@@ -896,7 +896,7 @@ void rr_strace_parser_reset(rr_strace_parser_t *parser) {
 }
 
 /**
- * 获取解析器统计信息
+ * Get parser statistics.
  */
 void rr_strace_get_stats(rr_strace_parser_t *parser, size_t *total_records, size_t *current_index) {
     if (parser && total_records && current_index) {
@@ -906,7 +906,7 @@ void rr_strace_get_stats(rr_strace_parser_t *parser, size_t *total_records, size
 }
 
 /**
- * 清理解析器资源
+ * Clean up parser resources.
  */
 void rr_strace_parser_cleanup(rr_strace_parser_t *parser) {
     if (!parser) return;
@@ -923,7 +923,7 @@ void rr_strace_parser_cleanup(rr_strace_parser_t *parser) {
 }
 
 /**
- * 打印系统调用记录(调试用)
+ * Print syscall record (for debugging).
  */
 void rr_strace_print_record(const rr_strace_record_t *record) {
     if (!record) return;

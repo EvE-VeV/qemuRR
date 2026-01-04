@@ -1,6 +1,6 @@
 /**
- * 系统调用分发优化模块
- * 使用函数指针表和ID映射替代大量字符串比较
+ * Syscall Dispatch Optimization Module
+ * Uses function pointer tables and ID mapping to replace expensive string comparisons.
  */
 
 #ifndef RR_SYSCALL_DISPATCH_H
@@ -9,7 +9,7 @@
 #include "../core/rr_framework.h"
 #include "rr_syscallparser.h"
 
-/* 系统调用类型枚举 */
+/* Syscall type enumeration */
 typedef enum {
     SYSCALL_TYPE_UNKNOWN = 0,
     SYSCALL_TYPE_FILE_IO,
@@ -22,7 +22,7 @@ typedef enum {
     SYSCALL_TYPE_MAX
 } syscall_type_t;
 
-/* 系统调用重要性级别 */
+/* Syscall importance level */
 typedef enum {
     SYSCALL_IMPORTANCE_CRITICAL = 0,
     SYSCALL_IMPORTANCE_IMPORTANT,
@@ -31,31 +31,31 @@ typedef enum {
     SYSCALL_IMPORTANCE_MAX
 } syscall_importance_t;
 
-/* 系统调用处理函数类型 */
+/* Syscall handler structure */
 typedef struct rr_syscall_handler {
     const char *name;
     int syscall_nr;
     syscall_type_t type;
     syscall_importance_t importance;
     
-    /* 处理函数指针 */
+    /* Handler function pointers */
     void (*apply_args)(rr_strace_record_t *record, abi_long *args);
     void (*apply_fd_mapping)(const char *syscall_name, abi_long *args);
     void (*post_hook)(rr_strace_record_t *record, abi_long ret, abi_long *args);
     
-    /* 标志位 */
+    /* Flags */
     bool needs_fd_mapping;
     bool needs_addr_mapping;
     bool is_fd_syscall;
 } rr_syscall_handler_t;
 
-/* 快速查找结构 */
+/* Fast lookup structure */
 typedef struct {
     int syscall_nr;
     rr_syscall_handler_t *handler;
 } syscall_lookup_entry_t;
 
-/* 公共接口 */
+/* Public interface */
 int rr_syscall_dispatch_init(void);
 void rr_syscall_dispatch_cleanup(void);
 
@@ -66,7 +66,7 @@ const char* rr_get_syscall_name_fast(int syscall_nr);
 syscall_type_t rr_get_syscall_type(int syscall_nr);
 syscall_importance_t rr_get_syscall_importance(int syscall_nr);
 
-/* 优化的处理函数 */
+/* Optimized handler functions */
 void rr_apply_syscall_args_optimized(rr_strace_record_t *record, abi_long *args);
 void rr_apply_fd_mapping_optimized(int syscall_nr, abi_long *args);
 void rr_syscall_post_hook_optimized(int syscall_nr, rr_strace_record_t *record, 
