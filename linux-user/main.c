@@ -60,6 +60,7 @@
 #ifdef CONFIG_RR_FUZZING
 #include "rr_fuzzing/core/rr_framework.h"
 #include "rr_fuzzing/core/rr_bb_trace.h"
+extern void rr_set_target_range(uint64_t start, uint64_t end);
 #endif
 
 #ifdef CONFIG_SEMIHOSTING
@@ -1043,6 +1044,12 @@ int main(int argc, char **argv, char **envp)
         exit(EXIT_FAILURE);
     }
     
+    /* 
+     * RR-Fuzz: 设置核心代码覆盖率追踪范围 
+     * 在main.c中再次设置，以确保使用的是RELOCATED之后的最终地址 (PIE兼容性)
+     */
+    rr_set_target_range(info->start_code, info->end_code);
+
     /* 设置主程序地址范围（用于BB trace过滤） */
     /* 注意：只有在BB trace已初始化时才设置过滤 */
     if (rr_bb_trace_is_enabled()) {

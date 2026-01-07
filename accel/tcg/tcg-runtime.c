@@ -31,16 +31,20 @@
 #include "exec/helper-info.c.inc"
 #undef  HELPER_H
 
-/* RR-Fuzz Integration */
-#ifdef CONFIG_USER_ONLY
-// Direct declaration to avoid include path complexity for now
+#define HELPER_H  "accel/tcg/rr_coverage_helper.h"
+#include "exec/helper-proto.h.inc"
+#include "exec/helper-info.c.inc"
+#undef  HELPER_H
+
+/* RR-Fuzz Integration: External definition in linux-user or common code */
 extern void rr_coverage_trace_edge(uint64_t cur_pc);
-#endif
 
 void HELPER(rr_coverage_trace_edge)(uint64_t cur_pc)
 {
 #ifdef CONFIG_USER_ONLY
     rr_coverage_trace_edge(cur_pc);
+#else
+    /* No-op for softmmu */
 #endif
 }
 

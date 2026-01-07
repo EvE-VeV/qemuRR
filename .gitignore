@@ -21,4 +21,5 @@ GTAGS
 *.patch
 *.gcov
 test_*
-fuzz_*
+!linux-user/rr_fuzzing/test_checkpoint.py
+!linux-user/rr_fuzzing/test_checkpoint_rotation.py
