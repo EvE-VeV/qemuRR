@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--infinite", action="store_true", help="Run indefinitely")
     parser.add_argument("--no-progress-timeout", type=int, default=300, help="Timeout if no progress (seconds)")
     parser.add_argument("--args", default="", help="Target binary arguments")
+    parser.add_argument("--tree", action="store_true", help="Enable Syscall Tree visualization (default: False)")
+    parser.add_argument("--persistence", action="store_true", help="Enable unified session persistence (Auto Save/Resume)")
     
     args = parser.parse_args()
     
@@ -36,9 +38,10 @@ def main():
             initial_trace=args.trace,
             output_dir=args.output,
             mutator=mutator,
-            enable_persistent=True,
+            use_fork_server=True,  # Internal design: high-speed fork server
+            enable_persistence=args.persistence,
             target_args=args.args,
-            enable_tree_viz=True
+            enable_tree_viz=args.tree
         )
         
         # Run Fuzzing

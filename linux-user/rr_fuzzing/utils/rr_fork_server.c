@@ -17,10 +17,18 @@
 #include <signal.h>
 #include <fnmatch.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "../core/rr_framework.h"
+#include "../core/rr_constants.h"
+#include "../fuzzing/qemu_integration/rr_coverage.h"
 #include "rr_syscall_info.h"  /* Syscall classification */
 #include "rr_dynamic_trace.h"  /* Dynamic trace API */
 #include "../replay/rr_replay_strace.h"
+#include "exec/cpu-common.h"   /* For current_cpu */
+#include "hw/core/cpu.h"       /* For CPUState */
+
+/* Manually declare queue_tb_flush to avoid header path issues */
+void queue_tb_flush(CPUState *cpu);
 
 extern FILE *g_trace_file;
 extern char *g_rr_trace_path;
@@ -115,9 +123,25 @@ int rr_start_fork_server(const char *syscall_name, const char *pattern)
     }
     
     RR_INFO("Fork server initialized, ready to receive commands in fork_server_loop()");
-    fprintf(stderr, "[DEBUG-FORK] Status sent. Returning 0\n");
+    fprintf(stderr, "[DEBUG-FORK] Status sent. Entering fork_server_loop() immediately...\n");
     fflush(stderr);
-    return 0;
+
+    /* 🔥 CRITICAL FIX: Enter Loop Immediately! */
+    int loop_ret = rr_fork_server_loop();
+    
+    if (loop_ret == 0) {
+        /* Parent Exit / Loop Finished -- Do not force exit process, let main loop decide */
+        RR_INFO("Fork Server Loop returned 0 (shutdown). Returning to emulator loop.");
+        return 0;
+    } else if (loop_ret == 2) {
+        /* Advance State */
+        RR_INFO("Fork Server Loop returned 2 (Advance). Returning to emulator loop.");
+        return 0;
+    } else {
+        /* Child Resume or Error or Quit Command */
+        RR_INFO("Fork Server Loop returned %d. Returning to emulator loop.", loop_ret);
+        return 0;
+    }
 }
 
 /**
@@ -363,16 +387,18 @@ int rr_fork_server_loop(void)
                     RR_INFO("Batch fork: %d variants", num_variants);
                     
                     /* Batch fork multiple child processes */
-                    pid_t child_pids[10] = {0};
+                    pid_t child_pids[RR_MAX_VARIANTS];
+                    memset(child_pids, 0, sizeof(child_pids));
                     
                     for (int variant_idx = 0; variant_idx < num_variants; variant_idx++) {
                         /* Load variant mutations into the global instruction array */
                         FuzzVariant *variant = &shm->variants[variant_idx];
-                        g_instruction_count = variant->instruction_count;
+                        size_t count = variant->instruction_count;
+                        if (count > RR_FUZZ_MAX_INSTRUCTIONS) count = RR_FUZZ_MAX_INSTRUCTIONS;
+                        g_instruction_count = count;
+                        
                         memcpy(g_fuzz_instructions, variant->instructions,
                                sizeof(FuzzInstruction) * g_instruction_count);
-                        
-                        RR_INFO("  Variant %d: %zu instructions", variant_idx, g_instruction_count);
                         
                         /* Fork child process */
                         pid_t pid = fork();
@@ -380,6 +406,16 @@ int rr_fork_server_loop(void)
                         if (pid == 0) {
                             /* ═══ Child Process ═══ */
                             
+                            /* 🔥 CRITICAL FIX: Rewind stdin to ensure child reads input from start */
+                            if (lseek(STDIN_FILENO, 0, SEEK_SET) == (off_t)-1) {
+                                // If stdin is a pipe, lseek might fail with ESPIPE, which is normal for pipe redirection
+                                if (errno != ESPIPE) {
+                                    fprintf(stderr, "[DEBUG-CHILD] Child: lseek(stdin) failed: %s\n", strerror(errno));
+                                }
+                            } else {
+                                fprintf(stderr, "[DEBUG-CHILD] Child: stdin rewound to 0\n");
+                            }
+
                             /* Close IPC FDs */
                             if (g_rr_framework->cmd_pipe_fd >= 0) {
                                 close(g_rr_framework->cmd_pipe_fd);
@@ -423,6 +459,16 @@ int rr_fork_server_loop(void)
                             }
 #endif
                             
+                            /* 🔥 PERFORMANCE FIX: Silence child output to avoid pipe/terminal contention */
+                            if (g_rr_debug.level < RR_DEBUG_INFO) {
+                                int devnull = open("/dev/null", O_WRONLY);
+                                if (devnull >= 0) {
+                                    dup2(devnull, STDOUT_FILENO);
+                                    dup2(devnull, STDERR_FILENO);
+                                    close(devnull);
+                                }
+                            }
+
                             RR_INFO("Child variant %d ready (PID=%d)", variant_idx, getpid());
                             return 1;  // Continue execution
                             
@@ -452,8 +498,11 @@ int rr_fork_server_loop(void)
                         
                         /* Analyze exit status */
                         int result_status = STATUS_NORMAL_EXIT;
+                        int exit_code = 0;
+                        int sig = 0;
+
                         if (WIFEXITED(status)) {
-                            int exit_code = WEXITSTATUS(status);
+                            exit_code = WEXITSTATUS(status);
                             if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
                                 result_status = STATUS_CRASH;
                                 RR_INFO("Crash: Child variant %d exited with code %d", i, exit_code);
@@ -461,7 +510,7 @@ int rr_fork_server_loop(void)
                                 result_status = STATUS_NORMAL_EXIT;
                             }
                         } else if (WIFSIGNALED(status)) {
-                            int sig = WTERMSIG(status);
+                            sig = WTERMSIG(status);
                             if (sig == SIGSEGV || sig == SIGABRT || sig == SIGBUS || 
                                 sig == SIGILL || sig == SIGFPE) {
                                 result_status = STATUS_CRASH;
@@ -472,7 +521,11 @@ int rr_fork_server_loop(void)
                         }
                         
                         /* Send status (one for each child) */
-                        rr_ipc_send_status(result_status);
+                        if (result_status == STATUS_CRASH) {
+                            rr_ipc_send_crash_status(result_status, exit_code, sig);
+                        } else {
+                            rr_ipc_send_status(result_status);
+                        }
                     }
                     
                     RR_INFO("Batch fork completed");
@@ -519,6 +572,15 @@ int rr_fork_server_loop(void)
                         if (g_rr_framework->status_pipe_fd >= 0) {
                             close(g_rr_framework->status_pipe_fd);
                             g_rr_framework->status_pipe_fd = -1;
+                        }
+                        
+                        /* 🔥 CRITICAL FIX: Rewind stdin to ensure child reads input from start */
+                        if (lseek(STDIN_FILENO, 0, SEEK_SET) == (off_t)-1) {
+                            if (errno != ESPIPE) {
+                                fprintf(stderr, "[DEBUG-CHILD] Child: lseek(stdin) failed: %s\n", strerror(errno));
+                            }
+                        } else {
+                            fprintf(stderr, "[DEBUG-CHILD] Child: stdin rewound to 0\n");
                         }
                         
                         /* 🔥 CRITICAL FIX: Child process re-opens trace file to ensure independent offset */
@@ -749,6 +811,12 @@ int rr_fork_server_loop(void)
                         g_rr_framework->replay_index = 0;  // Start replay from beginning
                         RR_INFO("✅ Baseline child: Switched to REPLAY mode for proper trace execution");
 
+                        /* 🔥 CRITICAL FIX: Flush TB cache for baseline child too */
+                        if (current_cpu) {
+                            queue_tb_flush(current_cpu);
+                            RR_INFO("✅ Baseline child: Queued TB flush to enable coverage instrumentation");
+                        }
+
                         // 🔥 Ensure replay system is correctly initialized (using absolute path)
                         if (g_rr_config.trace_file) {
                             // 🔥 Construct absolute path to ensure child process can find the file
@@ -822,6 +890,8 @@ int rr_fork_server_loop(void)
                     uint32_t depth = shm->current_depth;  // Read depth
                     uint32_t iteration_id = shm->iteration_id;  // Read iteration_id
                     int num_variants = shm->num_variants;
+                    if (num_variants <= 0) num_variants = 1;
+                    if (num_variants > RR_MAX_VARIANTS) num_variants = RR_MAX_VARIANTS;
                     
                     RR_INFO("Info: Fork command: fork_point=%u, variants=%d, depth=%u, iteration=%u",
                             fork_point, num_variants, depth, iteration_id);
@@ -852,6 +922,9 @@ int rr_fork_server_loop(void)
                         g_rr_framework->checkpoint_target = fork_point;
                         g_rr_framework->silent_replay_mode = true;
                         
+                        /* FIX: Set resume flag so we auto-execute 'C' logic when we re-enter loop at fork_point */
+                        g_rr_framework->resume_from_checkpoint = true;
+                        
                         /* Return special code 2 to signal "Advance state" */
                         return 2;
                     } else {
@@ -866,25 +939,32 @@ int rr_fork_server_loop(void)
                     }
                     
                     // Concurrent fork of all variants - dynamic multi-level fork support
-                    pid_t child_pids[10] = {0};
+                    pid_t child_pids[RR_MAX_VARIANTS];
+                    memset(child_pids, 0, sizeof(child_pids));
                     int status;
                     
                     /* Check parent strace replay state */
                     bool parent_strace_enabled = rr_strace_replay_enabled();
                     RR_INFO("🔍 DEBUG: Parent strace_replay_enabled=%d before fork", parent_strace_enabled);
                     
-                    for (int variant_idx = 0; variant_idx < num_variants && variant_idx < 10; variant_idx++) {
+                    for (int variant_idx = 0; variant_idx < num_variants; variant_idx++) {
                         FuzzVariant *variant = &shm->variants[variant_idx];
-                        g_instruction_count = variant->instruction_count;
+                        size_t count = variant->instruction_count;
+                        if (count > RR_FUZZ_MAX_INSTRUCTIONS) count = RR_FUZZ_MAX_INSTRUCTIONS;
+                        g_instruction_count = count;
+                        
                         memcpy(g_fuzz_instructions, variant->instructions,
                                sizeof(FuzzInstruction) * g_instruction_count);
-                        
-                        RR_INFO("Forking variant %d/%d (Concurrent)...", variant_idx + 1, num_variants);
                         
                         pid_t pid = fork();
                         
                         if (pid == 0) {
                             /* ═══ Child Process ═══ */
+                            
+                            
+                            fprintf(stderr, "[RR-FORK-DEBUG] Child started! PID: %d, Mode: %d, FSActive: %d\n", 
+                                    getpid(), g_rr_config.mode, g_rr_framework->fork_server_active);
+                            
                             if (g_rr_framework->cmd_pipe_fd >= 0) {
                                 close(g_rr_framework->cmd_pipe_fd);
                                 g_rr_framework->cmd_pipe_fd = -1;
@@ -1001,9 +1081,11 @@ int rr_fork_server_loop(void)
                                 
                                 RR_INFO("  → Synced file pointer by skipping %d records", seek_count);
                                 
-                                /* DO NOT reset replay_index to 0! */
-                                /* CPU and Trace File are now BOTH at fork_point */
-                                /* g_rr_framework->replay_index is inherited and correct (fork_point) */
+                                /* FORCE reset replay_index to match fork_point */
+                                /* rr_start_replay() likely resets it to 0, which mismatches CPU state */
+                                g_rr_framework->replay_index = fork_point;
+                                RR_INFO("  → Forced replay_index to %u", g_rr_framework->replay_index);
+                                fflush(stderr);
                                 
                                 g_rr_framework->silent_replay_mode = false;
                                 g_rr_framework->checkpoint_target = 0; 
@@ -1025,9 +1107,33 @@ int rr_fork_server_loop(void)
                             g_rr_framework->is_autonomous_child = true;  // Children are autonomous
                             g_rr_framework->current_iteration_id = iteration_id;
  
+                            
                             // Set to FUZZING mode for proper mutation application
                             g_rr_framework->mode = RR_MODE_FUZZING;
                             RR_INFO("✅ Child %d: Switched to FUZZING mode for mutation application", variant_idx);
+
+                            /* 🔥 PERFORMANCE FIX: Silence child output to avoid pipe/terminal contention */
+                            if (g_rr_debug.level < RR_DEBUG_INFO) {
+                                int devnull = open("/dev/null", O_WRONLY);
+                                if (devnull >= 0) {
+                                    dup2(devnull, STDOUT_FILENO);
+                                    dup2(devnull, STDERR_FILENO);
+                                    close(devnull);
+                                }
+                            }
+                            
+                            
+                            /* 🔥 CRITICAL FIX: Flush TB cache to force re-translation with coverage instrumentation.
+                             * The parent process may have generated TBs without coverage (or with different settings).
+                             * By flushing, we ensure the child generates new TBs that include calls to
+                             * rr_coverage_trace_edge, capturing execution of target code (e.g., main).
+                             */
+                            if (current_cpu) {
+                                queue_tb_flush(current_cpu);
+                                RR_INFO("✅ Child %d: Queued TB flush to enable coverage instrumentation", variant_idx);
+                            } else {
+                                RR_WARN("⚠️ Child %d: current_cpu is NULL, cannot flush TB cache!", variant_idx);
+                            }
                             
                             /* TRUE MID-POINT FORK: Child inherits complete parent state */
                             /* 

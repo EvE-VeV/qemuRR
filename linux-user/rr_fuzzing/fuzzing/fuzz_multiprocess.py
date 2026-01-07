@@ -137,6 +137,15 @@ For more information, see ARCHITECTURE_README.md
     parser.add_argument('--recipe', default=None,
                         help='Recipe file for guided mutation (requires --smart)')
     
+    # Persistence support
+    parser.add_argument('--persistence', action='store_true',
+                        help='Enable per-worker persistence (auto-save/resume)')
+    
+    # PathFinder control
+    parser.add_argument('--no-pathfinder', action='store_false', dest='pathfinder',
+                        help='Disable PathFinder (CFG guidance)')
+    parser.set_defaults(pathfinder=True)
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -182,7 +191,9 @@ For more information, see ARCHITECTURE_README.md
             sync_dir=args.sync_dir,
             mutator_type=mutator_type,
             recipe_file=args.recipe,
-            master_timeout=args.timeout
+            master_timeout=args.timeout,
+            enable_persistence=args.persistence,
+            enable_pathfinder=args.pathfinder
         )
         _fuzz_master = fuzz_master
         

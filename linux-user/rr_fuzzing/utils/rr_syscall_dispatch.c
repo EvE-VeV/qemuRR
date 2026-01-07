@@ -457,8 +457,6 @@ static bool dispatch_initialized = false;
 
 /* ==================== Public Interface Implementation ==================== */
 
-/* ==================== Public Interface Implementation ==================== */
-
 /**
  * @brief Initialize Syscall Dispatch system.
  * 
@@ -538,8 +536,6 @@ syscall_importance_t rr_get_syscall_importance(int syscall_nr) {
     rr_syscall_handler_t *handler = rr_get_syscall_handler(syscall_nr);
     return handler ? handler->importance : SYSCALL_IMPORTANCE_ENVIRONMENT;
 }
-
-/* ==================== Optimized Handler Functions ==================== */
 
 /* ==================== Optimized Handler Functions ==================== */
 
