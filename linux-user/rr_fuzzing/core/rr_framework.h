@@ -224,6 +224,9 @@ typedef struct {
     
     /* ✅ New: Mutation state delivery (fix for mutation detection) */
     bool last_syscall_mutated;          // Whether the last syscall was mutated
+
+    /* ✅ New: Cleanup safety */
+    pid_t root_pid;                     // PID of the root fuzzer process
 } rr_framework_t;
 
 /* ================= Global Variables ================= */

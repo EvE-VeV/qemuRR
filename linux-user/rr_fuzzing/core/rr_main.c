@@ -8,6 +8,7 @@
 #endif
 
 #include "rr_framework.h"
+#include "rr_bb_trace.h"
 #include "../replay/rr_replay_strace.h"
 #include "../record/rr_aux_data.h"
 #include "../utils/rr_dynamic_trace.h"
@@ -21,6 +22,9 @@
 
 /* Global framework state */
 rr_framework_t *g_rr_framework = NULL;
+
+/* Recursion guard for hooks */
+static __thread bool g_in_rr_hook = false;
 
 /* Temporary storage for mmap address mapping */
 target_ulong g_pending_mmap_recorded_addr = 0;
@@ -379,6 +383,7 @@ int rr_framework_init(void)
     /* Get running mode from configuration */
     g_rr_framework->mode = g_rr_config.mode;
     g_rr_framework->enabled = g_rr_config.enabled;  // Set enabled flag
+    g_rr_framework->root_pid = getpid();            // ✅ Record root PID for cleanup safety
 
     /* Initialize mapping manager (FD/address mapping) */
     if (rr_mapping_manager_init(RR_FD_MAPPING_BUCKETS, RR_ADDR_MAPPING_BUCKETS) < 0) {
@@ -415,11 +420,27 @@ int rr_framework_init(void)
         RR_WARN("Failed to initialize coverage tracking (non-fatal), return=%d", cov_ret);
     } else {
         RR_INFO("Coverage tracking initialized successfully");
+        // CRITICAL: Enable coverage in RECORD mode to capture initial trace execution
+        // This is where target code actually runs! REPLAY just replays syscalls.
+        if (g_rr_config.mode == RR_MODE_FUZZING || 
+            g_rr_config.mode == RR_MODE_REPLAY ||
+            g_rr_config.mode == RR_MODE_RECORD) {
+            rr_coverage_enable();
+            RR_INFO("Coverage tracking enabled for mode %d", g_rr_config.mode);
+        }
     }
 
     /* Initialize Syscall Tree Builder */
     rr_tree_init();
     RR_INFO("Syscall tree builder initialized");
+
+    /* Initialize BB trace if requested via environment */
+    const char *bb_trace_env = getenv("RR_BB_TRACE_ENABLED");
+    if (bb_trace_env && (strcmp(bb_trace_env, "1") == 0 || strcasecmp(bb_trace_env, "true") == 0)) {
+        if (rr_bb_trace_init(g_rr_config.trace_file) < 0) {
+            RR_WARN("Failed to initialize BB trace");
+        }
+    }
     
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     /* Initialize dynamic trace pipe (for tree visualization) */
@@ -560,7 +581,15 @@ void rr_framework_cleanup(void)
         return;
     }
 
-    RR_INFO("Starting RR-Fuzz framework cleanup");
+    /* ✅ Only the root process should perform cleanup (tree export, etc.)
+     * Child processes (forked) should exit silently to avoid contention 
+     * on shared resources and double-exporting the tree.
+     */
+    if (getpid() != g_rr_framework->root_pid) {
+        return;
+    }
+
+    RR_INFO("Starting RR-Fuzz framework cleanup (PID=%d)", getpid());
 
     /* Stop current mode */
     switch (g_rr_framework->mode) {
@@ -689,8 +718,13 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 {
     RR_VERBOSE("RR_DO_SYSCALL: Called for syscall %d, enabled=%d", num, rr_framework_enabled());
 
+    if (g_in_rr_hook) {
+        return -1;
+    }
+    g_in_rr_hook = true;
+
     if (!rr_framework_enabled()) {
-        RR_VERBOSE("RR_DO_SYSCALL: Framework not enabled, returning -1");
+        g_in_rr_hook = false;
         return -1; // Let caller execute original logic
     }
 
@@ -741,14 +775,7 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
 
     /* Syscall entry hint for debugging */
     const char* syscall_name = get_syscall_name(num);
-    /* RR_INFO("===============================================================");    
-    RR_INFO("=== ENTERING SYSCALL: %s (%d) === MODE: %s ===",
-            syscall_name, num,
-            g_rr_framework->mode == RR_MODE_RECORD ? "RECORD" :
-            g_rr_framework->mode == RR_MODE_REPLAY ? "REPLAY" :
-            g_rr_framework->mode == RR_MODE_FUZZING ? "FUZZING" : "UNKNOWN"); */
-
-    /* Exit syscalls need results recorded, but still executed by host */
+    
     if (num == 231 || num == 60) {
         /* RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num); */
         if (g_rr_framework->mode == RR_MODE_RECORD) {
@@ -850,7 +877,8 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
     /* Syscall exit hint for debugging */
     RR_INFO("=== EXITING SYSCALL: %s (%d) === RETURN: %d ===",
             syscall_name, num, (int)ret);
-    RR_INFO("===============================================================");
+    
+    g_in_rr_hook = false;
     return ret;
 }
 
@@ -929,9 +957,15 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                           abi_long arg5, abi_long arg6, abi_long arg7, abi_long arg8)
 {
     RR_VERBOSE("POST_HOOK: syscall=%d, ret=%ld", num, (long)ret);
+    
+    if (g_in_rr_hook) {
+        return; // Already in hook
+    }
+    g_in_rr_hook = true;
+
     if (!rr_framework_enabled()) {
         RR_VERBOSE("POST_HOOK: Skipping syscall %d - framework not enabled", num);
-        return;
+        goto cleanup;
     }
 
     /* Record syscall node to tree structure */
@@ -971,6 +1005,18 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
             was_mutated                              /* is_mutated flag */
         );
 
+        /* ✅ Attach Basic Block Trace to Syscall Node */
+        if (rr_bb_trace_is_enabled()) {
+            uint64_t bbs[128];
+            uint32_t count = rr_bb_trace_get_current_buffer(bbs, 128);
+            if (count > 0) {
+                // Attach to tree node
+                rr_tree_set_node_bbs(node_id, bbs, count);
+                // Flush buffer to ensure next syscall gets fresh BBs
+                rr_bb_trace_flush();
+            }
+        }
+
         /* Detect fork syscall and record fork relation */
         if ((num == 56 || num == 57 || num == 58) && ret > 0) {  // clone/fork/vfork
             rr_tree_add_fork_relation(node_id, (uint32_t)ret);
@@ -990,7 +1036,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
         } else {
             RR_ERROR("POST_HOOK: Failed to record syscall %d (result=%d)", num, record_result);
         }
-        return;
+        goto cleanup;
     }
     
     if (g_rr_framework->mode == RR_MODE_REPLAY || g_rr_framework->mode == RR_MODE_FUZZING) {
@@ -1137,7 +1183,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
 
                 rr_record_dispose(record);
             }
-            return;
+            goto cleanup;
         }
 
         if (
@@ -1164,6 +1210,9 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                                        g_rr_framework->replay_index - 1, false);  // -1 because it's already incremented
         
         RR_VERBOSE("POST_HOOK: Replay mode, syscall=%d, ret=%d", num, (int)ret);
-        return;
+        goto cleanup;
     }
+
+cleanup:
+    g_in_rr_hook = false;
 }

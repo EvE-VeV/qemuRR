@@ -12,8 +12,8 @@
 
 /* Global debug configuration */
 rr_debug_config_t g_rr_debug = {
-    .level = RR_DEBUG_INFO,          // Default level: INFO
-    .log_file = NULL                 // Default output: stderr
+    .level = RR_DEBUG_WARN,           // Default level: WARN (optimized for performance)
+    .log_file = NULL                  // Default output: stderr
 };
 
 /**

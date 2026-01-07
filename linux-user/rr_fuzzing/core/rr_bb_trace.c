@@ -139,9 +139,11 @@ void rr_bb_trace_log(uint64_t pc)
     }
     
     if (g_bb_trace->filter_enabled) {
-        /* Skip library function basic blocks */
-        g_bb_trace->filtered_bbs++;
-        return;
+        if (pc < g_bb_trace->main_start || pc >= g_bb_trace->main_end) {
+            /* Skip library function basic blocks */
+            g_bb_trace->filtered_bbs++;
+            return;
+        }
     }
     
     /* Check if buffer is full */
@@ -244,6 +246,24 @@ void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code)
     if (!g_bb_trace) return;
     g_bb_trace->main_start = start_code;
     g_bb_trace->main_end = end_code;
+}
+
+uint32_t rr_bb_trace_get_current_buffer(uint64_t *out_buffer, uint32_t max_count)
+{
+    if (!g_bb_trace || g_bb_trace->buffer_pos == 0) {
+        return 0;
+    }
+
+    uint32_t count = g_bb_trace->buffer_pos;
+    if (count > max_count) {
+        count = max_count;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        out_buffer[i] = g_bb_trace->buffer[i].pc;
+    }
+
+    return count;
 }
 
 void rr_bb_trace_set_filter(bool enabled)

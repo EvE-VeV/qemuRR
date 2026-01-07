@@ -82,7 +82,7 @@ class QEMUExecutor:
     _coverage_shm_lock = threading.Lock()
     _coverage_env_value = "rr_coverage_global"
     
-    def __init__(self, qemu_path: str, target_binary: str, timeout: float = 30.0, target_args: str = "", persistent_mode: bool = True):
+    def __init__(self, qemu_path: str, target_binary: str, timeout: float = 30.0, target_args: str = "", persistent_mode: bool = True, log_file: Optional[str] = None):
         """
         Initialize QEMU Executor
         
@@ -98,6 +98,7 @@ class QEMUExecutor:
         self.timeout = timeout
         self.target_args = target_args
         self.persistent_mode = persistent_mode
+        self.log_file = log_file
         
         # IPC components (initialized per execution)
         self.cmd_pipe_read = None
@@ -111,22 +112,28 @@ class QEMUExecutor:
         self.qemu_pid: Optional[int] = None
         self._qemu_ready = False  # Track if QEMU is in fork server loop
         self._trace_file = None   # Remember trace file for persistent mode
+        self._last_fork_point = -1 # Track last fork point for reuse optimization
+        
+        self._init_stats()
+        
+    @property
+    def process(self) -> Optional[subprocess.Popen]:
+        """Expose QEMU process object for monitoring (Read-only)"""
+        return self.qemu_process
         
         # Statistics
-        self.total_executions = 0
-        self.total_crashes = 0
-        self.total_timeouts = 0
-        self._ipc_fallback_dir = Path(
-            os.environ.get("RR_SHM_FALLBACK_DIR") or (Path.cwd() / ".rr_shm_fallback")
-        )
-        
-        # Initialize shared coverage bitmap (once for all executors)
-        self._init_shared_coverage()
-        
-        print(f"[QEMUExecutor] Initialized")
-        print(f"  QEMU: {qemu_path}")
-        print(f"  Target: {target_binary}")
-        print(f"  Timeout: {timeout}s")
+    def _init_stats(self):
+         self.total_executions = 0
+         self.total_crashes = 0
+         self.total_timeouts = 0
+         self._ipc_fallback_dir = Path(
+             os.environ.get("RR_SHM_FALLBACK_DIR") or (Path.cwd() / ".rr_shm_fallback")
+         )
+         
+         # Initialize shared coverage bitmap (once for all executors)
+         self._init_shared_coverage()
+         
+         alog(f"Initialized (QEMU={self.qemu_path}, Target={self.target_binary})", "EXEC", "INFO")
     
     class _FileBackedSharedMemory:
         """Minimal wrapper to mimic multiprocessing.SharedMemory API"""
@@ -137,7 +144,7 @@ class QEMUExecutor:
             os.ftruncate(self.fd, size)
             self._mmap = mmap.mmap(self.fd, size)
             self.buf = memoryview(self._mmap)
-            print(f"[QEMUExecutor] Created file-backed coverage bitmap at {self.path}")
+            alog(f"Created file-backed coverage bitmap at {self.path}", "EXEC", "INFO")
         
         def close(self):
             try:
@@ -167,37 +174,42 @@ class QEMUExecutor:
                 try:
                     from multiprocessing import shared_memory
                     
+                    # Use a unique name per process to avoid multi-worker collision
+                    # Logic: Logical coverage is global (mp.Array), but QEMU's raw SHM 
+                    # must be isolated to allow per-execution reset without cross-process interference.
+                    shm_name = f"rr_coverage_{os.getpid()}"
+                    
                     # Try to create or open existing shared memory
                     try:
                         cls._shared_coverage_shm = shared_memory.SharedMemory(
-                            name="rr_coverage_global",
+                            name=shm_name,
                             create=True,
-                            size=64 * 1024
+                            size=69672  # sizeof(rr_coverage_t)
                         )
                         # Initialize to zeros
-                        cls._shared_coverage_shm.buf[:] = bytes(64 * 1024)
-                        print("[QEMUExecutor] Created shared coverage bitmap (/dev/shm/rr_coverage_global)")
+                        cls._shared_coverage_shm.buf[:] = bytes(69672)
+                        alog(f"Created isolated coverage SHM ({shm_name})", "EXEC", "INFO")
                     except FileExistsError:
                         # Already exists, just open it
                         cls._shared_coverage_shm = shared_memory.SharedMemory(
-                            name="rr_coverage_global",
+                            name=shm_name,
                             create=False,
-                            size=64 * 1024
+                            size=69672
                         )
-                        print("[QEMUExecutor] Opened existing shared coverage bitmap")
-                    cls._coverage_env_value = "rr_coverage_global"
+                        alog(f"Opened existing isolated coverage SHM ({shm_name})", "EXEC", "INFO")
+                    cls._coverage_env_value = shm_name
                 except PermissionError as e:
-                    print(f"[QEMUExecutor] ⚠️  SharedMemory permission error: {e}")
+                    alog(f"⚠️  SharedMemory permission error: {e}", "EXEC", "WARN")
                     fallback_path = cls._coverage_fallback_path()
                     cls._shared_coverage_shm = cls._FileBackedSharedMemory(
-                        fallback_path, 64 * 1024
+                        fallback_path, 64 * 1024 + 4096
                     )
                     cls._coverage_env_value = f"file:{fallback_path}"
                 except Exception as e:
-                    print(f"[QEMUExecutor] ⚠️  Failed to create shared coverage: {e}")
+                    alog(f"⚠️  Failed to create shared coverage: {e}", "EXEC", "WARN")
                     fallback_path = cls._coverage_fallback_path()
                     cls._shared_coverage_shm = cls._FileBackedSharedMemory(
-                        fallback_path, 64 * 1024
+                        fallback_path, 69672
                     )
                     cls._coverage_env_value = f"file:{fallback_path}"
     
@@ -206,11 +218,19 @@ class QEMUExecutor:
         """Reset shared coverage bitmap to zeros (call before each execution)"""
         if cls._shared_coverage_shm is not None:
             try:
-                # Clear the entire bitmap
-                cls._shared_coverage_shm.buf[:] = bytes(64 * 1024)
-                return True
+                # 🔥 FIX: Preserve the first byte (enabled flag)
+                # Structure: [enabled(1)] [coverage_map(64K)]
+                # The map starts at offset 1 or 4 depending on alignment, but we clear from 1 to end to be safe/simple.
+                # However, strict slice assignment requires equal sizes.
+                
+                # Check actual buffer size
+                buf_len = len(cls._shared_coverage_shm.buf)
+                if buf_len > 1:
+                    # Create a zero-filled bytes object of the exact needed length
+                    reset_len = buf_len - 1
+                    cls._shared_coverage_shm.buf[1:] = bytes(reset_len)
             except Exception as e:
-                print(f"[QEMUExecutor] ⚠️  Failed to reset coverage: {e}")
+                alog(f"⚠️ Failed to reset coverage SHM: {e}", "EXEC", "WARN")
                 return False
         return False
     
@@ -220,11 +240,17 @@ class QEMUExecutor:
         with cls._coverage_shm_lock:
             if cls._shared_coverage_shm is not None:
                 try:
+                    # ✅ FIX: Avoid KeyError in resource_tracker by not calling unlink 
+                    # if the tracker has already marked it for deletion or it's gone.
                     cls._shared_coverage_shm.close()
                     if hasattr(cls._shared_coverage_shm, "unlink"):
-                        cls._shared_coverage_shm.unlink()
-                    print("[QEMUExecutor] Cleaned up shared coverage bitmap")
-                except:
+                        try:
+                            cls._shared_coverage_shm.unlink()
+                        except (FileNotFoundError, KeyError, Exception):
+                            # Silently ignore cleanup errors to avoid resource_tracker noise
+                            pass
+                    # alog("Cleaned up isolated coverage SHM", "EXEC", "INFO")
+                except Exception:
                     pass
                 finally:
                     cls._shared_coverage_shm = None
@@ -260,7 +286,7 @@ class QEMUExecutor:
             self.status_pipe_write = TARGET_FD_BASE + 3
             
         except Exception as e:
-            print(f"[QEMUExecutor] ⚠️ Failed to relocate FDs, falling back to default: {e}")
+            alog(f"⚠️ Failed to relocate FDs, falling back to default: {e}", "EXEC", "WARN")
             self.cmd_pipe_read = r1
             self.cmd_pipe_write = w1
             self.status_pipe_read = r2
@@ -281,7 +307,7 @@ class QEMUExecutor:
             return
         
         try:
-            print("[QEMUExecutor] 🛑 Stopping persistent QEMU fork server...")
+            alog("🛑 Stopping persistent QEMU fork server...", "EXEC", "INFO")
             # Send 'Q' command to quit
             if self.cmd_pipe_write is not None:
                 os.write(self.cmd_pipe_write, b'Q')
@@ -290,12 +316,12 @@ class QEMUExecutor:
             if self.qemu_process:
                 try:
                     self.qemu_process.wait(timeout=2.0)
-                    print("[QEMUExecutor] Fork server exited gracefully")
+                    alog("Fork server exited gracefully", "EXEC", "INFO")
                 except subprocess.TimeoutExpired:
-                    print("[QEMUExecutor] ⚠️  Fork server didn't exit, killing...")
+                    alog("⚠️  Fork server didn't exit, killing...", "EXEC", "WARN")
                     self._terminate_qemu()
         except Exception as e:
-            print(f"[QEMUExecutor] ⚠️  Error stopping fork server: {e}")
+            alog(f"⚠️  Error stopping fork server: {e}", "EXEC", "ERROR")
             self._terminate_qemu()
         finally:
             self._qemu_ready = False
@@ -324,7 +350,7 @@ class QEMUExecutor:
                 pass
             finally:
                 if shm_descriptor:
-                    print(f"[Conductor] Cleaned IPC shared memory: {shm_descriptor}")
+                    alog(f"Cleaned IPC shared memory: {shm_descriptor}", "EXEC", "INFO")
                 self.shm = None
         
         # Reset pipe descriptors
@@ -349,7 +375,7 @@ class QEMUExecutor:
         # QEMU may hang if RR_TRACE_PIPE is set but no visualizer is reading.
         # This prevents deadlock by ensuring we only pass it if active.
         if 'RR_TRACE_PIPE' in env:
-             print(f"[QEMUExecutor] RR_TRACE_PIPE active: {env['RR_TRACE_PIPE']}")
+             alog(f"RR_TRACE_PIPE active: {env['RR_TRACE_PIPE']}", "EXEC", "DEBUG")
              # print("[QEMUExecutor] 🛑 为了防止 QEMU 启动死锁（阻塞式打开），正在移除该变量")
              # del env['RR_TRACE_PIPE']
         
@@ -368,12 +394,17 @@ class QEMUExecutor:
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
             'RR_DEBUG_LEVEL': os.environ.get('RR_DEBUG_LEVEL', '1'),
+            'RR_BB_TRACE_ENABLED': '1', # Enable BB trace for PathFinder
         })
         
         if 'RR_TREE_OUTPUT' in env:
-            print(f"[QEMUExecutor] 🌲 Env OK: RR_TREE_OUTPUT={env['RR_TREE_OUTPUT']}")
+            alog(f"🌲 Env OK: RR_TREE_OUTPUT={env['RR_TREE_OUTPUT']}", "EXEC", "DEBUG")
         else:
-            print(f"[QEMUExecutor] ❌ Env MISSING: RR_TREE_OUTPUT not found!")
+            # Set default path to prevent C-side crash/error
+            import tempfile
+            default_tree = Path(tempfile.gettempdir()) / f"syscall_tree_{os.getpid()}_{self.total_executions}.html"
+            env['RR_TREE_OUTPUT'] = str(default_tree)
+            alog(f"⚠️ Env MISSING: RR_TREE_OUTPUT not found! Defaults to {default_tree}", "EXEC", "WARN")
         
         cmd = [self.qemu_path, self.target_binary]
         if self.target_args:
@@ -387,15 +418,33 @@ class QEMUExecutor:
         child_status_pipe = self.status_pipe_write
         
         try:
-            # ✅ FIX: 允许QEMU输出显示（用于调试和验证RR-Fuzz功能）
-            # 在生产环境中可以改回DEVNULL以减少输出
+            # ✅ FIX: Redirect output to log file if configured, otherwise inherit stdout (visible in terminal)
+            stdout_dest = None
+            stderr_dest = None
+            self._log_file_handle = None
+
+            if self.log_file:
+                try:
+                    # Open in append mode
+                    self._log_file_handle = open(self.log_file, "a")
+                    stdout_dest = self._log_file_handle
+                    stderr_dest = self._log_file_handle
+                    alog(f"📝 Redirecting QEMU output to {self.log_file}", "EXEC", "INFO")
+                except Exception as e:
+                    alog(f"⚠️ Failed to open log file {self.log_file}: {e}. Falling back to terminal.", "EXEC", "WARN")
+
             self.qemu_process = subprocess.Popen(
                 cmd,
                 env=env,
                 pass_fds=[child_cmd_pipe, child_status_pipe],
-                stdout=None,  # 继承父进程的stdout，显示QEMU输出
-                stderr=None   # 继承父进程的stderr
+                stdout=stdout_dest,
+                stderr=stderr_dest
             )
+            
+            # Close file handle in parent process immediately (Popen has enabled it for child)
+            if self._log_file_handle:
+                self._log_file_handle.close()
+                self._log_file_handle = None
             
             self.qemu_pid = self.qemu_process.pid
             
@@ -431,7 +480,7 @@ class QEMUExecutor:
                   For non-crash statuses: (status, None, None)
                   For crashes: (STATUS_CRASH, exit_code, signal_number)
 
-        🔥 性能优化: 降低select timeout减少等待时间
+        # Performance optimization: reduce select timeout to minimize wait time
         """
         start_time = time.time()
 
@@ -443,9 +492,27 @@ class QEMUExecutor:
             ready, _, _ = select.select([self.status_pipe_read], [], [], select_timeout)
 
             if ready:
-                # 先读取status (4字节)
-                status_bytes = os.read(self.status_pipe_read, 4)
-                print(f"[DEBUG-PIPE] Read {len(status_bytes)} bytes: {status_bytes.hex() if status_bytes else 'None'}")
+                # Read status (4 bytes)
+                try:
+                    status_bytes = os.read(self.status_pipe_read, 4)
+                except OSError:
+                    status_bytes = b''
+
+                if not status_bytes:
+                    # Pipe closed (EOF), process likely exited
+                    if self.qemu_process:
+                         # Wait briefly for process to update status
+                         try:
+                             self.qemu_process.wait(timeout=0.1)
+                         except:
+                             pass
+                         
+                         if self.qemu_process.poll() is not None:
+                             exit_code = self.qemu_process.returncode
+                             alog(f"❌ QEMU Process Exited Unexpectedly with Code: {exit_code}", "EXEC", "ERROR")
+                             return None
+                    return None
+                    
                 if len(status_bytes) == 4:
                     status = struct.unpack('i', status_bytes)[0]
                     
@@ -457,18 +524,28 @@ class QEMUExecutor:
                                 exit_code, signal_number = struct.unpack('ii', extra_bytes)
                                 return (status, exit_code, signal_number)
                             else:
-                                print(f"[QEMUExecutor] ⚠️ Incomplete crash data: {len(extra_bytes)} bytes")
+                                alog(f"⚠️ Incomplete crash data: {len(extra_bytes)} bytes", "EXEC", "WARN")
                                 return (status, None, None)
                         except Exception as e:
-                            print(f"[QEMUExecutor] ⚠️ Failed to read crash details: {e}")
+                            alog(f"⚠️ Failed to read crash details: {e}", "EXEC", "ERROR")
                             return (status, None, None)
                     else:
-                        # 非崩溃状态，不需要额外数据
+                        # Non-crash status, no extra data needed
                         return (status, None, None)
 
             # Check if process is still alive
             if self.qemu_process and self.qemu_process.poll() is not None:
                 # Process exited unexpectedly
+                exit_code = self.qemu_process.returncode
+                alog(f"❌ QEMU Process Exited Unexpectedly with Code: {exit_code}", "EXEC", "ERROR")
+                # Try to read stderr if available
+                if self.qemu_process.stderr:
+                   try:
+                       err_out = self.qemu_process.stderr.read()
+                       if err_out:
+                           print(f"[QEMUExecutor] 📜 Last Stderr: {err_out.decode('utf-8', errors='replace')}")
+                   except:
+                       pass
                 return None
 
         return None  # Timeout
@@ -487,18 +564,15 @@ class QEMUExecutor:
         # Try shared coverage first (new AFL-style approach)
         if self._shared_coverage_shm is not None:
             try:
-                coverage_bitmap = bytes(self._shared_coverage_shm.buf[:])
-
-                # 🔥 DEBUG: Check if we're reading non-zero data
-                non_zero = sum(1 for b in coverage_bitmap if b != 0)
-                if non_zero > 0:
-                    print(f"[QEMUExecutor] Coverage read: {non_zero} non-zero bytes")
-                else:
-                    print(f"[QEMUExecutor] ⚠️  Coverage read: ALL ZEROS!")
+                # 🔥 FIX: Slice exactly 64KB starting from offset 1 (skipping 'enabled' byte)
+                # Structure: [enabled(1)] [coverage_map(64K)]
+                start_offset = 1
+                map_size = 64 * 1024
+                coverage_bitmap = bytes(self._shared_coverage_shm.buf[start_offset : start_offset + map_size])
 
                 return coverage_bitmap
             except Exception as e:
-                print(f"[QEMUExecutor] ⚠️  Failed to read shared coverage: {e}")
+                alog(f"⚠️  Failed to read shared coverage: {e}", "EXEC", "WARN")
                 # Fall through to legacy file-based approach
         
         # Fallback: Legacy file-based approach (for compatibility with old QEMU)
@@ -532,7 +606,7 @@ class QEMUExecutor:
             
             non_zero_count = sum(1 for b in coverage_bitmap if b != 0)
             if non_zero_count > 0:
-                print(f"[QEMUExecutor] ✅ Read coverage: {non_zero_count} non-zero bytes from {latest_file}")
+                alog(f"✅ Read coverage: {non_zero_count} non-zero bytes from {latest_file}", "EXEC", "INFO")
             
             return bytes(coverage_bitmap)
         except FileNotFoundError:
@@ -554,9 +628,9 @@ class QEMUExecutor:
                 # Clear all bytes in the coverage bitmap
                 for i in range(len(self._shared_coverage_shm.buf)):
                     self._shared_coverage_shm.buf[i] = 0
-                print(f"[QEMUExecutor] ✅ Coverage bitmap reset (cleared {len(self._shared_coverage_shm.buf)} bytes)")
+                alog(f"✅ Coverage bitmap reset (cleared {len(self._shared_coverage_shm.buf)} bytes)", "EXEC", "DEBUG")
             except Exception as e:
-                print(f"[QEMUExecutor] ⚠️  Failed to reset coverage: {e}")
+                alog(f"⚠️  Failed to reset coverage: {e}", "EXEC", "WARN")
     
     def execute_baseline(self, trace_file: str, iteration_id: int = 0) -> ExecutionResult:
         """
@@ -573,14 +647,14 @@ class QEMUExecutor:
             ExecutionResult: Execution result with status
         """
         start_time = time.time()
-        print(f"[QEMUExecutor] 📜 Executing baseline trace (iteration {iteration_id})...")
+        alog(f"📜 Executing baseline trace (iteration {iteration_id})...", "EXEC", "INFO")
         
         try:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # PHASE 1: Initialize QEMU (if not ready)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if not self._qemu_ready:
-                print("[QEMUExecutor] 🚀 Starting persistent QEMU fork server for baseline...")
+                alog("🚀 Starting persistent QEMU fork server for baseline...", "EXEC", "INFO")
                 
                 # Setup IPC
                 self._setup_ipc()
@@ -598,7 +672,7 @@ class QEMUExecutor:
                     raise RuntimeError(f"QEMU startup failed (status={status})")
                 
                 self._qemu_ready = True
-                print("[QEMUExecutor] QEMU fork server ready for baseline")
+                alog("QEMU fork server ready for baseline", "EXEC", "DEBUG")
             else:
                 # Write iteration_id to shared memory
                 self.shm.write_fork_request(fork_point=0, mutation_variants=[[]], depth=0, iteration_id=iteration_id)
@@ -606,7 +680,7 @@ class QEMUExecutor:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # PHASE 2: Send baseline execution command ('E')
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            print(f"[QEMUExecutor] 📤 Sending 'E' (baseline execution) command...")
+            alog("📤 Sending 'E' (baseline execution) command...", "EXEC", "DEBUG")
             os.write(self.cmd_pipe_write, b'E')
             
             # Wait for execution to complete
@@ -615,7 +689,7 @@ class QEMUExecutor:
             execution_time = time.time() - start_time
             
             if status == 0:  # Success
-                print(f"[QEMUExecutor] Baseline execution completed ({execution_time:.3f}s)")
+                alog(f"Baseline execution completed ({execution_time:.3f}s)", "EXEC", "INFO")
                 return ExecutionResult(
                     status=STATUS_NORMAL_EXIT,
                     status_name="NORMAL",
@@ -623,7 +697,7 @@ class QEMUExecutor:
                     execution_time=execution_time
                 )
             else:
-                print(f"[QEMUExecutor] ⚠️ Baseline execution failed (status={status})")
+                alog(f"⚠️ Baseline execution failed (status={status})", "EXEC", "WARN")
                 return ExecutionResult(
                     status=-1,
                     status_name="ERROR",
@@ -633,7 +707,7 @@ class QEMUExecutor:
         
         except Exception as e:
             execution_time = time.time() - start_time
-            print(f"[QEMUExecutor] ❌ Baseline execution exception: {e}")
+            alog(f"❌ Baseline execution exception: {e}", "EXEC", "ERROR")
             import traceback
             traceback.print_exc()
             return ExecutionResult(
@@ -725,7 +799,7 @@ class QEMUExecutor:
             # PHASE 1: Initialize QEMU (first time only)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if not self._qemu_ready:
-                print("[QEMUExecutor] 🚀 Starting persistent QEMU fork server...")
+                alog("🚀 Starting persistent QEMU fork server...", "EXEC", "INFO")
                 
                 # Setup IPC
                 self._setup_ipc()
@@ -738,9 +812,9 @@ class QEMUExecutor:
                 self._trace_file = trace_file
                 
                 # Wait for initial READY status
-                status = self._wait_for_status(timeout=20.0)
-                if status != STATUS_READY:
-                    print(f"[DEBUG-EXEC] ❌ QEMU init failed (status={status}), setting _qemu_ready=False")
+                status_data = self._wait_for_status(timeout=20.0)
+                if status_data is None or status_data[0] != STATUS_READY:
+                    alog(f"❌ QEMU init failed (data={status_data}), setting _qemu_ready=False", "EXEC", "ERROR")
                     self._qemu_ready = False
                     return ExecutionResult(
                         status=STATUS_OTHER_SIGNAL,
@@ -769,9 +843,9 @@ class QEMUExecutor:
             os.write(self.cmd_pipe_write, b'F')
             
             # Step 6: Wait for execution result
-            status = self._wait_for_status(timeout=self.timeout)
+            status_data = self._wait_for_status(timeout=self.timeout)
             
-            if status is None:
+            if status_data is None:
                 # Timeout or unexpected exit
                 self.total_timeouts += 1
                 self._terminate_qemu()
@@ -786,14 +860,21 @@ class QEMUExecutor:
             # Step 7: Read coverage
             coverage_bitmap = self._read_coverage()
             
-            # Step 8: Determine status name
+            # Step 8: Unpack status and crash details
+            status, exit_code, signal_number = status_data
+            
+            # Step 9: Determine status name
             status_map = {
                 STATUS_NORMAL_EXIT: "normal_exit",
                 STATUS_CRASH: "crash",
                 STATUS_OTHER_SIGNAL: "signal",
                 STATUS_AT_FORK_POINT: "fork_point_ready"  # Fork server waiting for next command
             }
-            status_name = status_map.get(status, f"unknown_{status}")
+            # Ensure STATUS_NORMAL_EXIT (3) is explicitly handled
+            if status == 3:
+                status_name = "normal_exit"
+            else:
+                status_name = status_map.get(status, f"unknown_{status}")
             
             if status == STATUS_CRASH:
                 self.total_crashes += 1
@@ -801,11 +882,13 @@ class QEMUExecutor:
             # In persistent mode, fork server returns AT_FORK_POINT (2) after execution.
             if status == STATUS_AT_FORK_POINT:
                 # Fork server is ready for next command
-                exit_code = None
+                pass
             else:
                 # Abnormal termination, wait for exit
                 try:
-                    exit_code = self.qemu_process.wait(timeout=1.0)
+                    exit_code_wait = self.qemu_process.wait(timeout=1.0)
+                    if exit_code is None:
+                        exit_code = exit_code_wait
                 except subprocess.TimeoutExpired:
                     print(f"[DEBUG-EXEC] ⏱️ QEMU wait timeout after abnormal exit, setting _qemu_ready=False")
                     self._terminate_qemu()
@@ -846,40 +929,66 @@ class QEMUExecutor:
                     depth: int = 0,
                     iteration_id: int = 0) -> List[ExecutionResult]:
         """
-        统一的fork执行方法（替代所有旧方法）
+        Unified fork execution method (replaces all legacy methods)
         
         Args:
-            trace_file: Trace文件路径
-            fork_point: Fork点（0=从头，N=mid-point）
-            mutation_variants: Mutation列表（None=单次执行）
-            depth: Fork深度
-            iteration_id: Iteration编号
+            trace_file: Path to trace file
+            fork_point: Fork point (0=start, N=mid-point)
+            mutation_variants: Mutation variants list (None=single execution)
+            depth: Fork depth
+            iteration_id: Iteration ID
         
         Returns:
-            执行结果列表
+            List of execution results
         
-        场景映射:
-            - 旧execute(): fork(fork_point=0, variants=[[inst1,inst2]], depth=0)
-            - 旧execute_batch(): fork(fork_point=0, variants=[v1,v2,v3], depth=0)
-            - 旧execute_batch_at_checkpoint(): fork(fork_point=N, variants=[v1,v2,v3], depth=0)
-            - 嵌套fork: fork(fork_point=N, variants=[v1,v2,v3], depth=1)
+        Scenario Mapping:
+            - Legacy execute(): fork(fork_point=0, variants=[[inst1,inst2]], depth=0)
+            - Legacy execute_batch(): fork(fork_point=0, variants=[v1,v2,v3], depth=0)
+            - Legacy execute_batch_at_checkpoint(): fork(fork_point=N, variants=[v1,v2,v3], depth=0)
+            - Nested fork: fork(fork_point=N, variants=[v1,v2,v3], depth=1)
         """
         start_time = time.time()
         
-        # 初始化fork server（如果未初始化）
+        # 🔥 CRITICAL FIX: Each fork execution MUST use a fresh QEMU process
+        # 
+        # Problem: QEMU's CPU/memory state cannot be "rewound". After processing
+        # one fork command (e.g., fork_point=10), the Parent's replay_index has
+        # advanced. A subsequent fork command with fork_point=34 cannot work
+        # because QEMU cannot go back to replay_index=0 and replay to 34.
+        #
+        # Solution: Always start a fresh QEMU process for each execute_fork call.
+        # This ensures clean state and proper trace replay from the beginning.
+        #
+        # Performance Note: This is slower than true persistent mode, but correct.
+        # For high performance, use multi-process mode instead.
+        if self._qemu_ready:
+            # ✅ OPTIMIZATION: Reuse QEMU if fork_point matches
+            if self._last_fork_point == fork_point:
+                 # alog(f"♻️ Reusing QEMU at fork_point={fork_point}", "EXEC", "DEBUG")
+                 pass
+            else:
+                print(f"[QEMUExecutor] 🔄 Restarting QEMU for fresh fork state (fork_point={fork_point}, depth={depth})")
+                # Use stop_persistent_qemu instead of _terminate_qemu to properly cleanup IPC
+                self.stop_persistent_qemu()
+                print(f"[QEMUExecutor] 🔄 After stop: _qemu_ready={self._qemu_ready}")
+        
+        # Initialize fork server (if not already initialized)
         if not self._qemu_ready:
+            print(f"[QEMUExecutor] 🚀 Starting fresh QEMU (fork_point={fork_point}, depth={depth})")
             # If not persistent mode, we might need to restart, but here we just start if needed
             self._setup_ipc()
-            # 不需要写入共享内存，QEMU启动时会等待第一个命令
+            # No need to write to shared memory, QEMU will wait for first command on start
             # self.shm.write_fork_request(fork_point=0, mutation_variants=[[]], depth=0)
             self._fork_qemu(trace_file)
             self._trace_file = trace_file
             
+            print(f"[QEMUExecutor] ⏳ Waiting for READY status...")
             status_data = self._wait_for_status(timeout=20.0)
             if status_data is None or status_data[0] != STATUS_READY:
                 print(f"[DEBUG-EXEC] ❌ QEMU init failed (data={status_data})")
                 raise RuntimeError("QEMU init failed")
             
+            print(f"[QEMUExecutor] ✅ QEMU ready!")
             # 不需要发送'F'命令，QEMU已经在fork server loop中等待
             # os.write(self.cmd_pipe_write, b'F')
             # time.sleep(0.1)
@@ -888,10 +997,10 @@ class QEMUExecutor:
         if mutation_variants is None:
             mutation_variants = [[]]
         
-        # Coverage accumulation policy: Do NOT reset shared coverage
-        # QEMUExecutor.reset_shared_coverage()
+        # Coverage accumulation policy: Reset shared coverage for each iteration to get accurate delta
+        QEMUExecutor.reset_shared_coverage()
         
-        # 写入fork请求到共享内存
+        # Write fork request to shared memory
         self.shm.write_fork_request(
             fork_point=fork_point,
             mutation_variants=mutation_variants,
@@ -899,12 +1008,15 @@ class QEMUExecutor:
             iteration_id=iteration_id
         )
         
-        # 发送统一命令：'C'
+        # Update last fork point
+        self._last_fork_point = fork_point
+        
+        # Send unified command: 'C'
         print(f"[QEMUExecutor] Sending 'C' command (fork_point={fork_point}, "
               f"variants={len(mutation_variants)}, depth={depth}, iteration={iteration_id})")
         os.write(self.cmd_pipe_write, b'C')
         
-        # 收集结果
+        # Collect results
         results = []
         extended_timeout = self.timeout * len(mutation_variants)
         
@@ -912,21 +1024,35 @@ class QEMUExecutor:
             result_data = self._wait_for_status(timeout=extended_timeout)
             
             if result_data is None:
-                # ...
-                continue
+                if self.qemu_process and self.qemu_process.returncode == 0:
+                     print(f"[QEMUExecutor] ℹ️  QEMU Exited Cleanly (Execution Finished due to Early Exit in Mutation)")
+                else:
+                     print(f"[QEMUExecutor] ❌ QEMU disconnected unexpectedly (EOF), setting _qemu_ready=False")
+                
+                self._qemu_ready = False
+                # Try to restart QEMU to salvage subsequent iterations
+                self._terminate_qemu()
+                break
             
             # Unpack status and crash details
             status, exit_code, signal_number = result_data
             
-            # 读取coverage
+            # Read coverage
             coverage_bitmap = self._read_coverage()
             
             # Status name
             status_map = {
-                # ...
+                STATUS_NORMAL_EXIT: "normal_exit",
+                STATUS_CRASH: "crash",
+                STATUS_OTHER_SIGNAL: "signal",
+                STATUS_AT_FORK_POINT: "fork_point_ready",
                 2: "batch_completed"
             }
-            status_name = status_map.get(status, f"unknown_{status}")
+            # Ensure STATUS_NORMAL_EXIT (3) is explicitly handled
+            if status == 3:
+                status_name = "normal_exit"
+            else:
+                status_name = status_map.get(status, f"unknown_{status}")
             
             print(f"[QEMUExecutor] Read status={status}, name={status_name}")
             
@@ -934,21 +1060,26 @@ class QEMUExecutor:
                 self.total_crashes += 1
                 print(f"[QEMUExecutor] CRASH DETECTED! exit_code={exit_code}, signal={signal_number}, Total crashes: {self.total_crashes}")
             
-            results.append(ExecutionResult(
+            result = ExecutionResult(
                 status=status,
                 status_name=status_name,
                 coverage_bitmap=coverage_bitmap,
                 execution_time=time.time() - start_time,
-                qemu_exit_code=exit_code,      # ✅ 填充exit_code
-                signal_number=signal_number     # ✅ 填充signal_number
-            ))
+                qemu_exit_code=exit_code,
+                signal_number=signal_number
+            )
+            # Initialize crash_info if it's a crash
+            if status == STATUS_CRASH:
+                result.crash_info = f"Signal {signal_number} (Exit Code: {exit_code})"
+            
+            results.append(result)
             
             self.total_executions += 1
         
         print(f"[QEMUExecutor] ✅ Fork execution completed: {len(results)} results")
         
-        # ❌ 不要在这里关闭QEMU - 应该在iteration间关闭，而不是每次fork后关闭
-        # 当前的并发fork需要串行化或完全隔离，暂时依赖fuzzing_core的cleanup
+        # ❌ Do NOT close QEMU here - it should be closed between iterations, not after every fork
+        # Current concurrent forks require serialization or isolation, temporarily relying on FuzzingCore cleanup
         
         # If not persistent mode, ensure cleanup
         if not self.persistent_mode:

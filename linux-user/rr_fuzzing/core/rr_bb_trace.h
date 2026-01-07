@@ -145,6 +145,15 @@ void rr_bb_trace_print_stats(void);
 void rr_bb_trace_set_main_range(uint64_t start_code, uint64_t end_code);
 
 /**
+ * Get current BBs from buffer without flushing.
+ * 
+ * @param out_buffer Output buffer
+ * @param max_count Max entries to copy
+ * @return Number of entries copied
+ */
+uint32_t rr_bb_trace_get_current_buffer(uint64_t *out_buffer, uint32_t max_count);
+
+/**
  * Enable/Disable address filtering.
  * 
  * @param enabled Whether to enable filtering.

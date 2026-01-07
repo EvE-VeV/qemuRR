@@ -151,6 +151,7 @@
  * - Lower: Reduces complexity and increases reliability.
  */
 #define RR_FUZZ_MAX_INSTRUCTIONS    32
+#define RR_MAX_VARIANTS             10
 
 /**
  * Data payload size for each fuzzing instruction

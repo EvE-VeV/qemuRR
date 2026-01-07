@@ -162,11 +162,20 @@ int rr_ipc_receive_command(void)
     
     char cmd;
     /* Blocking read (due to fcntl F_SETFL 0 in init) */
+    /* fprintf(stderr, "[DEBUG-IPC] Reading command from FD %d...\\n\", g_rr_framework->cmd_pipe_fd); fflush(stderr); */
+    
     ssize_t n = read(g_rr_framework->cmd_pipe_fd, &cmd, 1);
     
-    if (n == 1) return (unsigned char)cmd;
+    if (n == 1) {
+        /* fprintf(stderr, "[DEBUG-IPC] Read command: %c (%d)\\n\", cmd, cmd); fflush(stderr); */
+        return (unsigned char)cmd;
+    }
     
-    if (n == 0) return 'Q'; /* EOF */
+    if (n == 0) {
+        fprintf(stderr, "[DEBUG-IPC] EOF on command pipe FD %d\n", g_rr_framework->cmd_pipe_fd);
+        fflush(stderr);
+        return 'Q'; /* EOF */
+    }
     
     if (n < 0) {
         RR_WARN("IPC read failed: %s", strerror(errno));

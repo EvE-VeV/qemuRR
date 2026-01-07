@@ -124,14 +124,20 @@ uint32_t rr_tree_add_syscall_node(
         return (uint32_t)-1;
     }
 
-    // Atomic Increment for Unique ID
-    uint32_t node_id = __sync_fetch_and_add(&g_syscall_tree.node_count, 1);
+    // Atomic Increment with Check (Safe CAS version)
+    uint32_t current_count;
+    do {
+        current_count = g_syscall_tree.node_count;
+        if (current_count >= MAX_TREE_NODES) {
+            // Only warn once per root process session
+            if (current_count == MAX_TREE_NODES) {
+                fprintf(stderr, "[RR-Tree] Warning: Maximum tree nodes reached (%u). Capped.\n", MAX_TREE_NODES);
+            }
+            return (uint32_t)-1;
+        }
+    } while (!__sync_bool_compare_and_swap(&g_syscall_tree.node_count, current_count, current_count + 1));
 
-    if (node_id >= MAX_TREE_NODES) {
-        // Only warn once per process roughly
-        if (node_id == MAX_TREE_NODES) fprintf(stderr, "[RR-Tree] Warning: Maximum tree nodes reached (%u)\n", MAX_TREE_NODES);
-        return (uint32_t)-1;
-    }
+    uint32_t node_id = current_count;
 
     TreeNode *node = &g_syscall_tree.nodes[node_id];
 
@@ -201,6 +207,19 @@ uint32_t rr_tree_add_syscall_node(
 /**
  * Add fork relation between parent node and child PID
  */
+// New implementation
+void rr_tree_set_node_bbs(uint32_t node_id, const uint64_t *bbs, uint32_t count) {
+    if (!g_syscall_tree_ptr || !g_syscall_tree.enabled) return;
+    if (node_id >= g_syscall_tree.node_count) return;
+
+    TreeNode *node = &g_syscall_tree.nodes[node_id];
+    node->bb_count = (count > MAX_BB_PER_NODE) ? MAX_BB_PER_NODE : count;
+    
+    for (uint32_t i = 0; i < node->bb_count; i++) {
+        node->bb_addrs[i] = bbs[i];
+    }
+}
+
 void rr_tree_add_fork_relation(
     uint32_t parent_node_id,
     uint32_t child_pid
@@ -489,14 +508,17 @@ void rr_tree_export_json(const char *output_file) {
         return;
     }
 
-    /**
-     * Unified Filename Logic:
-     * We use the PID of the Root Node (Node 0) to generate a deterministic filename.
-     * This ensures all processes in a multi-process execution contribute to the SAME HTML bundle,
-     * providing a truly unified visualization of the entire process tree.
-     */
+    if (output_file == NULL) {
+        RR_WARN("[RR-Tree] No output file specified for export, skipping.");
+        return;
+    }
+
+    // Safety: don't export more than MAX_TREE_NODES
+    uint32_t capped_count = g_syscall_tree.node_count;
+    if (capped_count > MAX_TREE_NODES) capped_count = MAX_TREE_NODES;
+
     RR_INFO("[RR-Tree] Exporting UNIFIED tree HTML bundle to %s (nodes=%u)", 
-            output_file, g_syscall_tree.node_count);
+            output_file, capped_count);
 
     FILE *fp = fopen(output_file, "w");
     if (!fp) {
@@ -510,7 +532,7 @@ void rr_tree_export_json(const char *output_file) {
     // 2. Write JSON Data
     fprintf(fp, "{\n");
     fprintf(fp, "  \"metadata\": {\n");
-    fprintf(fp, "    \"total_nodes\": %u,\n", g_syscall_tree.node_count);
+    fprintf(fp, "    \"total_nodes\": %u,\n", capped_count);
     fprintf(fp, "    \"total_syscalls\": %u,\n", g_syscall_tree.total_syscalls);
     fprintf(fp, "    \"total_forks\": %u,\n", g_syscall_tree.total_forks);
     fprintf(fp, "    \"root_node_id\": %u\n", g_syscall_tree.root_node_id);
@@ -519,7 +541,7 @@ void rr_tree_export_json(const char *output_file) {
     fprintf(fp, "  \"nodes\": [\n");
 
     // Loop through ALL nodes in shared memory
-    for (uint32_t i = 0; i < g_syscall_tree.node_count; i++) {
+    for (uint32_t i = 0; i < capped_count; i++) {
         TreeNode *node = &g_syscall_tree.nodes[i];
 
         fprintf(fp, "    {\n");
@@ -533,15 +555,18 @@ void rr_tree_export_json(const char *output_file) {
                 node->args[0], node->args[1], node->args[2], 
                 node->args[3], node->args[4], node->args[5]);
 
+        fprintf(fp, "      \"bb_addresses\": [");
+        for (uint32_t k = 0; k < node->bb_count; k++) {
+            fprintf(fp, "\"0x%lx\"", node->bb_addrs[k]);
+            if (k < node->bb_count - 1) fprintf(fp, ", ");
+        }
+        fprintf(fp, "],\n");
+
         fprintf(fp, "      \"retval\": %ld,\n", node->retval);
         fprintf(fp, "      \"timestamp_enter\": %lu,\n", node->timestamp_enter);
         fprintf(fp, "      \"timestamp_exit\": %lu,\n", node->timestamp_exit);
         fprintf(fp, "      \"parent_id\": %u,\n", node->parent_id);
 
-        /**
-         * Hierarchical reconstruction is performed by the D3.js visualizer 
-         * using parent_id, so we do not need to export explicit children_ids.
-         */
         fprintf(fp, "      \"children_ids\": [],\n"); 
 
         fprintf(fp, "      \"is_fork_node\": %s,\n", node->is_fork_node ? "true" : "false");
@@ -550,7 +575,7 @@ void rr_tree_export_json(const char *output_file) {
         fprintf(fp, "      \"is_mutated\": %s\n", node->is_mutated ? "true" : "false");
 
         fprintf(fp, "    }");
-        if (i < g_syscall_tree.node_count - 1) {
+        if (i < capped_count - 1) {
             fprintf(fp, ",");
         }
         fprintf(fp, "\n");

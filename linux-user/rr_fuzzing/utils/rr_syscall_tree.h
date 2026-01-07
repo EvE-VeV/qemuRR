@@ -4,9 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define MAX_TREE_NODES 100000      // Max 100,000 nodes
+#define MAX_TREE_NODES 200000      // Max 200,000 nodes
 #define MAX_CHILDREN_PER_NODE 16   // Max 16 child nodes per node
 #define MAX_SYSCALL_NAME 32
+#define MAX_BB_PER_NODE 128        // Max 128 BBs per syscall node
 
 /* TreeNode: Represents a syscall execution node */
 typedef struct TreeNode {
@@ -44,6 +45,10 @@ typedef struct TreeNode {
     /* Mutation information (optional) */
     bool is_mutated;                       // Whether it was mutated
     uint8_t mutation_cmd;                  // Mutation command type
+
+    /* Basic Block Trace (Mapping) */
+    uint32_t bb_count;
+    uint64_t bb_addrs[MAX_BB_PER_NODE];    // Array of BB addresses executed before this syscall
 
 } TreeNode;
 
@@ -97,6 +102,12 @@ uint32_t rr_tree_add_syscall_node(
 void rr_tree_add_fork_relation(
     uint32_t parent_node_id,
     uint32_t child_pid
+);
+
+void rr_tree_set_node_bbs(
+    uint32_t node_id,
+    const uint64_t *bbs,
+    uint32_t count
 );
 
 void rr_tree_export_json(const char *output_file);

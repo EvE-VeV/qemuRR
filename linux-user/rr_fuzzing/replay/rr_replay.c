@@ -199,21 +199,21 @@ syscall_record_t *read_next_record(void)
 
     /* Read basic record - field by field to avoid alignment issues */
 
-    // Read manually packed binary data to match record format
-    uint8_t buffer[8]; // 4字节index + 4字节syscall_nr
-    if (fread(buffer, 8, 1, g_trace_file) != 1) {
-        if (feof(g_trace_file)) {
-             RR_VERBOSE("READ_NEXT_RECORD: End of trace file (EOF)");
-        } else {
-             RR_ERROR("READ_NEXT_RECORD: Failed to read record header (Error: %s)", strerror(errno));
+    // Read index (4 bytes)
+    if (fread(&record->index, sizeof(uint32_t), 1, g_trace_file) != 1) {
+        if (!feof(g_trace_file)) {
+             RR_ERROR("READ_NEXT_RECORD: Failed to read record index (Error: %s)", strerror(errno));
         }
         g_free(record);
         return NULL;
     }
 
-    // Manual unpacking
-    record->index = buffer[0] | (buffer[1] << 8) | (buffer[2] << 16) | (buffer[3] << 24);
-    record->syscall_nr = (int32_t)(buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24));
+    // Read syscall_nr (4 bytes)
+    if (fread(&record->syscall_nr, sizeof(int32_t), 1, g_trace_file) != 1) {
+        RR_ERROR("READ_NEXT_RECORD: Failed to read syscall_nr");
+        g_free(record);
+        return NULL;
+    }
 
     // Read remaining fields
     if (fread(record->args, sizeof(abi_long) * 8, 1, g_trace_file) != 1 ||
@@ -396,7 +396,7 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
  * **Special Cases**:
  * - Output syscalls (write/writev): Forced Hybrid to maintain I/O state.
  * - mmap/brk: Forced Hybrid because QEMU must manage memory mappings.
- */
+ *
  * @param env CPU architecture state pointer (for guest memory R/W).
  * @param num Current syscall number.
  * @param args Syscall argument array (8 arguments); may be modified for Pure Replay.
@@ -409,15 +409,15 @@ static void apply_fd_mapping(abi_long *args, int syscall_nr)
  * @note Supports Dynamic Trace (RR_ENABLE_DYNAMIC_TRACE) for visualization.
  * @note Maintains global state: g_current_record, g_pending_post_record.
  * 
- * @warning ⚠️ Complex state management: g_syscall_already_consumed, g_pending_mmap_recorded_addr, etc.
+ * @warning Complex state management: g_syscall_already_consumed, g_pending_mmap_recorded_addr, etc.
  *          Must be carefully maintained to avoid double consumption or missed records.
  * @warning Fuzzing mutation modifies the args array, affecting subsequent execution.
  * 
- * @see rr_start_replay() 必须先调用该函数打开 trace 文件
- * @see rr_replay_syscall_pure() Pure Replay 的实现
- * @see read_next_record() 从 trace 文件读取记录
- * @see apply_fd_mapping() 应用 FD 映射的核心逻辑
- * @see rr_fuzz_mutate_syscall() Fuzzing 模式下的 mutation 应用
+ * @see rr_start_replay() Must call this function to open trace file first
+ * @see rr_replay_syscall_pure() Implementation of Pure Replay
+ * @see read_next_record() Read record from trace file
+ * @see apply_fd_mapping() Core logic for applying FD mapping
+ * @see rr_fuzz_mutate_syscall() Mutation application in Fuzzing mode
  */
 abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 {
@@ -505,6 +505,17 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
                    g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
                    
+    }
+
+    /* 🔥 GAP FIX: Handle unrecorded syscalls (Gap in trace) */
+    /* If the next record index is in the future, the current syscall was not recorded. */
+    /* We should execute it natively and increment our counter. */
+    if (g_current_record && g_current_record->index > g_rr_framework->replay_index) {
+        RR_VERBOSE("REPLAY: Unrecorded syscall %d (Current Index %u < Next Record Index %u). Executing natively.", 
+                   num, g_rr_framework->replay_index, g_current_record->index);
+        
+        g_rr_framework->replay_index++;
+        return -1; /* Execute natively */
     }
 
     /* Smart synchronization - if syscall doesn't match, continue reading until a match is found */
@@ -643,44 +654,104 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 
     /* ========== Path Bifurcation: Pure vs Hybrid ========== */
     
-    if (g_current_record->has_aux_data &&
-        !(num == TARGET_NR_brk
-#if defined(TARGET_NR_mmap)
-          || num == TARGET_NR_mmap
+    /* 🎯 CRITICAL FIX: Force Hybrid Replay for I/O syscalls in FUZZING/REPLAY mode */
+    if (g_rr_framework->mode == RR_MODE_FUZZING || g_rr_framework->mode == RR_MODE_REPLAY) {
+        bool is_io = (
+#ifdef TARGET_NR_read
+//                      num == TARGET_NR_read ||
 #endif
-#if defined(TARGET_NR_mmap2)
-          || num == TARGET_NR_mmap2
+#ifdef TARGET_NR_write
+                      num == TARGET_NR_write ||
 #endif
-        /* 🔥 P0 Fix: Force Hybrid Replay for File Ops (Open/Close) */
-        /* These syscalls MUST go through hybrid path to register FD mappings */
-#if defined(TARGET_NR_open)
-        || num == TARGET_NR_open
+#ifdef TARGET_NR_open
+                      num == TARGET_NR_open ||
 #endif
-#if defined(TARGET_NR_openat)
-        || num == TARGET_NR_openat
+#ifdef TARGET_NR_openat
+                      num == TARGET_NR_openat ||
 #endif
-#if defined(TARGET_NR_creat)
-        || num == TARGET_NR_creat
+#ifdef TARGET_NR_close
+                      num == TARGET_NR_close ||
 #endif
-#if defined(TARGET_NR_close)
-        || num == TARGET_NR_close
+#ifdef TARGET_NR_lseek
+                      num == TARGET_NR_lseek ||
 #endif
-#if defined(TARGET_NR_lseek)
-        || num == TARGET_NR_lseek
+#ifdef TARGET_NR_llseek
+                      num == TARGET_NR_llseek ||
 #endif
-        )) {
+#ifdef TARGET_NR_fstat
+                      num == TARGET_NR_fstat ||
+#endif
+#ifdef TARGET_NR_newfstatat
+                      num == TARGET_NR_newfstatat ||
+#endif
+#ifdef TARGET_NR_pread64
+                      num == TARGET_NR_pread64 ||
+#endif
+#ifdef TARGET_NR_mmap
+                      num == TARGET_NR_mmap ||
+#endif
+#ifdef TARGET_NR_mmap2
+                      num == TARGET_NR_mmap2 ||
+#endif
+                      0);
+        if (is_io) {
+            goto try_hybrid;
+        }
+    }
 
-        /* 
-         * Path 1: Pure Replay
-         * If aux_data is available, attempt pure replay without real syscall.
-         * Fuzzing mutations are applied before Pure Replay.
-         */
+    if (g_current_record->has_aux_data) {
+        /* Path 1: Pure Replay */
         RR_VERBOSE("REPLAY: Pure replay path for syscall %d (has aux_data)", num);
         
         /* 
          * Strategy: Restore aux_data to buffer first, then apply mutation 
          * to allow mutations to overwrite existing data.
          */
+        
+        /* 🎯 CRITICAL FIX: Force Hybrid Replay for I/O syscalls in FUZZING mode
+         * to ensure target code actually executes and provides real coverage.
+         * 
+         * Pure Replay would skip target code execution by restoring aux_data directly.
+         * Hybrid Replay forces QEMU to execute real syscall, which requires running
+         * target code to reach the syscall point.
+         * 
+         * Note: Check both RR_MODE_FUZZING and RR_MODE_REPLAY because baseline children
+         * are in REPLAY mode (rr_fork_server.c:780) while batch children are in FUZZING mode.
+         */
+        if (g_rr_framework->mode == RR_MODE_FUZZING || g_rr_framework->mode == RR_MODE_REPLAY) {
+            bool is_io_syscall = false;
+            
+#ifdef TARGET_NR_read
+//            if (num == TARGET_NR_read) is_io_syscall = true;
+#endif
+#ifdef TARGET_NR_write
+            if (num == TARGET_NR_write) is_io_syscall = true;
+#endif
+#ifdef TARGET_NR_open
+            if (num == TARGET_NR_open) is_io_syscall = true;
+#endif
+#ifdef TARGET_NR_openat
+            if (num == TARGET_NR_openat) is_io_syscall = true;
+#endif
+#ifdef TARGET_NR_close
+            if (num == TARGET_NR_close) is_io_syscall = true;
+#endif
+#ifdef TARGET_NR_lseek
+            if (num == TARGET_NR_lseek) is_io_syscall = true;
+#endif
+#if defined(TARGET_NR_fstat)
+            if (num == TARGET_NR_fstat) is_io_syscall = true;
+#endif
+#if defined(TARGET_NR_newfstatat)
+            if (num == TARGET_NR_newfstatat) is_io_syscall = true;
+#endif
+            
+            if (is_io_syscall) {
+                RR_INFO("🎯 HYBRID-FORCE: Forcing Hybrid Replay for I/O syscall %d (mode=%d) to execute target code", 
+                        num, g_rr_framework->mode);
+                goto try_hybrid;
+            }
+        }
         
         /* Step 1: Restore aux_data to buffer first (if any) */
         ret = rr_replay_syscall_pure(env, num, args, g_current_record);
@@ -803,16 +874,14 @@ try_hybrid:
     RR_VERBOSE("REPLAY_SYSCALL: Hybrid mode, record cleaned, executing real syscall %d", num);
     return -1;
 
-    /* Pure Replay success path: Deterministic result returned, clean record */
-    /* Save recorded_ret for debugging before record cleanup */
-    abi_long recorded_ret_for_debug = g_current_record ? g_current_record->retval : -999;
-
-    g_pending_post_record = g_current_record;
-    g_current_record = NULL;
+    /* This is the common success path for Pure Replay or Overridden Hybrid Replay */
+replay_success:
+    if (g_current_record) {
+        g_pending_post_record = g_current_record;
+        g_current_record = NULL;
+    }
 
     g_rr_framework->replay_index++;
-
-    /* Set flag to notify post_hook not to process again */
     g_syscall_already_consumed = true;
 
     /* Apply return value override (IO return value mutation) */
@@ -820,11 +889,11 @@ try_hybrid:
         abi_long original_ret = ret;
         ret = rr_fuzz_get_retval_override();  // This clears the flag automatically
 
-        RR_INFO("🎯 IO RETVAL OVERRIDE: syscall %d (%s): recorded=%ld, ret_before=%ld → ret_after=%ld",
-                num, rr_get_syscall_name_fast(num), (long)recorded_ret_for_debug, (long)original_ret, (long)ret);
+        RR_INFO("🎯 IO RETVAL OVERRIDE: syscall %d (%s): ret_before=%ld → ret_after=%ld",
+                num, rr_get_syscall_name_fast(num), (long)original_ret, (long)ret);
 
-        fprintf(stderr, "[REPLAY] 🎯 RETVAL OVERRIDE: recorded=%ld, before=%ld → after=%ld\n",
-                (long)recorded_ret_for_debug, (long)original_ret, (long)ret);
+        fprintf(stderr, "[REPLAY] 🎯 RETVAL OVERRIDE: before=%ld → after=%ld\n",
+                (long)original_ret, (long)ret);
         fflush(stderr);
     }
 
@@ -853,7 +922,6 @@ try_hybrid:
         }
     }
 
-replay_success:
     /* Dynamic trace: Syscall exit (binary replay path) */
 #ifdef RR_ENABLE_DYNAMIC_TRACE
     rr_dynamic_trace_syscall_exit(env, num, (uint64_t*)args, ret,

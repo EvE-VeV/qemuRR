@@ -1,7 +1,7 @@
 /**
  * RR-Fuzz Coverage Tracking Module - Implementation
  * 
- * Phase 3: 实现AFL风格的覆盖率追踪
+ * Phase 3: Implement AFL-style coverage tracking
  */
 
 #include "rr_coverage.h"
@@ -13,18 +13,15 @@
 #include <string.h>
 #include <errno.h>
 
-/* ================= 全局变量 ================= */
+/* ================= Global Variables ================= */
 
+rr_coverage_t *g_base_coverage = NULL;
 rr_coverage_t *g_coverage = NULL;
 
-/* ================= 内部辅助函数 ================= */
+/* ================= Internal Helper Functions ================= */
 
 /**
- * 创建共享内存
- * 
- * 支持两种模式：
- * 1. AFL-style: 使用固定名称 (从环境变量RR_COVERAGE_SHM读取)
- * 2. Legacy: 使用PID后缀 (fallback)
+ * Create shared memory
  */
 static int create_shared_memory(const char *shm_name)
 {
@@ -33,428 +30,184 @@ static int create_shared_memory(const char *shm_name)
     bool file_backed = false;
     char file_backing_path[PATH_MAX] = {0};
     
-    // ✅ NEW: Check for global shared memory name from environment
     const char *env_shm_name = getenv("RR_COVERAGE_SHM");
     if (env_shm_name && env_shm_name[0] != '\0') {
         if (strncmp(env_shm_name, "file:", 5) == 0) {
             file_backed = true;
             snprintf(file_backing_path, sizeof(file_backing_path), "%s", env_shm_name + 5);
-            RR_INFO("Using file-backed coverage: %s", file_backing_path);
         } else {
-            // AFL-style: Use fixed name without PID (shared across processes)
             snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s", env_shm_name);
             use_global_shm = true;
-            RR_INFO("Using global shared coverage: %s", shm_path);
         }
     } else {
-        // Legacy: Use PID suffix (per-process)
-        snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", shm_name, getpid());
-        RR_INFO("Using per-process coverage: %s", shm_path);
+        snprintf(shm_path, sizeof(shm_path), "/dev/shm/rr_coverage_%d", getpid());
     }
 
+    int fd;
     if (file_backed) {
-        int fd = open(file_backing_path, O_CREAT | O_RDWR, 0666);
-        if (fd < 0) {
-            RR_ERROR("Failed to open file-backed coverage '%s': %s",
-                    file_backing_path, strerror(errno));
-            return -1;
-        }
-        
-        if (ftruncate(fd, RR_COVERAGE_MAP_SIZE) < 0) {
-            RR_ERROR("Failed to resize file-backed coverage '%s': %s",
-                    file_backing_path, strerror(errno));
-            close(fd);
-            return -1;
-        }
-        
-        void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, fd, 0);
-        if (mem == MAP_FAILED) {
-            RR_ERROR("Failed to mmap file-backed coverage '%s': %s",
-                    file_backing_path, strerror(errno));
-            close(fd);
-            return -1;
-        }
-        
-        memset(mem, 0, RR_COVERAGE_MAP_SIZE);
-        g_coverage->coverage_map = (uint8_t *)mem;
-        g_coverage->shm_fd = fd;
-        g_coverage->file_backed = true;
-        snprintf(g_coverage->backing_path, sizeof(g_coverage->backing_path),
-                 "%s", file_backing_path);
-        RR_INFO("✅ File-backed coverage ready: %s (%d bytes)",
-                file_backing_path, RR_COVERAGE_MAP_SIZE);
-        return 0;
+        fd = open(file_backing_path, O_RDWR | O_CREAT, 0666);
+    } else if (use_global_shm) {
+        fd = open(shm_path, O_RDWR | O_CREAT, 0666);
+    } else {
+        fd = open(shm_path, O_RDWR | O_CREAT | O_EXCL, 0666);
     }
-    
-    // If global SHM, try to open existing first
-    if (use_global_shm) {
-        // Try to open existing shared memory
-        int fd = open(shm_path, O_RDWR, 0666);
-        if (fd >= 0) {
-            // Existing shared memory found, just map it
-            void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, 0);
-            if (mem == MAP_FAILED) {
-                RR_ERROR("Failed to mmap existing shared memory '%s': %s", 
-                        shm_path, strerror(errno));
-                close(fd);
-                return -1;
-            }
-            
-            g_coverage->coverage_map = (uint8_t *)mem;
-            g_coverage->shm_fd = fd;
-            
-            RR_INFO("✅ Opened existing global coverage shared memory: %s (%d bytes)", 
-                    shm_path, RR_COVERAGE_MAP_SIZE);
-            return 0;
-        }
-        // If opening failed, we'll create it below
-        RR_VERBOSE("Global shared memory doesn't exist yet, will create");
-    }
-    
-    // Create new shared memory file
-    int fd = open(shm_path, O_CREAT | O_RDWR, 0666);
+
     if (fd < 0) {
-        RR_ERROR("Failed to create shared memory file '%s': %s (errno=%d)", 
-                shm_path, strerror(errno), errno);
-        return -1;
-    }
-    
-    // Set size
-    if (ftruncate(fd, RR_COVERAGE_MAP_SIZE) < 0) {
-        RR_ERROR("Failed to resize shared memory: %s", strerror(errno));
-        close(fd);
-        if (!use_global_shm) {
-            unlink(shm_path);  // Only unlink per-process SHM
+        if (errno == EEXIST && !use_global_shm) {
+            fd = open(shm_path, O_RDWR);
         }
-        return -1;
+        if (fd < 0) return -1;
     }
-    
-    // Map to memory
-    void *mem = mmap(NULL, RR_COVERAGE_MAP_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_SHARED, fd, 0);
-    if (mem == MAP_FAILED) {
-        RR_ERROR("Failed to mmap shared memory: %s", strerror(errno));
+
+    if (ftruncate(fd, sizeof(rr_coverage_t)) < 0) {
         close(fd);
-        if (!use_global_shm) {
-            unlink(shm_path);  // Only unlink per-process SHM
-        }
         return -1;
     }
-    
-    // Clear bitmap (only if we created it)
-    memset(mem, 0, RR_COVERAGE_MAP_SIZE);
-    
-    g_coverage->coverage_map = (uint8_t *)mem;
-    g_coverage->shm_fd = fd;
-    
-    RR_INFO("✅ Created coverage shared memory: %s (%d bytes)", 
-            shm_path, RR_COVERAGE_MAP_SIZE);
-    
-    return 0;
+
+    return fd;
 }
 
-/* ================= 目标范围过滤 ================= */
+/* ================= Public API Implementation ================= */
 
-static uint64_t g_target_start = 0;
-static uint64_t g_target_end = 0;
-static bool g_range_set = false;
-
-/* ================= 核心函数实现 ================= */
-
-/**
- * @brief 初始化覆盖率追踪系统
- * 
- * 分配覆盖率上下文，并建立与 Python 端共享的 Bitmap 内存区域。
- * 
- * **共享内存策略**:
- * 1. **Global Mode** (推荐): 即使环境变量 `RR_COVERAGE_SHM` 设置了名称，主要用于 AFL++ 等外部 Fuzzer 集成。
- * 2. **Per-Process Mode**: 使用 PID 后缀，用于多进程隔离 Fuzzing。
- * 3. **File-Backed Mode**: 使用文件映射，用于调试。
- * 
- * @param shm_name 共享内存名称 (可选，默认为 RR_COVERAGE_SHM_NAME)
- * @return int 0 成功，-1 失败
- */
 int rr_coverage_init(const char *shm_name)
 {
-    fprintf(stderr, "[DEBUG-COV] rr_coverage_init entered\n");
-    if (g_coverage) {
-        RR_WARN("Coverage already initialized");
-        fprintf(stderr, "[DEBUG-COV] Coverage already initialized, returning 0\n");
-        return 0;
-    }
-    
-    // 分配上下文
-    g_coverage = calloc(1, sizeof(rr_coverage_t));
-    if (!g_coverage) {
-        RR_ERROR("Failed to allocate coverage context");
-        fprintf(stderr, "[DEBUG-COV] Failed to allocate context\n");
+    if (g_base_coverage) return 0;
+
+    int fd = create_shared_memory(shm_name);
+    if (fd < 0) return -1;
+
+    g_base_coverage = (rr_coverage_t *)mmap(NULL, sizeof(rr_coverage_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (g_base_coverage == MAP_FAILED) {
+        g_base_coverage = NULL;
         return -1;
     }
-    
-    // 使用默认名称
-    if (!shm_name) {
-        shm_name = RR_COVERAGE_SHM_NAME;
-    }
-    
-    // 创建共享内存
-    fprintf(stderr, "[DEBUG-COV] Calling create_shared_memory(%s)...\n", shm_name);
-    if (create_shared_memory(shm_name) < 0) {
-        RR_ERROR("create_shared_memory() failed");
-        fprintf(stderr, "[DEBUG-COV] create_shared_memory failed\n");
-        free(g_coverage);
-        g_coverage = NULL;
-        return -1;
-    }
-    fprintf(stderr, "[DEBUG-COV] create_shared_memory succeeded\n");
-    
-    // 初始化状态
-    g_coverage->enabled = true;
-    g_coverage->prev_pc = 0;
-    g_coverage->total_edges = 0;
-    g_coverage->unique_edges = 0;
-    
-    RR_INFO("Coverage tracking initialized");
-    fprintf(stderr, "[DEBUG-COV] Coverage tracking initialized successfully\n");
-    
+
+    g_coverage = g_base_coverage;
     return 0;
 }
 
 void rr_coverage_cleanup(void)
 {
-    if (!g_coverage) {
-        return;
+    if (g_base_coverage) {
+        munmap(g_base_coverage, sizeof(rr_coverage_t));
+        g_base_coverage = NULL;
+        g_coverage = NULL;
     }
-    
-    // 打印统计信息
-    rr_coverage_print_stats();
-    
-    // 解除映射
-    if (g_coverage->coverage_map) {
-        munmap(g_coverage->coverage_map, RR_COVERAGE_MAP_SIZE);
-        g_coverage->coverage_map = NULL;
-    }
-    
-    // 关闭文件描述符
-    if (g_coverage->shm_fd >= 0) {
-        close(g_coverage->shm_fd);
-        
-        if (g_coverage->file_backed && g_coverage->backing_path[0] != '\0') {
-            unlink(g_coverage->backing_path);
-            RR_VERBOSE("Deleted file-backed coverage file: %s", g_coverage->backing_path);
-        } else {
-            // ✅ FIXED: Only delete per-process SHM files, NOT global shared memory
-            const char *env_shm_name = getenv("RR_COVERAGE_SHM");
-            if (!env_shm_name || env_shm_name[0] == '\0') {
-                // Legacy per-process mode: delete the file
-                char shm_path[256];
-                snprintf(shm_path, sizeof(shm_path), "/dev/shm/%s_%d", 
-                        RR_COVERAGE_SHM_NAME, getpid());
-                unlink(shm_path);
-                RR_VERBOSE("Deleted per-process coverage file: %s", shm_path);
-            } else {
-                // Global shared memory mode: DON'T delete (shared by all processes)
-                RR_VERBOSE("Keeping global shared coverage (shared by all processes)");
-            }
-        }
-    }
-    
-    free(g_coverage);
-    g_coverage = NULL;
-    
-    RR_INFO("Coverage tracking cleanup completed");
 }
 
-/**
- * @brief 记录一条执行边 (AFL Style)
- * 
- * 这是插桩代码调用的热点函数 (Hot Path)。
- * 使用经典的 AFL 算法计算边的哈希并更新 Bitmap。
- * 
- * **算法**:
- * `idx = (prev_pc >> 1) ^ cur_pc`
- * 
- * - `prev_pc >> 1`: 区分 A->B 和 B->A 的方向性
- * - `^ cur_pc`: 组合源和目的地址
- * 
- * @param cur_pc 当前基本块的地址
- */
-/* Debug counter for coverage calls */
-static uint64_t s_trace_call_count = 0;
-
-void rr_coverage_trace_edge(uint64_t cur_pc)
+void rr_coverage_enable(void)
 {
-    s_trace_call_count++;
-    
-    /* Periodic debug log (every 10000 calls) */
-    if (s_trace_call_count % 10000 == 1) {
-        fprintf(stderr, "[RR-COV-DEBUG] trace_edge called %lu times, cur_pc=0x%lx\n", 
-                s_trace_call_count, cur_pc);
+    if (g_base_coverage) {
+        g_base_coverage->enabled = true;
     }
-    
-    if (!rr_coverage_is_enabled()) {
-        if (s_trace_call_count == 1) {
-            fprintf(stderr, "[RR-COV-DEBUG] Coverage DISABLED at first call!\n");
-        }
-        return;
-    }
-    
-    /* Runtime range filter: Only track PCs within target binary.
-     * This check is done here (at runtime) because:
-     * 1. Target range is set AFTER ELF loading, after many TBs are translated
-     * 2. We cannot flush TB cache during loading (assertion failure)
-     */
-    if (!rr_in_target_range(cur_pc)) {
-        return;
-    }
-    
-    // 计算AFL风格的边哈希
-    // hash = (prev_pc >> 1) ^ cur_pc
-    uint64_t edge_hash = (g_coverage->prev_pc >> 1) ^ cur_pc;
-    
-    // 映射到bitmap索引（取模）
-    uint32_t idx = edge_hash % RR_COVERAGE_MAP_SIZE;
-    
-    // 获取当前计数
-    uint8_t old_count = g_coverage->coverage_map[idx];
-    
-    // 更新计数（饱和加法，防止溢出）
-    if (old_count < 255) {
-        g_coverage->coverage_map[idx]++;
-    }
-    
-    // 如果是新边，增加unique_edges计数
-    if (old_count == 0) {
-        g_coverage->unique_edges++;
-    }
-    
-    // 更新总边数
-    g_coverage->total_edges++;
-    
-    // 更新prev_pc为当前PC
-    g_coverage->prev_pc = cur_pc;
 }
 
-void rr_coverage_set_enabled(bool enabled)
+void rr_coverage_disable(void)
 {
-    if (g_coverage) {
-        g_coverage->enabled = enabled;
-        RR_INFO("Coverage tracking %s", enabled ? "enabled" : "disabled");
+    if (g_base_coverage) {
+        g_base_coverage->enabled = false;
     }
+}
+
+bool rr_coverage_is_enabled_check(void)
+{
+    return rr_coverage_is_enabled();
 }
 
 void rr_coverage_reset(void)
 {
-    if (!g_coverage || !g_coverage->coverage_map) {
-        return;
-    }
-    
-    // 清零bitmap
-    memset(g_coverage->coverage_map, 0, RR_COVERAGE_MAP_SIZE);
-    
-    // 重置统计
-    g_coverage->prev_pc = 0;
-    g_coverage->total_edges = 0;
-    g_coverage->unique_edges = 0;
-    
-    RR_VERBOSE("Coverage map reset");
-}
-
-void rr_coverage_get_stats(uint64_t *total_edges, uint64_t *unique_edges)
-{
-    if (g_coverage) {
-        if (total_edges) {
-            *total_edges = g_coverage->total_edges;
-        }
-        if (unique_edges) {
-            *unique_edges = g_coverage->unique_edges;
-        }
+    if (g_base_coverage) {
+        memset(g_base_coverage->coverage_map, 0, RR_COVERAGE_MAP_SIZE);
+        g_base_coverage->unique_edges = 0;
+        g_base_coverage->total_edges = 0;
+        g_base_coverage->prev_pc = 0;
     }
 }
 
-void rr_coverage_print_stats(void)
-{
-    if (!g_coverage) {
-        return;
-    }
-    
-    RR_INFO("=== Coverage Statistics ===");
-    RR_INFO("  Total edges executed: %lu", g_coverage->total_edges);
-    RR_INFO("  Unique edges found:   %lu", g_coverage->unique_edges);
-    
-    if (g_coverage->total_edges > 0) {
-        RR_INFO("  Bitmap density:       %.2f%%", 
-                (double)g_coverage->unique_edges * 100.0 / RR_COVERAGE_MAP_SIZE);
-    }
-}
-
-bool rr_coverage_has_new_edges(const uint8_t *baseline_map)
-{
-    if (!g_coverage || !g_coverage->coverage_map || !baseline_map) {
-        return false;
-    }
-    
-    // 比较当前map和baseline
-    for (size_t i = 0; i < RR_COVERAGE_MAP_SIZE; i++) {
-        if (g_coverage->coverage_map[i] > 0 && baseline_map[i] == 0) {
-            return true;  // 发现新边
-        }
-    }
-    
-    return false;
-}
-
-void rr_coverage_copy_map(uint8_t *dest)
-{
-    if (!g_coverage || !g_coverage->coverage_map || !dest) {
-        return;
-    }
-    
-    memcpy(dest, g_coverage->coverage_map, RR_COVERAGE_MAP_SIZE);
-}
-
-/* 非内联版本供cpu-exec.c使用 */
-bool rr_coverage_is_enabled_check(void)
-{
-    return g_coverage && g_coverage->enabled && g_coverage->coverage_map;
-}
+/* RR-Fuzz: Range Filtering */
+/* RR-Fuzz: Range Filtering (Linked to accel/tcg/translator.c) */
+extern uint64_t g_target_start;
+extern uint64_t g_target_end;
 
 void rr_set_target_range(uint64_t start, uint64_t end)
 {
     g_target_start = start;
     g_target_end = end;
-    g_range_set = true;
-    fprintf(stderr, "[RR-Fuzz] Target Range Set: 0x%lx - 0x%lx\n", start, end);
+    fprintf(stderr, "[RR-COVERAGE] Target range set: 0x%lx - 0x%lx\n", start, end);
 }
-
-/* Debug counter for range checks */
-static uint64_t s_range_check_count = 0;
-static uint64_t s_range_denied_count = 0;
 
 bool rr_in_target_range(uint64_t pc)
 {
-    s_range_check_count++;
-    
-    if (!g_range_set) {
-        s_range_denied_count++;
-        /* Log first denial and periodically after */
-        if (s_range_denied_count == 1 || s_range_denied_count % 100000 == 0) {
-            fprintf(stderr, "[RR-RANGE-DEBUG] DENIED (range not set): pc=0x%lx, denied %lu times\n", 
-                    pc, s_range_denied_count);
+    if (g_target_start == 0 || g_target_end == 0) {
+        // [DEBUG] Log when we use uninitialized range
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[RR-COVERAGE] WARNING: Target range not set (start=%lx, end=%lx), allowing all addresses\n",
+                    g_target_start, g_target_end);
+            warned = 1;
         }
-        return false;
+        return true;
+    }
+    return (pc >= g_target_start && pc <= g_target_end);
+}
+
+/**
+ * Core tracking function: Record edge coverage
+ */
+void rr_coverage_trace_edge(uint64_t cur_pc)
+{
+    if (!rr_coverage_is_enabled()) {
+        return;
     }
     
-    bool in_range = (pc >= g_target_start && pc < g_target_end);
-    
-    /* Log first in-range hit */
-    static bool first_hit_logged = false;
-    if (in_range && !first_hit_logged) {
-        fprintf(stderr, "[RR-RANGE-DEBUG] FIRST IN-RANGE HIT: pc=0x%lx (range: 0x%lx-0x%lx)\n", 
-                pc, g_target_start, g_target_end);
-        first_hit_logged = true;
+    /* [CRITICAL DEBUG] Log occasionally to verify edge tracking is alive */
+    static uint64_t call_count = 0;
+    if ((++call_count % 1000) == 0) {
+        fprintf(stderr, "[COVERAGE-DEBUG] PID=%d, calls=%lu, cur_pc=0x%lx, range=0x%lx-0x%lx\n",
+                getpid(), call_count, cur_pc, g_target_start, g_target_end);
     }
     
-    return in_range;
+    if (!rr_in_target_range(cur_pc)) {
+        return;
+    }
+    
+    // AFL-style edge hashing
+    uint64_t edge_hash = (g_coverage->prev_pc >> 1) ^ cur_pc;
+    uint32_t idx = edge_hash % RR_COVERAGE_MAP_SIZE;
+    
+    uint8_t old_count = g_coverage->coverage_map[idx];
+    if (old_count < 255) {
+        g_coverage->coverage_map[idx]++;
+    }
+    
+    if (old_count == 0) {
+        g_coverage->unique_edges++;
+        /* Log if we found a new edge in THIS process */
+        if (g_rr_debug.level >= RR_DEBUG_VERBOSE) {
+            fprintf(stderr, "[COVERAGE-NEW-EDGE] PID=%d, pc=0x%lx, idx=%u, unique=%lu\n",
+                    getpid(), cur_pc, idx, g_coverage->unique_edges);
+        }
+    }
+    
+    g_coverage->total_edges++;
+    g_coverage->prev_pc = cur_pc;
+}
+
+void rr_coverage_copy_map(uint8_t *dest)
+{
+    if (g_base_coverage && dest) {
+        memcpy(dest, g_base_coverage->coverage_map, RR_COVERAGE_MAP_SIZE);
+    }
+}
+
+uint64_t rr_coverage_get_unique_edges(void)
+{
+    return g_base_coverage ? g_base_coverage->unique_edges : 0;
+}
+
+uint64_t rr_coverage_get_total_edges(void)
+{
+    return g_base_coverage ? g_base_coverage->total_edges : 0;
 }

@@ -21,8 +21,18 @@
 #include "disas/disas.h"
 #include "tb-internal.h"
 
+/* RR-Fuzz: Helper Generation */
+#define HELPER_H "accel/tcg/rr_coverage_helper.h"
+#include "exec/helper-proto.h.inc"
+#include "exec/helper-gen.h.inc"
+#undef  HELPER_H
+
 /* RR-Fuzz: Universal Range Filtering Declaration */
 extern bool rr_in_target_range(uint64_t pc);
+
+/* RR-Fuzz: Target Range Variables (Defined here to be visible to TCG) */
+uint64_t g_target_start = 0;
+uint64_t g_target_end = 0;
 
 
 static void set_can_do_io(DisasContextBase *db, bool val)
@@ -153,19 +163,31 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     /* Start translating.  */
     icount_start_insn = gen_tb_start(db, cflags);
     
-#ifdef CONFIG_USER_ONLY
     /* RR-Fuzz: Instrument Basic Block for Coverage
      * 
-     * IMPORTANT: We ALWAYS insert the hook here (no compile-time filtering).
-     * The range check is performed at RUNTIME inside rr_coverage_trace_edge().
+     * [OPTIMIZATION] Filter at TRANSLATION TIME.
+     * We use externs to access the target range set by elfload.c.
+     * This ensures that we ONLY instrument the target binary, avoiding Libc noise.
      * 
-     * This is necessary because:
-     * 1. Target range is set AFTER ELF loading, by which time many TBs are already translated
-     * 2. We cannot call tb_flush during ELF loading (requires exclusive CPU context)
-     * 3. Runtime filtering has negligible overhead since the hook is a simple range check
+     * Note: This relies on the Fork Server flushing the TB cache (queue_tb_flush)
+     * so that code originally translated without instrumentation (or with wrong range)
+     * is re-translated with these checks active.
      */
-    gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
-#endif
+    /* RR-Fuzz: Translation-Time Coverage Filtering
+     * Only instrument basic blocks that fall within the target binary's address range.
+     * This eliminates Libc noise and significantly improves performance.
+     */
+    if (g_target_start > 0 && pc >= g_target_start && pc <= g_target_end) {
+         gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
+    } else if (g_target_start > 0 && (pc < g_target_start || pc > g_target_end)) {
+        // pc outside range - expected for libs
+    } else {
+        // g_target_start == 0 - this is suspicious if we expect coverage
+        static int warned_count = 0;
+        if (++warned_count % 1000 == 1) {
+             fprintf(stderr, "[TRANSLATOR-DEBUG] pc=0x%lx, g_target_start is 0, skipping coverage\n", pc);
+        }
+    }
 
     ops->tb_start(db, cpu);
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */

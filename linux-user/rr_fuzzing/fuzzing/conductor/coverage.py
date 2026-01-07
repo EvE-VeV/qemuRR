@@ -87,7 +87,9 @@ class CoverageTracker:
         """Read current coverage map"""
         try:
             with open(self.shm_path, 'rb') as f:
-                return bytearray(f.read(COVERAGE_MAP_SIZE))
+                # Skip 1-byte header (enabled flag)
+                f.seek(1)
+                return bytearray(f.read(64 * 1024))
         except FileNotFoundError:
             # Coverage may not be initialized yet
             return None
@@ -245,6 +247,11 @@ class CoverageTracker:
             elif hits < avg_hits * 0.1:
                 self.rare_edges.add(edge_id)
     
+    def cleanup(self):
+        """Clean up shared resources"""
+        if self.shared_coverage and hasattr(self.shared_coverage, 'cleanup'):
+            self.shared_coverage.cleanup()
+
     def _update_stability(self):
         """Track edge stability based on recent execution variance"""
         if len(self.edges_per_execution) < 10:
@@ -330,6 +337,17 @@ class CoverageTracker:
         Recalculates total_edges directly from the bitmap for precision.
         """
         with self._lock:
+            # Force sync with shared memory if available
+            if self.shared_coverage:
+                 synced_edges = self.shared_coverage.sync_coverage()
+                 if synced_edges > 0:
+                     for i in range(COVERAGE_MAP_SIZE):
+                         shared_val = self.shared_coverage.local_bitmap[i]
+                         if shared_val > self.global_bitmap[i]:
+                             self.global_bitmap[i] = shared_val
+                             if self.virgin_bits[i] > 0:
+                                 self.virgin_bits[i] = 0
+
             # Re-calculate total edges from bitmap for precision
             actual_total_edges = sum(1 for b in self.global_bitmap if b > 0)
             virgin_bits_count = sum(1 for b in self.virgin_bits if b == 255)
@@ -372,4 +390,23 @@ class CoverageTracker:
         return (trend['growing'] or 
                 stats['virgin_bits_percent'] > 50 or 
                 time_since_last < 60)
+    
+    def get_bitmap(self) -> bytes:
+        """Export coverage bitmap for checkpoint persistence"""
+        with self._lock:
+            return bytes(self.global_bitmap)
+    
+    def set_bitmap(self, bitmap_data: bytes):
+        """Restore coverage bitmap from checkpoint"""
+        if len(bitmap_data) != COVERAGE_MAP_SIZE:
+            raise ValueError(f"Invalid bitmap size: {len(bitmap_data)} (expected {COVERAGE_MAP_SIZE})")
+        
+        with self._lock:
+            self.global_bitmap = bytearray(bitmap_data)
+            # Recalculate total_edges_cached
+            self.total_edges_cached = sum(1 for b in self.global_bitmap if b > 0)
+            # Reset virgin bits for restored edges
+            for i in range(COVERAGE_MAP_SIZE):
+                if self.global_bitmap[i] > 0:
+                    self.virgin_bits[i] = 0
 
