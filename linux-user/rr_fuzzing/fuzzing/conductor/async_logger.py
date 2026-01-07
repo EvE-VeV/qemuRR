@@ -67,17 +67,24 @@ class AsyncLogger:
             self.file_handle.close()
             self.file_handle = None
 
-    def log(self, msg: str, tag: str = None, force: bool = False):
+    def log(self, msg: str, tag: str = None, level: str = "INFO", force: bool = False):
         """
         Log a message asynchronously.
         
         Args:
             msg: Message content
-            tag: Optional tag prefix (e.g., "[DEBUG]")
-            force: If True, flush immediately (synchronous) - use sparingly!
+            tag: Optional component tag (e.g., "FuzzingCore")
+            level: Log level (INFO, DEBUG, WARN, ERROR)
+            force: If True, flush immediately
         """
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        formatted_msg = f"[{timestamp}] {tag} {msg}" if tag else f"[{timestamp}] {msg}"
+        
+        # Format: [Time] LEVEL    [Tag] Message
+        # Level padded to 7 chars (e.g. "INFO   ")
+        # Tag wrapped in [] if present
+        
+        tag_str = f"[{tag}]" if tag else ""
+        formatted_msg = f"[{timestamp}] {level:<7} {tag_str} {msg}"
         
         if force:
             # Synchronous path for critical errors or shutdown
@@ -112,9 +119,9 @@ class AsyncLogger:
             pass
 
 # Global convenience method
-def alog(msg, tag=None):
+def alog(msg, tag=None, level="INFO"):
     if AsyncLogger._instance:
-        AsyncLogger._instance.log(msg, tag)
+        AsyncLogger._instance.log(msg, tag, level)
     else:
         # Fallback if not initialized
-        print(f"[FALLBACK] {tag or ''} {msg}")
+        print(f"[FALLBACK] {level:<7} [{tag or ''}] {msg}")

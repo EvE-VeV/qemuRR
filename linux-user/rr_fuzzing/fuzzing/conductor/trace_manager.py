@@ -265,7 +265,7 @@ class TraceManager:
             mutations: List of FuzzInstructions applied
             has_new_coverage: Whether new coverage was found
         """
-        # 初始化trace的syscall_stats（如果不存在）
+        # Initialize syscall_stats for the trace if it doesn't exist
         if trace_id not in self.syscall_stats:
             self.syscall_stats[trace_id] = {}
         
@@ -294,18 +294,18 @@ class TraceManager:
                         'syscall_nr': sc.syscall_nr 
                     }
                 
-                # 增加执行计数（每个syscall都被记录）
+                # Increment execution count (every syscall is recorded)
                 self.syscall_stats[trace_id][i]['exec_count'] += 1
         
         except Exception as e:
-            # 如果解析失败，回退到只记录mutations
+            # If parsing fails, fall back to only recording mutations
             print(f"[TraceManager] ⚠️  Failed to parse trace for full stats: {e}")
         
         # Update statistics for syscalls influenced by mutations
         for mutation in mutations:
             syscall_idx = mutation.syscall_index
             
-            # 确保该syscall存在于stats中
+            # Ensure this syscall exists in stats
             if syscall_idx not in self.syscall_stats[trace_id]:
                 self.syscall_stats[trace_id][syscall_idx] = {
                     'exec_count': 1,
@@ -318,16 +318,16 @@ class TraceManager:
             
             stat = self.syscall_stats[trace_id][syscall_idx]
             
-            # 标记mutation相关信息
-            stat['fork_count'] += 1  # 每次mutation都会fork
+            # Mark mutation-related info
+            stat['fork_count'] += 1  # Every mutation involves a fork
             stat['mutation_applied'] = True
             
-            # 记录mutation类型
+            # Record mutation type
             cmd_name = self._get_mutation_name(mutation.cmd)
             if cmd_name not in stat['mutation_types']:
                 stat['mutation_types'].append(cmd_name)
             
-            # 记录参数修改
+            # Record argument modifications
             arg_key = f"arg[{mutation.arg_index}]"
             if arg_key not in stat['arg_modifications']:
                 stat['arg_modifications'][arg_key] = {
@@ -338,12 +338,12 @@ class TraceManager:
             if cmd_name not in stat['arg_modifications'][arg_key]['mutation_commands']:
                 stat['arg_modifications'][arg_key]['mutation_commands'].append(cmd_name)
             
-            # 如果发现新coverage，记录
+            # If new coverage found, record it
             if has_new_coverage:
                 stat['new_coverage'] += 1
     
     def _get_mutation_name(self, cmd: int) -> str:
-        """将mutation命令转换为名称"""
+        """Convert mutation command to name"""
         from .constants import (
             FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
             FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
@@ -368,7 +368,7 @@ class TraceManager:
     
     def get_syscall_stats(self, trace_id: str) -> Dict[int, Dict]:
         """
-        获取指定trace的syscall统计信息
+        Get syscall statistics for specified trace
         
         Args:
             trace_id: Trace ID
@@ -404,7 +404,7 @@ class TraceManager:
                     'new_coverage_count': trace.metadata.new_coverage_count,
                     'coverage_info': self.coverage_map.get(trace.id, {}),
                     'syscall_stats': self.syscall_stats.get(trace.id, {})
-                }, f, indent=2)
+                }, f, indent=2, default=lambda o: list(o) if isinstance(o, set) else str(o))
         
         print(f"[TraceManager] Saved {len(self.trace_pool)} traces to {corpus_dir}")
 

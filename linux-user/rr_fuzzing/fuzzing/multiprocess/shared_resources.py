@@ -24,7 +24,7 @@ COVERAGE_MAP_SIZE = 64 * 1024
 
 @dataclass
 class SeedMetadata:
-    """Seed元数据（从文件名解析）"""
+    """Seed metadata (parsed from filename)"""
     seed_id: str
     seq: int
     new_edges: int
@@ -33,8 +33,8 @@ class SeedMetadata:
     @staticmethod
     def parse_filename(filename: str) -> Optional['SeedMetadata']:
         """
-        解析seed文件名
-        格式: id_{seq:06d}_cov_{new_edges}_depth_{depth}
+        Parse seed filename
+        Format: id_{seq:06d}_cov_{new_edges}_depth_{depth}
         """
         try:
             parts = filename.split('_')
@@ -57,119 +57,204 @@ class SeedMetadata:
 
 class SharedCoverage:
     """
-    共享Coverage Bitmap（基于multiprocessing.Array - 进程安全）
+    Shared Coverage Bitmap (Based on multiprocessing.Array - process-safe)
 
-    多进程通过multiprocessing.Array共享一个coverage bitmap，实现：
-    1. Worker发现新coverage时原子更新全局bitmap
-    2. Worker定期从全局bitmap同步到本地
-    3. 使用进程锁保证原子性，无race condition
+    Multiple processes share a coverage bitmap via multiprocessing.Array, achieving:
+    1. Atomic updates to the global bitmap when a worker finds new coverage
+    2. Periodic synchronization from global to local bitmap
+    3. Use of process locks to ensure atomicity, no race conditions
     """
 
-    # 类级别的共享资源（所有实例共享）
+    # Class-level shared resources (shared across all instances)
     _shared_array = None
     _lock = None
+    _revision = None # Global revision counter (mp.Value)
 
     @classmethod
     def _ensure_shared_resources(cls):
-        """确保共享资源已初始化（只初始化一次）"""
+        """Ensure shared resources are initialized (only once)"""
         if cls._shared_array is None:
             cls._shared_array = mp.Array('B', COVERAGE_MAP_SIZE)  # unsigned char array
             cls._lock = mp.Lock()
+            cls._revision = mp.Value('L', 0) # Unsigned long revision counter
 
     def __init__(self, worker_id: int = 0):
         """
-        初始化共享coverage
+        Initialize shared coverage
 
         Args:
             worker_id: Worker ID
         """
-        # 确保共享资源存在
+        # Ensure shared resources exist
         SharedCoverage._ensure_shared_resources()
 
         self.worker_id = worker_id
 
-        # 引用类级别的共享资源
+        # Reference class-level shared resources
         self.shared_array = SharedCoverage._shared_array
         self.lock = SharedCoverage._lock
+        self.revision = SharedCoverage._revision
 
-        # 本地副本（减少锁竞争，快速查询）
+        # Local copy (reduce lock contention, fast query)
         self.local_bitmap = bytearray(COVERAGE_MAP_SIZE)
+        self.local_revision = 0 # Last synced revision
 
-        print(f"[SharedCoverage] Worker {worker_id} initialized with multiprocessing.Array (process-safe)")
+        print(f"[SharedCoverage] Worker {worker_id} initialized with mp.Array and revision counter")
     
     def sync_coverage(self) -> int:
         """
-        从全局bitmap同步到本地（进程安全）
+        Sync from global bitmap to local copy (process-safe)
+        Uses vectorized 64-bit comparisons for performance.
 
         Returns:
-            新发现的edges数量
+            Number of newly discovered edges
         """
+        # Fast path: Skip lock if global revision hasn't changed
+        if self.revision.value == self.local_revision:
+            return 0
+
+        import struct
         new_edges = 0
 
-        # 使用进程锁保护读取
+        # Use process lock to protect read
         with self.lock:
-            for i in range(COVERAGE_MAP_SIZE):
-                global_byte = self.shared_array[i]
-                local_byte = self.local_bitmap[i]
+            # Check revision again inside lock to avoid race conditions
+            if self.revision.value == self.local_revision:
+                return 0
+                
+            # Access underlying buffer for fast struct unpacking
+            # self.shared_array.get_obj() returns the raw ctypes array
+            try:
+                global_buf = self.shared_array.get_obj()
+            except AttributeError:
+                # Fallback if not a SynchronizedArray
+                global_buf = bytes(self.shared_array)
 
-                # 发现新的coverage
-                if global_byte > local_byte:
-                    new_edges += 1
-                    self.local_bitmap[i] = global_byte
+            global_longs = struct.unpack('<8192Q', global_buf)
+            local_longs = struct.unpack('<8192Q', self.local_bitmap)
+            
+            for k in range(8192):
+                g_long = global_longs[k]
+                l_long = local_longs[k]
+                
+                # Fast path: No new coverage in this 8-byte chunk
+                if g_long == l_long:
+                    continue
+                
+                # If we are here, at least one byte changed.
+                # Update individual bytes in this chunk
+                base = k * 8
+                for j in range(8):
+                    idx = base + j
+                    g_byte = self.shared_array[idx]
+                    l_byte = self.local_bitmap[idx]
+                    
+                    if g_byte > l_byte:
+                        new_edges += 1
+                        self.local_bitmap[idx] = g_byte
+            
+            # Sync complete, update local revision
+            self.local_revision = self.revision.value
 
         return new_edges
     
     def update_coverage(self, exec_bitmap: bytes) -> int:
         """
-        更新coverage（本地发现新coverage后原子更新全局）
-
+        Update global coverage using execution bitmap
+        Uses vectorized 64-bit comparisons for performance.
+        
         Args:
-            exec_bitmap: 执行产生的coverage bitmap
-
+            exec_bitmap: Coverage bitmap generated by execution
+            
         Returns:
-            新发现的edges数量
+            Number of newly discovered edges
         """
+        import struct
         if len(exec_bitmap) > COVERAGE_MAP_SIZE:
             exec_bitmap = exec_bitmap[:COVERAGE_MAP_SIZE]
+        
+        # Fast check: If the entire block is identical to local, skip local-to-global sync
+        # This check is FAST and done outside the lock.
+        if exec_bitmap == self.local_bitmap:
+            return 0
 
         new_edges = 0
-
-        # 使用进程锁保证原子性（消除race condition）
+        
+        # Use process lock to ensure atomicity (eliminate race conditions)
         with self.lock:
-            for i in range(len(exec_bitmap)):
-                exec_byte = exec_bitmap[i]
+            # Re-check against local after lock is acquired (another sync might have happened)
+            if exec_bitmap == self.local_bitmap:
+                return 0
+                
+            exec_longs = struct.unpack('<8192Q', exec_bitmap)
+            local_longs = struct.unpack('<8192Q', self.local_bitmap)
+            
+            # Access global buffer for manual updates
+            try:
+                global_buf = self.shared_array.get_obj()
+            except AttributeError:
+                global_buf = self.shared_array
 
-                # 更新本地
-                if exec_byte > self.local_bitmap[i]:
-                    self.local_bitmap[i] = exec_byte
-
-                    # 更新全局（原子操作）
-                    if exec_byte > self.shared_array[i]:
-                        self.shared_array[i] = exec_byte
-                        new_edges += 1
-
+            for k in range(8192):
+                e_long = exec_longs[k]
+                l_long = local_longs[k]
+                
+                # Skip chunks with no NEW local coverage
+                if e_long == l_long:
+                    continue
+                
+                # Check byte-by-byte and update global
+                base = k * 8
+                for j in range(8):
+                    idx = base + j
+                    e_byte = exec_bitmap[idx]
+                    
+                    if e_byte > self.local_bitmap[idx]:
+                        self.local_bitmap[idx] = e_byte
+                        
+                        # Update global if better
+                        if e_byte > self.shared_array[idx]:
+                            self.shared_array[idx] = e_byte
+                            new_edges += 1
+            
+            # If we updated global, increment revision
+            if new_edges > 0:
+                with self.revision.get_lock(): # Only needed for Value, though usually mp.Value handles it
+                    self.revision.value += 1
+                self.local_revision = self.revision.value # Keep local in sync
+        
         return new_edges
     
     def get_coverage_count(self) -> int:
-        """获取当前coverage数量"""
+        """Get current coverage count"""
         return sum(1 for b in self.local_bitmap if b > 0)
     
+    @classmethod
+    def cleanup(cls):
+        """Clean up shared resources"""
+        cls._shared_array = None
+        cls._lock = None
+        cls._revision = None
+        
     def __del__(self):
-        """清理资源（multiprocessing.Array自动管理，无需手动清理）"""
-        pass
+        """Destructor"""
+        try:
+            self.cleanup()
+        except:
+            pass
 
 
 class WorkerSeedQueue:
     """
-    Worker Seed队列管理
+    Worker Seed Queue Management
     
-    每个worker有自己的私有队列，定期从其他worker导入高质量seeds。
+    Each worker has its own private queue, periodically importing high-quality seeds from other workers.
     
-    策略：
-    1. 本地优先：80%时间处理本地seeds
-    2. 定期同步：每100次迭代从其他worker导入
-    3. 智能导入：只导入高质量seeds（new_edges > 阈值）
-    4. 去重：避免重复导入相同seeds
+    Strategy:
+    1. Local priority: 80% time processing local seeds
+    2. Periodic sync: Sync from others every 100 iterations
+    3. Smart import: Only import high-quality seeds (new_edges > threshold)
+    4. Deduplication: Avoid re-importing identical seeds
     """
     
     def __init__(
@@ -179,72 +264,72 @@ class WorkerSeedQueue:
         num_workers: int
     ):
         """
-        初始化Worker Seed队列
+        Initialize Worker Seed Queue
         
         Args:
             worker_id: Worker ID
-            sync_dir: 同步目录
-            num_workers: 总worker数量
+            sync_dir: Synchronization directory
+            num_workers: Total number of workers
         """
         self.worker_id = worker_id
         self.sync_dir = sync_dir
         self.num_workers = num_workers
         
-        # 私有队列目录
+        # Private queue directory
         self.my_dir = sync_dir / "queue" / f"worker{worker_id}"
         self.my_dir.mkdir(parents=True, exist_ok=True)
         
-        # 已导入的seeds（去重）
+        # Imported seeds (deduplication)
         self.imported_seeds: Set[str] = set()
         
-        # 同步计数器
+        # Sync counter
         self.sync_counter = 0
-        self.SYNC_INTERVAL = 100  # 每100次迭代同步一次
+        self.SYNC_INTERVAL = 100  # Synchronize every 100 iterations
         
-        # Seed序列号
+        # Seed sequence number
         self.seq = 0
         
-        # 统计信息
+        # Statistics
         self.imported_count = 0
         self.avg_depth = 0
     
     def should_sync(self) -> bool:
-        """判断是否应该同步"""
+        """Decide if sync is needed"""
         self.sync_counter += 1
         return self.sync_counter % self.SYNC_INTERVAL == 0
     
     def sync_with_others(self) -> List[Any]:
         """
-        从其他worker导入新seeds
+        Import new seeds from other workers
         
         Returns:
-            导入的seeds列表
+            List of imported seeds
         """
         imported_seeds = []
         
-        # 扫描所有其他worker的目录
+        # Scan all other worker directories
         for other_worker_id in range(self.num_workers):
             if other_worker_id == self.worker_id:
-                continue  # 跳过自己
+                continue  # Skip self
             
             other_worker_dir = self.sync_dir / "queue" / f"worker{other_worker_id}"
             if not other_worker_dir.exists():
                 continue
             
-            # 发现新seeds
+            # Found new seeds
             for seed_file in other_worker_dir.iterdir():
                 seed_id = seed_file.name
                 
-                # 避免重复导入
+                # Avoid duplicate import
                 if seed_id in self.imported_seeds:
                     continue
                 
-                # 解析seed元数据
+                # Parse seed metadata
                 metadata = SeedMetadata.parse_filename(seed_id)
                 if not metadata:
                     continue
                 
-                # 导入策略：只导入高质量seeds
+                # Import strategy: only import high quality seeds
                 if self._should_import(metadata):
                     try:
                         seed = self._load_seed(seed_file)
@@ -255,7 +340,7 @@ class WorkerSeedQueue:
                     except:
                         pass
                 
-                # 限制单次导入数量
+                # Limit single import count
                 if len(imported_seeds) >= 50:
                     break
             
@@ -266,34 +351,34 @@ class WorkerSeedQueue:
     
     def _should_import(self, metadata: SeedMetadata) -> bool:
         """
-        判断是否应该导入这个seed
+        Decide if a seed should be imported
         
-        策略：
-        1. 新coverage高的seeds（new_edges > 5）
-        2. 路径深度大的seeds（depth > avg）
-        3. 随机采样一小部分（10%概率）
+        Strategy:
+        1. High new coverage seeds (new_edges > 5)
+        2. High depth seeds (depth > avg)
+        3. Random sampling (10% probability)
         """
-        # 策略1: 高coverage
+        # Strategy 1: High coverage
         if metadata.new_edges > 5:
             return True
         
-        # 策略2: 深路径
+        # Strategy 2: Deep path
         if self.avg_depth > 0 and metadata.depth > self.avg_depth:
             return True
         
-        # 策略3: 随机采样（多样性）
+        # Strategy 3: Random sampling (diversity)
         if random.random() < 0.1:
             return True
         
         return False
     
     def _load_seed(self, seed_file: Path) -> Optional[Any]:
-        """加载seed文件"""
+        """Load seed file"""
         try:
             with open(seed_file, 'rb') as f:
                 return pickle.load(f)
         except:
-            # 如果不是pickle格式，作为原始bytes返回
+            # If not in pickle format, return as raw bytes
             try:
                 with open(seed_file, 'rb') as f:
                     return f.read()
@@ -307,54 +392,54 @@ class WorkerSeedQueue:
         depth: int
     ) -> Path:
         """
-        保存新seed到自己的目录
+        Save new seed to private directory
         
         Args:
-            seed: Seed对象
-            new_edges: 新发现的edges数量
-            depth: 路径深度
+            seed: Seed object
+            new_edges: Number of new edges discovered
+            depth: Path depth
         
         Returns:
-            保存的文件路径
+            Saved file path
         """
-        # 生成文件名
+        # Generate filename
         seed_id = f"id_{self.seq:06d}_cov_{new_edges}_depth_{depth}"
         seed_path = self.my_dir / seed_id
         
-        # 原子写入（先写临时文件再重命名）
+        # Atomic write (write to tmp then rename)
         temp_path = seed_path.with_suffix('.tmp')
         
         try:
             with open(temp_path, 'wb') as f:
                 pickle.dump(seed, f)
             
-            # 原子重命名
+            # Atomic rename
             temp_path.rename(seed_path)
             
             self.seq += 1
             
-            # 更新平均深度
+            # Update average depth
             self._update_avg_depth(depth)
             
             return seed_path
         
         except Exception as e:
-            # 清理临时文件
+            # Clean up tmp file
             if temp_path.exists():
                 temp_path.unlink()
             raise e
     
     def _update_avg_depth(self, depth: int):
-        """更新平均深度（移动平均）"""
-        alpha = 0.1  # 平滑系数
+        """Update average depth (moving average)"""
+        alpha = 0.1  # Smoothing factor
         self.avg_depth = alpha * depth + (1 - alpha) * self.avg_depth
     
     def get_queue_size(self) -> int:
-        """获取队列大小"""
+        """Get queue size"""
         return len(list(self.my_dir.iterdir()))
     
     def load_all_seeds(self) -> List[Any]:
-        """加载所有本地seeds"""
+        """Load all local seeds"""
         seeds = []
         for seed_file in self.my_dir.iterdir():
             seed = self._load_seed(seed_file)
@@ -365,9 +450,9 @@ class WorkerSeedQueue:
 
 class WorkStealingQueue:
     """
-    工作窃取队列
+    Work Stealing Queue
     
-    当worker的本地队列为空时，可以"窃取"其他worker的工作。
+    When a worker's local queue is empty, it can 'steal' work from other workers.
     """
     
     def __init__(
@@ -382,12 +467,12 @@ class WorkStealingQueue:
     
     def steal_from_others(self) -> Optional[Any]:
         """
-        从其他worker窃取工作
+        Steal work from others
         
         Returns:
-            窃取的seed，如果没有则返回None
+            Stolen seed, or None if failed
         """
-        # 随机选择一个受害者worker
+        # Randomly choose a victim worker
         victim_id = random.choice([
             w for w in range(self.num_workers)
             if w != self.worker_id
@@ -397,12 +482,12 @@ class WorkStealingQueue:
         if not victim_dir.exists():
             return None
         
-        # 获取受害者的seeds
+        # Get victim's seeds
         seed_files = list(victim_dir.iterdir())
         if not seed_files:
             return None
         
-        # 随机窃取一个
+        # Randomly steal one
         stolen_file = random.choice(seed_files)
         
         try:
@@ -413,14 +498,14 @@ class WorkStealingQueue:
 
 
 def test_shared_coverage():
-    """测试SharedCoverage"""
+    """Test SharedCoverage"""
     print("Testing SharedCoverage...")
 
-    # 创建两个worker的coverage（共享multiprocessing.Array）
+    # Create coverage for two workers (shared multiprocessing.Array)
     worker0 = SharedCoverage(worker_id=0)
     worker1 = SharedCoverage(worker_id=1)
 
-    # Worker 0 发现新coverage
+    # Worker 0 discovers new coverage
     test_bitmap = bytearray(COVERAGE_MAP_SIZE)
     test_bitmap[0] = 0xFF
     test_bitmap[1] = 0xAA
@@ -428,11 +513,11 @@ def test_shared_coverage():
     new_edges = worker0.update_coverage(bytes(test_bitmap))
     print(f"Worker 0 found {new_edges} new edges")
 
-    # Worker 1 同步
+    # Worker 1 synchronizes
     new_edges = worker1.sync_coverage()
     print(f"Worker 1 synced {new_edges} new edges")
 
-    # 验证
+    # Verify
     assert worker1.local_bitmap[0] == 0xFF
     assert worker1.local_bitmap[1] == 0xAA
 
@@ -440,29 +525,29 @@ def test_shared_coverage():
 
 
 def test_worker_seed_queue():
-    """测试WorkerSeedQueue"""
+    """Test WorkerSeedQueue"""
     import tempfile
     import shutil
     
     print("Testing WorkerSeedQueue...")
     
-    # 创建临时目录
+    # Create temporary directory
     temp_dir = Path(tempfile.mkdtemp())
     (temp_dir / "queue").mkdir()
     
     try:
-        # 创建两个worker的队列
+        # Create queues for two workers
         worker0_queue = WorkerSeedQueue(0, temp_dir, 2)
         worker1_queue = WorkerSeedQueue(1, temp_dir, 2)
         
-        # Worker 0 保存seeds
+        # Worker 0 saves seeds
         test_seed = b"test_seed_data"
         worker0_queue.save_seed(test_seed, new_edges=10, depth=50)
         worker0_queue.save_seed(test_seed, new_edges=5, depth=30)
         
         print(f"Worker 0 queue size: {worker0_queue.get_queue_size()}")
         
-        # Worker 1 同步
+        # Worker 1 synchronizes
         imported = worker1_queue.sync_with_others()
         print(f"Worker 1 imported {len(imported)} seeds")
         

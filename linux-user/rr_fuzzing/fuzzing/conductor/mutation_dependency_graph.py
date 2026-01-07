@@ -498,7 +498,7 @@ class MutationDependencyGraph:
         }
 
         with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, default=lambda o: list(o) if isinstance(o, set) else str(o))
 
     def to_dict(self) -> Dict[str, Any]:
         """

@@ -2,9 +2,9 @@
 """
 Stats Consistency Checker
 
-自动验证final_stats.json中的数据一致性，检测"Multiple Sources of Truth"问题。
+Automatically verifies data consistency in final_stats.json, detecting "Multiple Sources of Truth" issues.
 
-用法:
+Usage:
     python3 check_stats_consistency.py <stats_file>
     python3 check_stats_consistency.py fuzzing_output/final_stats.json
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 class StatsConsistencyChecker:
-    """Stats一致性检查器"""
+    """Stats Consistency Checker"""
 
     def __init__(self, stats_file):
         self.stats_file = Path(stats_file)
@@ -24,7 +24,7 @@ class StatsConsistencyChecker:
         self.warnings = []
 
     def load_stats(self):
-        """加载stats文件"""
+        """Load stats file"""
         try:
             with open(self.stats_file, 'r') as f:
                 self.data = json.load(f)
@@ -37,7 +37,7 @@ class StatsConsistencyChecker:
             return False
 
     def check_execution_counters(self):
-        """检查执行计数器一致性"""
+        """Check consistency of execution counters"""
         execution = self.data.get('execution', {})
         executor = self.data.get('executor', {})
 
@@ -48,8 +48,8 @@ class StatsConsistencyChecker:
             self.errors.append("Missing execution counters")
             return False
 
-        # 允许一定的差异 (因为DynamicFork会增加额外的执行)
-        # 但total_execs应该 >= total_executions
+        # Allow some difference (since DynamicFork may add extra executions)
+        # but total_execs should be >= total_executions
         if total_execs < total_executions:
             self.errors.append(
                 f"❌ Execution counter inconsistency: "
@@ -58,9 +58,9 @@ class StatsConsistencyChecker:
             )
             return False
 
-        # 如果差异过大，发出警告
+        # If difference is too large, issue a warning
         diff = total_execs - total_executions
-        if diff > total_executions * 0.5:  # 超过50%差异
+        if diff > total_executions * 0.5:  # Over 50% difference
             self.warnings.append(
                 f"⚠️  Large difference between counters: "
                 f"total_execs={total_execs}, total_executions={total_executions}, diff={diff}"
@@ -69,14 +69,14 @@ class StatsConsistencyChecker:
         return True
 
     def check_crash_counts(self):
-        """检查crash计数一致性"""
+        """Check consistency of crash counts"""
         execution = self.data.get('execution', {})
         executor = self.data.get('executor', {})
 
         crashes_found = execution.get('crashes_found', 0)
         total_crashes = executor.get('total_crashes', 0)
 
-        # Crashes应该一致
+        # Crashes should be consistent
         if crashes_found != total_crashes:
             self.warnings.append(
                 f"⚠️  Crash count mismatch: "
@@ -88,14 +88,14 @@ class StatsConsistencyChecker:
         return True
 
     def check_timeout_counts(self):
-        """检查超时计数一致性"""
+        """Check consistency of timeout counts"""
         execution = self.data.get('execution', {})
         executor = self.data.get('executor', {})
 
         timeouts = execution.get('timeouts', 0)
         total_timeouts = executor.get('total_timeouts', 0)
 
-        # Timeouts应该一致
+        # Timeouts should be consistent
         if timeouts != total_timeouts:
             self.warnings.append(
                 f"⚠️  Timeout count mismatch: "
@@ -107,13 +107,13 @@ class StatsConsistencyChecker:
         return True
 
     def check_coverage_consistency(self):
-        """检查覆盖率数据一致性"""
+        """Check consistency of coverage data"""
         coverage = self.data.get('coverage', {})
 
         total_edges = coverage.get('total_edges', 0)
         new_edges = coverage.get('new_edges_this_run', 0)
 
-        # new_edges应该 <= total_edges
+        # new_edges should be <= total_edges
         if new_edges > total_edges:
             self.errors.append(
                 f"❌ Coverage inconsistency: "
@@ -124,13 +124,13 @@ class StatsConsistencyChecker:
         return True
 
     def check_rates(self):
-        """检查各种比率的合理性"""
+        """Check reasonableness of various rates"""
         executor = self.data.get('executor', {})
 
         crash_rate = executor.get('crash_rate', 0)
         timeout_rate = executor.get('timeout_rate', 0)
 
-        # 比率应该在0-1之间
+        # Rates should be between 0 and 1
         if not (0 <= crash_rate <= 1):
             self.errors.append(f"❌ Invalid crash_rate: {crash_rate}")
             return False
@@ -142,7 +142,7 @@ class StatsConsistencyChecker:
         return True
 
     def run_checks(self):
-        """运行所有检查"""
+        """Run all checks"""
         if not self.load_stats():
             return False
 
@@ -178,7 +178,7 @@ class StatsConsistencyChecker:
         print(f"Summary: {passed} passed, {failed} failed/warning")
         print(f"{'='*60}\n")
 
-        # 显示详细错误和警告
+        # Show detailed errors and warnings
         if self.errors:
             print("❌ Errors:")
             for error in self.errors:
@@ -191,7 +191,7 @@ class StatsConsistencyChecker:
                 print(f"  {warning}")
             print()
 
-        # 显示关键统计信息
+        # Show key statistics
         execution = self.data.get('execution', {})
         print(f"📊 Key Statistics:")
         print(f"  total_execs: {execution.get('total_execs', 'N/A')}")
@@ -201,7 +201,7 @@ class StatsConsistencyChecker:
         print(f"  timeouts: {execution.get('timeouts', 'N/A')}")
         print()
 
-        # 返回True如果没有错误
+        # Return True if no errors
         return len(self.errors) == 0
 
 

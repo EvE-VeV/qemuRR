@@ -418,7 +418,7 @@ static void inject_interesting_values(rr_aux_data_t *aux, const FuzzInstruction 
  */
 void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
                               abi_long *args, int syscall_nr) {
-    // 检查前提条件
+    // Check prerequisites
     if (!record || !record->aux_data) {
         RR_VERBOSE("FUZZ_AUX: No aux_data to mutate");
         return;
@@ -437,11 +437,11 @@ void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
     RR_VERBOSE("FUZZ_AUX: Mutating aux_data for syscall %d (index=%u)", 
               syscall_nr, record->index);
     
-    // 遍历所有 Fuzz 指令
+    // Iterate through all Fuzz instructions
     for (size_t i = 0; i < g_instruction_count; i++) {
         FuzzInstruction *instr = &g_fuzz_instructions[i];
         
-        // 只处理匹配当前 syscall 索引的指令
+        // Only process instructions matching current syscall index
         if (instr->syscall_index != record->index) {
             continue;
         }
@@ -458,7 +458,7 @@ void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
         RR_VERBOSE("FUZZ_AUX: Found aux_data for arg[%u] (mask=0x%02x), size=%u, kind=%d",
                   instr->arg_index, arg_mask, aux->size, aux->kind);
         
-        // 根据命令类型执行变异
+        // Execute mutation based on command type
         switch (instr->cmd) {
             case FUZZ_CMD_MUTATE_AUX_BUFFER:
                 mutate_aux_buffer(aux, instr);

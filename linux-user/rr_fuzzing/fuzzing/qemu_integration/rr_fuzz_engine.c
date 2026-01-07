@@ -1,12 +1,12 @@
 /**
- * RR-Fuzz变异引擎
- * 实现Fuzzing指令的应用和参数变异
+ * RR-Fuzz Mutation Engine
+ * Implements fuzzing instruction application and parameter mutation
  */
 
 #include "../../core/rr_framework.h"
 #include "../../utils/rr_syscall_dispatch.h"
 
-/* ==================== 优化开关 ==================== */
+/* ==================== Optimization Flags ==================== */
 #define FUZZ_ENABLE_DEBUG_LOG 1
 
 #if FUZZ_ENABLE_DEBUG_LOG
@@ -15,7 +15,7 @@
 #define FUZZ_DEBUG_LOG(...) do {} while(0)
 #endif
 
-/* ==================== 全局状态 ==================== */
+/* ==================== Global State ==================== */
 
 FuzzInstruction g_fuzz_instructions[FUZZ_MAX_INSTRUCTIONS];
 size_t g_instruction_count = 0;
@@ -41,7 +41,7 @@ static int get_input_io_buffer_arg_index(int syscall_nr);
 fuzz_stats_t g_fuzz_stats = {0};
 
 /**
- * 从共享内存加载Fuzz指令
+ * Load Fuzz instructions from shared memory
  */
 int rr_fuzz_load_from_shared_memory(void *shm_ptr)
 {
@@ -60,8 +60,10 @@ int rr_fuzz_load_from_shared_memory(void *shm_ptr)
 
     uint32_t expected_checksum = shm->magic ^ shm->sequence ^ shm->num_variants ^ shm->fork_point ^ shm->current_depth;
     if (shm->checksum != expected_checksum) {
-        RR_WARN("Shared memory checksum mismatch: got 0x%x, expected 0x%x",
-                shm->checksum, expected_checksum);
+        RR_WARN("Shared memory checksum mismatch! sequence=%u, num_variants=%u, fork_point=%u, depth=%u",
+                shm->sequence, shm->num_variants, shm->fork_point, shm->current_depth);
+        RR_WARN("Checksum: got 0x%08x, expected 0x%08x (magic=0x%08x)",
+                shm->checksum, expected_checksum, shm->magic);
         g_instruction_count = 0;
         return -1;
     }

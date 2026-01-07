@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-全局配置文件
+Global Configuration File
 """
 
-# 🔥 Speed Optimization: 禁用verbose日志以减少I/O开销
-# 设置为False可以提升5-10%的性能
+# 🔥 Speed Optimization: Disable verbose logging to reduce I/O overhead
+# Setting to False can improve performance by 5-10%
 ENABLE_VERBOSE_LOGGING = False
 
-# 是否启用DynamicFork详细日志
+# Whether to enable detailed DynamicFork logging
 ENABLE_DYNAMIC_FORK_VERBOSE = False
 
-# 是否启用PathFinder详细日志
+# Whether to enable detailed PathFinder logging
 ENABLE_PATHFINDER_VERBOSE = False
 
-# 是否启用Mutation详细日志
+# Whether to enable detailed Mutation logging
 ENABLE_MUTATION_VERBOSE = False

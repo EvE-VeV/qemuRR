@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-DualLevelPathFinder - 双层CFG架构实现
+DualLevelPathFinder - Dual-level CFG Architecture Implementation
 
-实现BB-level和Syscall-level的双层控制流图分析，
-解决syscall索引映射不准确的问题。
+Implements dual-layer control flow graph analysis for BB-level and Syscall-level,
+resolving inaccuracies in syscall index mapping.
 """
 
 import os
@@ -13,24 +13,20 @@ from typing import List, Dict, Set, Tuple, Any, Optional
 from collections import defaultdict
 import logging
 
-# 添加fuzzing目录到路径
-fuzzing_dir = Path(__file__).parent.parent
-if str(fuzzing_dir) not in sys.path:
-    sys.path.insert(0, str(fuzzing_dir))
-
-from multiprocess.syscall_block import SyscallBlock
-from conductor.async_logger import alog
-from conductor.types import MutationRecipe
+# Add parent directory to path if needed (though usually conductor/ is in path)
+from .syscall_block import SyscallBlock
+from .async_logger import alog
+from .types import MutationRecipe
 
 
 class DualLevelPathFinder:
-    """双层CFG的PathFinder实现"""
+    """PathFinder implementation with dual-level CFG"""
 
     def __init__(self, target_binary: str, config=None):
         """
         Args:
-            target_binary: 目标二进制文件路径
-            config: PathFinder配置（可选）
+            target_binary: Path to target binary
+            config: PathFinder configuration (optional)
         """
         self.target_binary = target_binary
         self.config = config
@@ -43,30 +39,33 @@ class DualLevelPathFinder:
         # Mapping: BB → Syscall Block
         self.bb_to_syscall: Dict[int, int] = {}  # bb_addr → syscall_idx
 
-        # 统计信息
+        # Statistics
         self.stats = {
             'total_blocks': 0,
             'total_edges': 0,
             'total_bbs': 0,
         }
 
+        # Cache for tree files: path -> (mtime, size, nodes_data, blocks, map)
+        self._tree_cache = {}
+
         self.available = True
 
     # def _setup_logger(self) -> logging.Logger:
-    #     """设置日志"""
+    #     """Setup logger"""
     #     # Replaced by alog
     #     pass
 
     def load_syscall_tree(self, tree_file: str = "/tmp/syscall_tree.json") -> bool:
         """
-        从C端导出的syscall tree JSON文件加载精确的BB→Syscall映射
+        Load precise BB->Syscall mapping from syscall tree JSON exported from C-side.
 
-        这个方法解决了PathFinder recipe命中率低的问题:
-        - 旧方法: 使用粗糙估算 (source_addr >> 4) % 20, 命中率<10%
-        - 新方法: 使用C端精确映射, 命中率85%+
+        This method solves the low hit rate issue of PathFinder recipes:
+        - Legacy method: Using crude estimate (source_addr >> 4) % 20, hit rate < 10%
+        - New method: Using precise C-side mapping, hit rate 85%+
 
         Args:
-            tree_file: Syscall tree JSON文件路径(由C端rr_syscall_tree.c导出)
+            tree_file: Path to syscall tree JSON file (exported by C-side rr_syscall_tree.c)
 
         Returns:
             True if successfully loaded, False otherwise
@@ -79,58 +78,117 @@ class DualLevelPathFinder:
             alog(f"Hint: Ensure C-side code has exported syscall tree", "PathFinder", "WARN")
             return False
 
+        import json
+        import os
+        
         try:
-            with open(tree_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                
-            # HTML bundle parsing
-            if content.strip().startswith('<!DOCTYPE html>') or 'const treeData =' in content:
-                import re
-                # 改进的正则匹配：匹配直到 // Stats Init 之前的最后一个分号
-                # 因为 JSON 内部不会出现 }; 且之后紧跟大量 JS 代码
-                match = re.search(r'const treeData = ({.*?});\s+// Stats Init', content, re.DOTALL)
-                if not match:
-                    # Fallback: 尝试匹配到末尾的分号（如果 footer 格式变了）
-                    match = re.search(r'const treeData = ({.*?});', content, re.DOTALL)
-                
-                if match:
-                    json_str = match.group(1)
-                    try:
-                        tree_data = json.loads(json_str)
-                    except json.JSONDecodeError as je:
-                        alog(f"JSON parsing failed: {je}", "PathFinder", "ERROR")
-                        # 尝试更宽泛的匹配: 寻找第一个 { 和 最后一个 } 之间的内容
-                        start_idx = content.find('const treeData = ')
-                        if start_idx != -1:
-                            start_idx += len('const treeData = ')
-                            end_marker = ';\n'
-                            end_idx = content.find(end_marker, start_idx)
+            # Check cache
+            try:
+                stat = os.stat(tree_file)
+                mtime = stat.st_mtime
+                size = stat.st_size
+                if tree_file in self._tree_cache:
+                    cached_mtime, cached_size, cached_nodes, cached_blocks, cached_map = self._tree_cache[tree_file]
+                    if cached_mtime == mtime and cached_size == size:
+                        alog(f"♻️ Using cached syscall tree for {tree_file}", "PathFinder", "INFO")
+                        nodes = cached_nodes
+                        # Since we cached the processed objects too, we can restore them
+                        # But self.syscall_blocks and self.bb_to_syscall are instance state
+                        # We must update them
+                        self.syscall_blocks = cached_blocks.copy()
+                        self.bb_to_syscall = cached_map.copy()
+                        
+                        # Initialize stats
+                        self.stats['total_blocks'] = len(self.syscall_blocks)
+                        self.stats['total_edges'] = len(self.syscall_edges) # Edges are not fully cached here but simple restore of blocks implies edges if we had them or if they are derived. 
+                        # Actually syscall_edges is static per tree structure. Let's assume we re-build edges or cache them too.
+                        # For simplicity, let's just cache the 'nodes' list and let the fast in-memory loop run.
+                        # The heavy part is JSON parsing.
+                        pass 
+                    else:
+                        nodes = None
+                else:
+                    nodes = None
+            except FileNotFoundError:
+                return False
+
+            if nodes is None:
+                with open(tree_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    
+                # HTML bundle parsing
+                if 'const treeData =' in content or 'var treeData =' in content:
+                    import re
+                    match_start = re.search(r'(?:const|var)\s+treeData\s*=\s*', content)
+                    if match_start:
+                        start_idx = match_start.end()
+                        
+                        # Look for marker or fallback
+                        marker_idx = content.find('// Stats Init', start_idx)
+                        json_str = None
+                        
+                        if marker_idx != -1:
+                            end_idx = content.rfind(';', start_idx, marker_idx)
                             if end_idx != -1:
                                 json_str = content[start_idx:end_idx].strip()
-                                tree_data = json.loads(json_str)
-                            else:
-                                return False
+                        
+                        if not json_str:
+                            end_idx = content.find(';\n', start_idx)
+                            if end_idx != -1:
+                                 json_str = content[start_idx:end_idx].strip()
+                        
+                        if json_str:
+                            try:
+                                tree_data = json.loads(json_str) 
+                            except json.JSONDecodeError as je:
+                                alog(f"JSON parsing failed (HTML extract): {je}", "PathFinder", "ERROR")
+                                # Deep recovery
+                                try:
+                                    brace_count = 0
+                                    for i, char in enumerate(content[start_idx:], start=start_idx):
+                                        if char == '{':
+                                            brace_count += 1
+                                        elif char == '}':
+                                            brace_count -= 1
+                                            if brace_count == 0:
+                                                json_str = content[start_idx:i+1]
+                                                tree_data = json.loads(json_str)
+                                                break
+                                except Exception:
+                                    return False
                         else:
                             return False
+                    else:
+                        return False
                 else:
-                    alog(f"Failed to extract treeData from HTML: {tree_file}", "PathFinder", "ERROR")
-                    return False
-            else:
-                # Standard JSON
-                tree_data = json.loads(content)
+                    try:
+                        tree_data = json.loads(content)
+                    except json.JSONDecodeError:
+                        return False
 
-            # 提取节点数据
+                # Extract node data
+                nodes = tree_data.get('nodes', [])
+                
+            if not nodes:
+                return False
+            
+            # --- Common Processing Logic (Cached or New) ---
+            # Reset current mapping
+            self.syscall_blocks.clear()
+            self.bb_to_syscall.clear()
+
+            # Extract node data
             nodes = tree_data.get('nodes', [])
             if not nodes:
                 alog(f"Syscall tree is empty: {tree_file}", "PathFinder", "WARN")
                 return False
-
-            # 存储tree数据供后续使用
+            
+            # Store tree data for future use
             if not hasattr(self, 'syscall_tree_data'):
                 self.syscall_tree_data = {}
             self.syscall_tree_data = tree_data
-
-            # ✅ P3 Fix 1: 初始化Syscall Blocks
+            
+            # ✅ P3 Fix 1: Initialize Syscall Blocks
             temp_id_to_block = {}
             for node in nodes:
                 syscall_idx = node.get('syscall_index', -1)
@@ -149,12 +207,12 @@ class DualLevelPathFinder:
                 
                 block.bb_addrs = node.get('bb_addresses', [])
                 
-                # 同时也按node ID索引，用于建立边
+                # Also index by node ID for building edges
                 node_id = node.get('id', -1)
                 if node_id >= 0:
                     temp_id_to_block[node_id] = block
 
-            # ✅ P3 Fix 2: 建立图的边 (Successors/Predecessors)
+            # ✅ P3 Fix 2: Build graph edges (Successors/Predecessors)
             for node in nodes:
                 node_id = node.get('id', -1)
                 parent_id = node.get('parent_id', -1)
@@ -163,15 +221,15 @@ class DualLevelPathFinder:
                     child_block = temp_id_to_block[node_id]
                     parent_block = temp_id_to_block[parent_id]
                     
-                    # 建立双向链接
+                    # Establish bilateral links
                     parent_block.add_successor(child_block)
                     child_block.add_predecessor(parent_block)
                     
-                    # 记录边
+                    # Record edge
                     self.syscall_edges.add((parent_block.syscall_index, child_block.syscall_index))
 
-            # 构建BB→Syscall映射
-            # 方法1: 如果tree_data有预计算的映射
+            # Build BB->Syscall mapping
+            # Method 1: If tree_data has pre-computed mapping
             if 'bb_to_syscall' in tree_data:
                 bb_map = tree_data['bb_to_syscall']
                 for bb_addr_str, syscall_idx in bb_map.items():
@@ -179,14 +237,14 @@ class DualLevelPathFinder:
                     self.bb_to_syscall[bb_addr] = syscall_idx
                 alog(f"✅ Loaded {len(self.bb_to_syscall)} BB->Syscall mappings from pre-computed map", "PathFinder", "INFO")
             else:
-                # 方法2: 从nodes中提取BB地址
+                # Method 2: Extract BB addresses from nodes
                 for node in nodes:
                     syscall_idx = node.get('syscall_index', -1)
                     bb_addrs = node.get('bb_addresses', [])
 
                     if syscall_idx >= 0:
                         for bb_addr in bb_addrs:
-                            # 处理字符串格式的地址 (如 "0x12345")
+                            # Handle string format addresses (e.g., "0x12345")
                             if isinstance(bb_addr, str):
                                 try:
                                     bb_addr = int(bb_addr, 16)
@@ -196,7 +254,7 @@ class DualLevelPathFinder:
 
                 alog(f"✅ Extracted {len(self.bb_to_syscall)} BB->Syscall mappings from nodes", "PathFinder", "INFO")
 
-            # 日志输出加载统计
+            # Log loading statistics
             alog(f"✅ Syscall tree loaded and initialized:", "PathFinder", "INFO")
             alog(f"  - Nodes: {len(nodes)}", "PathFinder", "INFO")
             alog(f"  - Initialized Blocks: {len(self.syscall_blocks)}", "PathFinder", "INFO")
@@ -213,66 +271,93 @@ class DualLevelPathFinder:
 
     def mark_nodes_covered(self, tree_file: str) -> int:
         """
-        根据给定的tree文件，显式标记其中出现的节点为已覆盖。
-        这比基于bitmap的映射更准确。
+        Explicitly mark nodes appearing in the given tree file as covered.
+        This is more accurate than bitmap-based mapping.
         """
         import json
+        
         try:
-            with open(tree_file, 'r') as f:
+             import re
+             with open(tree_file, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-                if 'var treeData =' in content:
-                    start = content.find('var treeData =') + len('var treeData =')
-                    end = content.find('};', start) + 1
-                    tree_data = json.loads(content[start:end])
-                else:
-                    tree_data = json.loads(content)
             
-            nodes = tree_data.get('nodes', [])
-            marked = 0
-            for node in nodes:
-                idx = node.get('syscall_index', -1)
-                if idx in self.syscall_blocks:
-                    if not self.syscall_blocks[idx].is_covered:
-                        self.syscall_blocks[idx].is_covered = True
-                        marked += 1
+             tree_data = None
             
-            if marked > 0:
-                alog(f"📍 Marked {marked} new nodes as covered from tree", "PathFinder", "INFO")
-            return marked
+             # Check for HTML bundle format (const treeData = ... or var treeData = ...)
+             if 'treeData =' in content:
+                 match_start = re.search(r'(?:const|var)\s+treeData\s*=\s*', content)
+                 if match_start:
+                     start_idx = match_start.end()
+                     # Use simpler extraction: find the next ';\n' or '};'
+                     # Or reuse the logic: look for start of JSON '{'
+                     if content[start_idx:].strip().startswith('{'):
+                         # Find proper end
+                         end_idx = content.find(';\n', start_idx)
+                         if end_idx != -1:
+                             try:
+                                 tree_data = json.loads(content[start_idx:end_idx].strip())
+                             except:
+                                 pass
+            
+             # If extraction failed or it's a plain JSON file
+             if tree_data is None:
+                 try:
+                      # If file starts with {, it's likely pure JSON
+                      if content.strip().startswith('{'):
+                         tree_data = json.loads(content)
+                 except:
+                     pass
+            
+             if not tree_data:
+                 # alog(f"Could not parse valid JSON from {tree_file}", "PathFinder", "WARN")
+                 return 0
+            
+             nodes = tree_data.get('nodes', [])
+             marked = 0
+             for node in nodes:
+                 idx = node.get('syscall_index', -1)
+                 if idx in self.syscall_blocks:
+                     if not self.syscall_blocks[idx].is_covered:
+                         self.syscall_blocks[idx].is_covered = True
+                         marked += 1
+            
+             if marked > 0:
+                 alog(f"📍 Marked {marked} new nodes as covered from tree", "PathFinder", "INFO")
+             return marked
         except Exception as e:
             alog(f"Failed to mark nodes as covered: {e}", "PathFinder", "ERROR")
             return 0
 
     def build_dual_cfg(self, trace_file: str) -> bool:
         """
-        从trace文件构建双层CFG
+        Build dual-level CFG from trace file
 
         Args:
-            trace_file: Trace文件路径
+            trace_file: Path to trace file
 
         Returns:
-            是否成功构建
+            True if successfully built, False otherwise
         """
         alog("Starting dual-level CFG build...", "PathFinder", "INFO")
 
         try:
-            # 导入TraceAnalyzer
+            # Import TraceAnalyzer
             from trace_analyzer import TraceAnalyzer
 
-            # 解析trace
+            # Parse trace
             analyzer = TraceAnalyzer(trace_file)
             if not analyzer.analyze():
                 alog("TraceAnalyzer parsing failed", "PathFinder", "ERROR")
                 return False
-
-            # 检查BB trace
+            
+            # Check BB trace
             if not analyzer.has_bb_trace() or not analyzer.bb_trace_parser:
                 alog("Missing BB trace, using simplified mode", "PathFinder", "WARN")
                 return self._build_syscall_only_cfg(analyzer)
-
-            # 构建Syscall-level CFG
+            
+            # Build Syscall-level CFG
             self._build_syscall_cfg(analyzer)
-
+            
             alog(f"✅ Dual-level CFG build complete:", "PathFinder", "INFO")
             alog(f"  - Syscall blocks: {len(self.syscall_blocks)}", "PathFinder", "INFO")
             alog(f"  - Syscall edges: {len(self.syscall_edges)}", "PathFinder", "INFO")
@@ -288,15 +373,15 @@ class DualLevelPathFinder:
 
     def _build_syscall_cfg(self, analyzer):
         """
-        从TraceAnalyzer构建Syscall-level CFG
+        Build Syscall-level CFG from TraceAnalyzer
 
         Args:
-            analyzer: TraceAnalyzer实例
+            analyzer: TraceAnalyzer instance
         """
         syscalls = analyzer.syscalls
         bb_entries = analyzer.bb_trace_parser.entries
 
-        # Step 1: 创建所有SyscallBlocks
+        # Step 1: Create all SyscallBlocks
         for syscall in syscalls:
             idx = syscall.index
             block = SyscallBlock(
@@ -307,7 +392,7 @@ class DualLevelPathFinder:
             block.syscall_retval = getattr(syscall, 'retval', 0)
             self.syscall_blocks[idx] = block
 
-        # Step 2: 分配BBs到对应的SyscallBlock
+        # Step 2: Assign BBs to corresponding SyscallBlocks
         for bb_entry in bb_entries:
             bb_addr = bb_entry.pc
             syscall_idx = bb_entry.syscall_idx
@@ -316,19 +401,19 @@ class DualLevelPathFinder:
                 self.syscall_blocks[syscall_idx].add_bb(bb_addr)
                 self.bb_to_syscall[bb_addr] = syscall_idx
 
-        # Step 3: 构建Syscall-level控制流边
+        # Step 3: Build Syscall-level control flow edges
         self._build_syscall_edges(bb_entries)
 
-        # 更新统计
+        # Update statistics
         self.stats['total_blocks'] = len(self.syscall_blocks)
         self.stats['total_edges'] = len(self.syscall_edges)
         self.stats['total_bbs'] = len(self.bb_to_syscall)
 
     def _build_syscall_edges(self, bb_entries: List):
         """
-        分析syscall之间的控制流边
+        Analyze control flow edges between syscalls
 
-        策略：当BB trace中的syscall_idx发生变化时，创建边
+        Strategy: Create edges when syscall_idx changes in BB trace
         """
         prev_syscall_idx = None
 
@@ -338,15 +423,15 @@ class DualLevelPathFinder:
             if curr_syscall_idx < 0:
                 continue
 
-            # 检测syscall边界跨越
+            # Detect syscall boundary crossing
             if prev_syscall_idx is not None and prev_syscall_idx != curr_syscall_idx:
                 if prev_syscall_idx in self.syscall_blocks and curr_syscall_idx in self.syscall_blocks:
-                    # 创建边
+                    # Create edge
                     edge = (prev_syscall_idx, curr_syscall_idx)
                     if edge not in self.syscall_edges:
                         self.syscall_edges.add(edge)
 
-                        # 更新SyscallBlock的后继/前驱
+                        # Update successors/predecessors of SyscallBlock
                         prev_block = self.syscall_blocks[prev_syscall_idx]
                         curr_block = self.syscall_blocks[curr_syscall_idx]
                         prev_block.add_successor(curr_block)
@@ -356,14 +441,14 @@ class DualLevelPathFinder:
 
     def _build_syscall_only_cfg(self, analyzer) -> bool:
         """
-        构建仅syscall-level的CFG（无BB trace时的回退方案）
+        Build syscall-only CFG (Fallback plan when BB trace is missing)
 
         Args:
-            analyzer: TraceAnalyzer实例
+            analyzer: TraceAnalyzer instance
         """
         syscalls = analyzer.syscalls
 
-        # 创建SyscallBlocks
+        # Create SyscallBlocks
         for syscall in syscalls:
             idx = syscall.index
             block = SyscallBlock(
@@ -374,7 +459,7 @@ class DualLevelPathFinder:
             block.syscall_retval = getattr(syscall, 'retval', 0)
             self.syscall_blocks[idx] = block
 
-        # 构建线性边（syscall按顺序执行）
+        # Build linear edges (syscalls execute in order)
         for i in range(len(syscalls) - 1):
             curr_idx = syscalls[i].index
             next_idx = syscalls[i + 1].index
@@ -396,18 +481,18 @@ class DualLevelPathFinder:
 
     def find_uncovered_syscall_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:
         """
-        查找未覆盖的syscall-level分支
+        Find uncovered syscall-level branches
 
         Args:
-            covered_bbs: 已覆盖的BB地址集合
+            covered_bbs: Set of covered BB addresses
 
         Returns:
-            未覆盖的syscall分支列表
+            List of uncovered syscall branches
         """
         if not self.syscall_blocks:
             return []
 
-        # Step 1: 映射BB覆盖率到Syscall覆盖率
+        # Step 1: Map BB coverage to Syscall coverage
         covered_syscalls = set()
         matched_bb_count = 0
         for bb_addr in covered_bbs:
@@ -418,7 +503,7 @@ class DualLevelPathFinder:
         
         alog(f"Coverage Mapping Analysis: BBs={len(covered_bbs)}, Matched BBs={matched_bb_count}, Mapped Syscalls={len(covered_syscalls)}", "PathFinder", "DEBUG")
 
-        # 累积更新覆盖状态（不重置已有状态）
+        # Accumulate coverage status (do not reset existing status)
         newly_covered_blocks = 0
         for idx in covered_syscalls:
             if idx in self.syscall_blocks:
@@ -426,30 +511,30 @@ class DualLevelPathFinder:
                     self.syscall_blocks[idx].is_covered = True
                     newly_covered_blocks += 1
 
-        # Step 2: 查找未覆盖的syscall分支
+        # Step 2: Find uncovered syscall branches
         uncovered_branches = []
 
-        # 遍历所有已覆盖的syscall blocks
+        # Iterate through all covered syscall blocks
         total_successors = 0
         for syscall_idx in self.syscall_blocks:
             block = self.syscall_blocks[syscall_idx]
-
-            # 只检查已覆盖的block的successors
+            
+            # Only check successors of covered blocks
             if not block.is_covered:
                 continue
-
-            # 检查每个successor
+            
+            # Check each successor
             for succ_block in block.successors:
                 total_successors += 1
                 if not succ_block.is_covered:
-                    # 未覆盖的分支
+                    # Uncovered branch
                     branch = {
                         'from_syscall_idx': block.syscall_index,
                         'to_syscall_idx': succ_block.syscall_index,
                         'from_syscall_name': block.syscall_name,
                         'to_syscall_name': succ_block.syscall_name,
                         'type': 'syscall_edge',
-                        'target_syscall_idx': block.syscall_index,  # 使用源syscall进行变异
+                        'target_syscall_idx': block.syscall_index,  # Use source syscall for mutation
                         'has_syscall': True,
                     }
                     uncovered_branches.append(branch)
@@ -460,26 +545,26 @@ class DualLevelPathFinder:
 
     def generate_syscall_recipes(self, uncovered_branches: List[Dict[str, Any]]) -> List[MutationRecipe]:
         """
-        为未覆盖的syscall分支生成recipes
+        Generate recipes for uncovered syscall branches
 
         Args:
-            uncovered_branches: 未覆盖分支列表
+            uncovered_branches: List of uncovered branches
 
         Returns:
-            MutationRecipe对象列表
+            List of MutationRecipe objects
         """
         recipes = []
 
         for i, branch in enumerate(uncovered_branches):
             from_idx = branch['from_syscall_idx']
 
-            # 获取源syscall block的详细信息
+            # Get detailed info of source syscall block
             if from_idx not in self.syscall_blocks:
                 continue
-
+            
             from_block = self.syscall_blocks[from_idx]
-
-            # 构建MutationRecipe
+            
+            # Build MutationRecipe
             recipe = MutationRecipe(
                 source_branch=from_idx,
                 target_branch=branch['to_syscall_idx'],
@@ -495,7 +580,7 @@ class DualLevelPathFinder:
         return recipes
 
     def _infer_mutation_type(self, syscall_name: str) -> str:
-        """根据syscall类型推断mutation策略"""
+        """Infer mutation strategy based on syscall type"""
         if syscall_name in ['read', 'write', 'recv', 'send']:
             return 'FUZZ_CMD_EXTEND'
         elif syscall_name in ['open', 'openat']:
@@ -506,31 +591,31 @@ class DualLevelPathFinder:
             return 'FUZZ_CMD_INTERESTING_VALUES'
 
     def _infer_arg_index(self, syscall_name: str) -> int:
-        """推断应该变异哪个参数"""
+        """Infer which argument to mutate"""
         if syscall_name in ['read', 'write', 'recv', 'send']:
-            return 2  # count参数
+            return 2  # count parameter
         elif syscall_name in ['open', 'openat']:
-            return 1  # flags参数
-        return 0  # 默认第一个参数
+            return 1  # flags parameter
+        return 0  # Default to first parameter
 
     def is_available(self) -> bool:
         """
-        检查PathFinder是否可用
-        双层CFG采用延迟构建，初始化后即可用
+        Check if PathFinder is available
+        Dual-level CFG uses lazy building, available after initialization
         """
         return self.available
 
     def ensure_cfg_ready(self) -> bool:
         """
-        确保CFG就绪（兼容方法）
-        双层CFG采用延迟构建，初始化后总是可用
+        Ensure CFG is ready (compatibility method)
+        Dual-level CFG uses lazy building, always available after initialization
         """
         return True
 
     def build_from_trace(self, trace_file: str) -> bool:
         """
-        从trace构建CFG（兼容方法）
-        兼容原PathFinder接口，内部调用build_dual_cfg
+        Build CFG from trace (compatibility method)
+        Compatible with original PathFinder interface, calls build_dual_cfg internally
         """
         return self.build_dual_cfg(trace_file)
 
@@ -541,15 +626,15 @@ class DualLevelPathFinder:
         covered_set: Optional[Set[int]] = None
     ) -> int:
         """
-        增强CFG: 使用BB trace更新Syscall级别的覆盖率和边
+        Enhance CFG: Update syscall-level coverage and edges using BB trace
         
         Args:
-            syscall_trace_file: Syscall trace路径 (未使用，兼容参数)
-            bb_trace_file: BB trace文件路径 (.bbl)
-            covered_set: 已覆盖的BB集合 (可选优化)
+            syscall_trace_file: Syscall trace path (unused, compatibility parameter)
+            bb_trace_file: BB trace file path (.bbl)
+            covered_set: Covered BB set (optional optimization)
             
         Returns:
-            int: 映射到的新Syscall节点数
+            int: Number of new syscall nodes mapped
         """
         import struct
         
@@ -563,35 +648,35 @@ class DualLevelPathFinder:
             with open(bb_trace_file, 'rb') as f:
                 content = f.read()
                 
-            # 解析64位BB地址
+            # Parse 64-bit BB addresses
             total_bbs = len(content) // 8
             bb_addrs = struct.unpack(f'<{total_bbs}Q', content)
             
             for bb_addr in bb_addrs:
-                # 尝试映射BB -> Syscall
+                # Try mapping BB -> Syscall
                 if bb_addr in self.bb_to_syscall:
                     syscall_idx = self.bb_to_syscall[bb_addr]
                     
                     if syscall_idx in self.syscall_blocks:
                         block = self.syscall_blocks[syscall_idx]
                         
-                        # 1. 标记覆盖
+                        # 1. Mark covered
                         if not block.is_covered:
                             block.is_covered = True
                             mapped_count += 1
-                            
-                        # 2. 构建Syscall级别的边 (CFG Edge)
+                        
+                        # 2. Build syscall-level edge (CFG Edge)
                         if last_syscall_idx >= 0 and last_syscall_idx != syscall_idx:
-                            # 添加前驱/后继关系
+                            # Add predecessor/successor relationship
                             last_block = self.syscall_blocks[last_syscall_idx]
                             
-                            # 避免重复添加
+                            # Avoid duplicate addition
                             exists = False
                             for succ in last_block.successors:
                                 if succ.syscall_index == syscall_idx:
                                     exists = True
                                     break
-                                    
+                            
                             if not exists:
                                 last_block.add_successor(block)
                                 block.add_predecessor(last_block)
@@ -607,8 +692,8 @@ class DualLevelPathFinder:
 
     def find_uncovered_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:
         """
-        查找未覆盖分支（兼容方法）
-        内部调用find_uncovered_syscall_branches
+        Find uncovered branches (compatibility method)
+        Internal call to find_uncovered_syscall_branches
         """
         return self.find_uncovered_syscall_branches(covered_bbs)
 
@@ -618,23 +703,23 @@ class DualLevelPathFinder:
         max_recipes: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
-        生成recipes（兼容方法）
-        内部调用generate_syscall_recipes
+        Generate recipes (compatibility method)
+        Internal call to generate_syscall_recipes
         """
         if max_recipes and len(uncovered_branches) > max_recipes:
             uncovered_branches = uncovered_branches[:max_recipes]
         return self.generate_syscall_recipes(uncovered_branches)
 
     def get_stats(self) -> Dict[str, Any]:
-        """获取统计信息"""
+        """Get statistics"""
         return self.stats.copy()
 
     def export_cfg(self, output_file: str):
         """
-        导出CFG为JSON格式
+        Export CFG to JSON format
 
         Args:
-            output_file: 输出文件路径
+            output_file: Path to output file
         """
         import json
 

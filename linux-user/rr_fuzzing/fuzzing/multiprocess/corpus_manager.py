@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Corpus持久化管理
+"""Corpus Persistence Management
 
-负责：
-1. 保存fuzzing corpus到磁盘
-2. 从磁盘恢复corpus
-3. Corpus合并和最小化
-4. Corpus质量评估
+Responsible for:
+1. Saving fuzzing corpus to disk
+2. Restoring corpus from disk
+3. Corpus merging and minimization
+4. Corpus quality assessment
 """
 
 import json
@@ -18,14 +18,14 @@ from dataclasses import asdict
 
 
 class CorpusManager:
-    """管理fuzzing corpus的保存和加载"""
+    """Manages saving and loading of the fuzzing corpus"""
     
     def __init__(self, corpus_dir: Path):
         """
-        初始化Corpus Manager
+        Initialize Corpus Manager
         
         Args:
-            corpus_dir: corpus存储目录
+            corpus_dir: Directory for storing the corpus
         """
         self.corpus_dir = Path(corpus_dir)
         self.corpus_dir.mkdir(parents=True, exist_ok=True)
@@ -40,16 +40,16 @@ class CorpusManager:
     def save_corpus(self, seed_queue: 'SeedQueue', coverage_tracker: 'CoverageTracker',
                    fuzzer_stats: Optional[Dict] = None):
         """
-        保存当前corpus
+        Save the current corpus
         
         Args:
-            seed_queue: Seed队列
-            coverage_tracker: Coverage追踪器
-            fuzzer_stats: Fuzzer统计信息（可选）
+            seed_queue: Seed queue
+            coverage_tracker: Coverage tracker
+            fuzzer_stats: Fuzzer statistics (optional)
         """
         print(f"[Corpus] Saving corpus to {self.corpus_dir}...")
         
-        # 1. 保存队列状态
+        # 1. Save queue state
         queue_data = {
             'version': '1.0',
             'saved_at': datetime.now().isoformat(),
@@ -61,9 +61,9 @@ class CorpusManager:
             seed_dict = {
                 'seed_id': seed.seed_id,
                 'trace_file': seed.trace_file,
-                'coverage': list(seed.coverage),  # Set转List
+                'coverage': list(seed.coverage),  # Set -> List
                 'energy': seed.energy,
-                'priority': seed.priority.name,  # Enum转string
+                'priority': seed.priority.name,  # Enum -> string
                 'parent_id': seed.parent_id,
                 'generation': seed.generation,
                 'crash': seed.crash,
@@ -75,7 +75,7 @@ class CorpusManager:
         
         print(f"[Corpus] Saved {len(seed_queue.seeds)} seeds to queue")
         
-        # 2. 复制所有seed的trace文件
+        # 2. Copy all seed trace files
         copied_count = 0
         for seed in seed_queue.seeds:
             if seed.trace_file and Path(seed.trace_file).exists():
@@ -89,7 +89,7 @@ class CorpusManager:
         
         print(f"[Corpus] Copied {copied_count}/{len(seed_queue.seeds)} trace files")
         
-        # 3. 保存coverage数据
+        # 3. Save coverage data
         coverage_data = {
             'global_coverage': list(coverage_tracker.global_coverage),
             'edge_coverage': {str(k): v for k, v in coverage_tracker.edge_coverage.items()},
@@ -102,7 +102,7 @@ class CorpusManager:
         print(f"[Corpus] Saved coverage data: {len(coverage_tracker.global_coverage)} blocks, "
               f"{len(coverage_tracker.edge_coverage)} edges")
         
-        # 4. 保存metadata
+        # 4. Save metadata
         metadata = {
             'version': '1.0',
             'last_updated': datetime.now().isoformat(),
@@ -119,10 +119,10 @@ class CorpusManager:
     
     def load_corpus(self) -> Optional[Dict]:
         """
-        加载corpus
+        Load corpus
         
         Returns:
-            包含seeds和coverage的字典，如果失败返回None
+            Dictionary containing seeds and coverage, or None if failed
         """
         if not self.queue_file.exists():
             print(f"[Corpus] No existing corpus found at {self.corpus_dir}")
@@ -131,11 +131,11 @@ class CorpusManager:
         try:
             print(f"[Corpus] Loading corpus from {self.corpus_dir}...")
             
-            # 1. 加载队列数据
+            # 1. Load queue data
             with open(self.queue_file, 'r') as f:
                 queue_data = json.load(f)
             
-            # 2. 恢复trace文件路径
+            # 2. Restore trace file paths
             seeds_loaded = 0
             for seed_dict in queue_data['seeds']:
                 seed_id = seed_dict['seed_id']
@@ -149,14 +149,14 @@ class CorpusManager:
             
             print(f"[Corpus] Loaded {seeds_loaded}/{len(queue_data['seeds'])} seeds")
             
-            # 3. 加载coverage数据
+            # 3. Load coverage data
             coverage_data = None
             if self.coverage_file.exists():
                 with open(self.coverage_file, 'r') as f:
                     coverage_data = json.load(f)
                 print(f"[Corpus] Loaded coverage data: {len(coverage_data['global_coverage'])} blocks")
             
-            # 4. 加载metadata
+            # 4. Load metadata
             metadata = None
             if self.metadata_file.exists():
                 with open(self.metadata_file, 'r') as f:
@@ -176,7 +176,7 @@ class CorpusManager:
             return None
     
     def get_metadata(self) -> Optional[Dict]:
-        """获取corpus元数据"""
+        """Get corpus metadata"""
         if not self.metadata_file.exists():
             return None
         
@@ -187,7 +187,7 @@ class CorpusManager:
             return None
     
     def get_statistics(self) -> Dict:
-        """获取corpus统计信息"""
+        """Get corpus statistics"""
         metadata = self.get_metadata()
         
         if not metadata:
@@ -198,7 +198,7 @@ class CorpusManager:
                 'last_updated': None
             }
         
-        # 检查文件大小
+        # Check file sizes
         total_size = 0
         seed_count = 0
         for seed_file in self.seeds_dir.glob("*.dat"):
@@ -217,7 +217,7 @@ class CorpusManager:
         }
     
     def print_statistics(self):
-        """打印corpus统计信息"""
+        """Print corpus statistics"""
         stats = self.get_statistics()
         
         print(f"\n{'='*60}")
@@ -247,14 +247,14 @@ class CorpusManager:
     
     def minimize_corpus(self, coverage_tracker: 'CoverageTracker') -> List[str]:
         """
-        最小化corpus，保留覆盖相同但数量更少的seeds
+        Minimize corpus, keeping fewer seeds that cover the same paths
         
         Returns:
-            保留的seed_ids列表
+            List of retained seed_ids
         """
         print(f"[Corpus] Minimizing corpus...")
         
-        # 加载corpus
+        # Load corpus
         corpus_data = self.load_corpus()
         if not corpus_data:
             print(f"[Corpus] No corpus to minimize")
@@ -262,18 +262,18 @@ class CorpusManager:
         
         seeds = corpus_data['queue']['seeds']
         
-        # 贪心算法：按coverage大小降序，选择能覆盖新edge的seeds
+        # Greedy algorithm: sort by coverage size descending, select seeds that cover new edges
         covered_edges = set()
         minimized_seeds = []
         
-        # 按coverage大小排序（优先选择覆盖多的）
+        # Sort by coverage size (prefer seeds with more coverage)
         seeds.sort(key=lambda s: len(s['coverage']), reverse=True)
         
         for seed in seeds:
             seed_coverage = set(seed['coverage'])
             new_coverage = seed_coverage - covered_edges
             
-            # 如果带来新coverage，保留
+            # Keep if it provides new coverage
             if new_coverage or len(minimized_seeds) == 0:
                 minimized_seeds.append(seed['seed_id'])
                 covered_edges.update(seed_coverage)
@@ -287,10 +287,10 @@ class CorpusManager:
     
     def clean_old_seeds(self, keep_days: int = 7):
         """
-        清理旧的seed文件
+        Clean up old seed files
         
         Args:
-            keep_days: 保留最近N天的seeds
+            keep_days: Keep seeds from the most recent N days
         """
         import time
         
@@ -312,15 +312,15 @@ class CorpusManager:
 def merge_corpuses(output_dir: Path, input_dirs: List[Path], 
                    minimize: bool = True) -> Dict:
     """
-    合并多个corpus到output_dir
+    Merge multiple corpuses into output_dir
     
     Args:
-        output_dir: 输出目录
-        input_dirs: 输入目录列表
-        minimize: 是否最小化合并后的corpus
+        output_dir: Output directory
+        input_dirs: List of input directories
+        minimize: Whether to minimize the merged corpus
     
     Returns:
-        合并统计信息
+        Merge statistics
     """
     print(f"\n{'='*60}")
     print(f"Merging Corpuses")
@@ -332,7 +332,7 @@ def merge_corpuses(output_dir: Path, input_dirs: List[Path],
     all_coverage = set()
     total_input_seeds = 0
     
-    # 从每个输入目录加载corpus
+    # Load corpus from each input directory
     for input_dir in input_dirs:
         if not input_dir.exists():
             print(f"[Merge] Warning: Input directory not found: {input_dir}")
@@ -344,12 +344,12 @@ def merge_corpuses(output_dir: Path, input_dirs: List[Path],
             print(f"[Merge] Warning: Failed to load corpus from {input_dir}")
             continue
         
-        # 合并seeds（去重）
+        # Merge seeds (deduplication)
         for seed_dict in data['queue']['seeds']:
             seed_id = seed_dict['seed_id']
             seed_coverage = set(seed_dict['coverage'])
             
-            # 使用coverage作为去重依据（相同coverage只保留一个）
+            # Use coverage as deduplication criterion (keep only one with same coverage)
             coverage_hash = hash(frozenset(seed_coverage))
             
             if coverage_hash not in all_seeds:
@@ -366,13 +366,13 @@ def merge_corpuses(output_dir: Path, input_dirs: List[Path],
     print(f"  Dedup rate:         {(1 - len(unique_seeds)/total_input_seeds)*100:.1f}%")
     print(f"  Total coverage:     {len(all_coverage)} edges")
     
-    # 最小化（如果需要）
+    # Minimize (if requested)
     if minimize:
         print(f"\n[Merge] Applying minimization...")
-        # TODO: 实现最小化逻辑
+        # TODO: Implement minimization logic
     
-    # 保存合并后的corpus
-    # TODO: 需要重构为直接保存seed列表
+    # Save merged corpus
+    # TODO: Refactor to directly save seed list
     
     print(f"\n[Merge] ✅ Corpus merge completed")
     print(f"{'='*60}\n")
@@ -386,7 +386,7 @@ def merge_corpuses(output_dir: Path, input_dirs: List[Path],
 
 
 def main():
-    """测试入口"""
+    """Test Entry Point"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Corpus Manager Tool')

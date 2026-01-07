@@ -47,7 +47,8 @@ class WorkerConfig:
     worker_dir: Path
     mutator_type: str = "smart"  # "base" or "smart"
     recipe_file: Optional[str] = None
-    enable_pathfinder: bool = True  # ✅ 默认启用PathFinder
+    enable_pathfinder: bool = True
+    enable_persistence: bool = False
 
 
 @dataclass
@@ -90,7 +91,8 @@ class FuzzMaster:
         mutator_type: str = "smart",
         recipe_file: Optional[str] = None,
         master_timeout: Optional[int] = None,
-        enable_pathfinder: bool = True  # ✅ 默认启用PathFinder
+        enable_pathfinder: bool = True,
+        enable_persistence: bool = False
     ):
         """
         Initialize FuzzMaster
@@ -113,15 +115,16 @@ class FuzzMaster:
         self.mutator_type = mutator_type
         self.recipe_file = recipe_file
         self.master_timeout = master_timeout
-        self.enable_pathfinder = enable_pathfinder  # ✅ 保存PathFinder配置
+        self.enable_pathfinder = enable_pathfinder
+        self.enable_persistence = enable_persistence
         
         # Worker management
         self.workers: List[mp.Process] = []
         self.worker_configs: List[WorkerConfig] = []
         self.worker_stats: Dict[int, WorkerStats] = {}
 
-        # ✅ Shared resources - 使用SharedCoverage实现进程安全的coverage同步
-        self.shared_coverage = SharedCoverage(worker_id=0)  # Master使用worker_id=0
+        # ✅ Shared resources - use SharedCoverage for process-safe sync
+        self.shared_coverage = SharedCoverage(worker_id=0)  # Master uses worker_id=0
         self.global_trace_count = 0
         self.global_crash_count = 0
         
@@ -189,7 +192,8 @@ class FuzzMaster:
             worker_dir=worker_dir,
             mutator_type=self.mutator_type,
             recipe_file=self.recipe_file,
-            enable_pathfinder=self.enable_pathfinder  # ✅ 传递PathFinder配置
+            enable_pathfinder=self.enable_pathfinder,
+            enable_persistence=self.enable_persistence
         )
     
     @staticmethod
@@ -207,12 +211,22 @@ class FuzzMaster:
             config: Worker configuration
             iterations_per_sync: Iterations between syncs
         """
+        # Setup signal handlers for graceful shutdown (CRITICAL for cleaning up shared resources)
+        import signal
+        def signal_handler(signum, frame):
+            # We rely on the finally block to run cleanup, so we raise SystemExit
+            sys.exit(0)
+            
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
         worker_id = config.worker_id
+        fuzzing_core = None
         
         print(f"[Worker{worker_id}] Starting...")
 
         try:
-            # ✅ 创建SharedCoverage（所有worker共享同一个multiprocessing.Array）
+            # ✅ Create SharedCoverage (all workers share one multiprocessing.Array)
             shared_coverage = SharedCoverage(worker_id=worker_id)
 
             # Create mutator
@@ -231,11 +245,12 @@ class FuzzMaster:
                 initial_trace=config.initial_trace,
                 output_dir=str(config.worker_dir),
                 mutator=mutator,
-                enable_pathfinder=config.enable_pathfinder,  # ✅ 传递PathFinder配置
-                enable_tree_viz=False,  # 多进程模式下禁用tree viz避免冲突
+                enable_pathfinder=config.enable_pathfinder,  # ✅ Pass PathFinder config
+                enable_persistence=config.enable_persistence,
+                enable_tree_viz=False,  # Disable tree viz in multi-process to avoid conflict
                 enable_monitoring=False,
-                use_energy_scheduler=False,  # ✅ 多进程模式使用TraceManager而非SeedManagerAdapter
-                shared_coverage=shared_coverage  # ✅ 多进程coverage同步
+                use_energy_scheduler=False,  # ✅ MP mode uses TraceManager instead of SeedManagerAdapter
+                shared_coverage=shared_coverage  # ✅ Multi-process coverage sync
             )
             
             print(f"[Worker{worker_id}] FuzzingCore initialized")
@@ -272,13 +287,23 @@ class FuzzMaster:
             
             print(f"[Worker{worker_id}] Exiting")
     
+            # ✅ Final stats update before exit
+            try:
+                if 'fuzzing_core' in locals() and fuzzing_core:
+                    FuzzMaster._worker_update_stats(config, fuzzing_core)
+            except:
+                pass
+
+            # Explicit cleanup to release shared memory/semaphores
+            if "fuzzing_core" in locals():
+                fuzzing_core.cleanup()
+
     @staticmethod
     def _worker_sync(config: WorkerConfig, fuzzing_core: FuzzingCore):
         """
         Synchronize worker data to shared directory
         
         Syncs:
-        1. New traces to queue/
         2. Crashes to crashes/workerN/
         3. Coverage to coverage/
         """
@@ -330,8 +355,6 @@ class FuzzMaster:
                 f.write(global_cov)
         except Exception as e:
             print(f"[Worker{worker_id}] Coverage sync failed: {e}")
-    
-    @staticmethod
     def _worker_update_stats(config: WorkerConfig, fuzzing_core: FuzzingCore):
         """Update worker statistics in shared directory"""
         worker_id = config.worker_id
@@ -357,12 +380,16 @@ class FuzzMaster:
     def start_workers(self):
         """Start all worker processes"""
         print(f"\n[FuzzMaster] Starting {self.num_workers} workers...")
+        # Ensure SharedCoverage is initialized in parent process (for true sharing)
+        SharedCoverage._ensure_shared_resources()
+
         
         for i in range(self.num_workers):
             config = self._create_worker_config(i)
             self.worker_configs.append(config)
             
             # Create and start worker process
+        # Ensure SharedCoverage is initialized in parent process (for true sharing)
             worker = mp.Process(
                 target=FuzzMaster._worker_main,
                 args=(config, 10),  # Sync every 10 iterations
@@ -546,6 +573,7 @@ class FuzzMaster:
         print(f"\n[FuzzMaster] Final Statistics:")
         self._display_progress()
         
+        SharedCoverage.cleanup()
         print(f"\n[FuzzMaster] Shutdown complete")
     
     def run(self):
@@ -574,3 +602,35 @@ class FuzzMaster:
             # Shutdown
             self.shutdown()
 
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="RR-Fuzz Multi-Process Master")
+    parser.add_argument("--qemu", required=True, help="Path to QEMU executable")
+    parser.add_argument("--target", required=True, help="Path to target binary")
+    parser.add_argument("--trace", required=True, help="Path to initial seed trace")
+    parser.add_argument("-n", "--workers", type=int, help="Number of workers (default: CPU count)")
+    parser.add_argument("--sync-dir", default="sync_dir", help="Sync directory")
+    parser.add_argument("--timeout", type=int, help="Master timeout in seconds")
+    parser.add_argument("--smart", action="store_true", help="Enable smart mutation")
+    parser.add_argument("--recipe", help="Recipe file for smart mutation")
+    parser.add_argument("--no-pathfinder", action="store_false", dest="pathfinder", help="Disable PathFinder")
+    parser.set_defaults(pathfinder=True)
+    
+    args = parser.parse_args()
+    
+    # Instantiate and run Master
+    master = FuzzMaster(
+        qemu_path=args.qemu,
+        target_binary=args.target,
+        initial_trace=args.trace,
+        num_workers=args.workers,
+        sync_dir=args.sync_dir,
+        mutator_type="smart" if args.smart else "base",
+        recipe_file=args.recipe,
+        master_timeout=args.timeout,
+        enable_pathfinder=args.pathfinder
+    )
+    
+    master.run()

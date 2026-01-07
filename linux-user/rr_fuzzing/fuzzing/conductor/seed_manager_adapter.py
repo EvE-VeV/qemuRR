@@ -11,6 +11,7 @@ from dataclasses import dataclass
 # Import both implementations
 from .trace_manager import TraceManager, Trace, TraceMetadata
 from multiprocess.seed_queue_advanced import AdvancedSeedQueue, Seed, SeedPriority, FuzzContext
+from conductor.async_logger import alog
 
 
 class SeedManagerAdapter:
@@ -46,11 +47,11 @@ class SeedManagerAdapter:
             self.trace_to_seed_map: Dict[str, Seed] = {}
             self.seed_counter = 0
 
-            print("[SeedManagerAdapter] Using AdvancedSeedQueue with Energy Scheduler")
+            alog("Using AdvancedSeedQueue with Energy Scheduler", "CORE", "INFO")
         else:
             # Fallback to original TraceManager
             self.queue = TraceManager(initial_trace=initial_trace)
-            print("[SeedManagerAdapter] Using TraceManager (fallback mode)")
+            alog("Using TraceManager (fallback mode)", "CORE", "WARN")
 
         # Add initial trace if provided
         if initial_trace and use_advanced:
@@ -123,7 +124,7 @@ class SeedManagerAdapter:
             self.trace_to_seed_map[seed_id] = seed
             self.seed_counter = 1
 
-            print(f"[SeedManagerAdapter] Added initial seed: {seed_id}")
+            alog(f"Added initial seed: {seed_id}", "CORE", "INFO")
         else:
             self.queue.add_initial_trace(trace_file)
 
@@ -200,8 +201,7 @@ class SeedManagerAdapter:
             # Convert to Trace
             trace = self._seed_to_trace(seed)
 
-            print(f"[SeedManagerAdapter] Selected seed: {seed.seed_id} "
-                  f"(energy={seed.energy:.2f}, exec_count={seed.execution_count})")
+            alog(f"Selected seed: {seed.seed_id} (energy={seed.energy:.2f}, exec_count={seed.execution_count})", "CORE", "DEBUG")
 
             return trace
         else:
@@ -293,6 +293,7 @@ class SeedManagerAdapter:
             os.makedirs(output_dir, exist_ok=True)
             corpus_file = os.path.join(output_dir, "corpus_seeds.json")
 
+            # Save metadata
             corpus_data = {
                 'total_seeds': self.queue.size(),
                 'statistics': self.queue.get_stats(),
@@ -306,13 +307,27 @@ class SeedManagerAdapter:
                         'generation': seed.generation,
                         'parent_id': seed.parent_id,
                     }
-                    for seed in list(self.queue.seed_map.values())[:100]  # Limit to 100 for performance
+                    for seed in list(self.queue.seed_map.values())
                 ]
             }
 
             with open(corpus_file, 'w') as f:
                 json.dump(corpus_data, f, indent=2)
 
-            print(f"[SeedManagerAdapter] Saved corpus metadata to {corpus_file}")
+            # Save actual bin files to a corpus/ subdirectory
+            import shutil
+            seeds_dir = os.path.join(output_dir, "corpus")
+            os.makedirs(seeds_dir, exist_ok=True)
+            
+            saved_count = 0
+            for seed in self.queue.seed_map.values():
+                if seed.trace_file and os.path.exists(seed.trace_file):
+                    dest = os.path.join(seeds_dir, f"{seed.seed_id}.bin")
+                    if not os.path.exists(dest):
+                        shutil.copy(seed.trace_file, dest)
+                        saved_count += 1
+            
+            alog(f"Saved corpus metadata to {corpus_file}", "CORE", "INFO")
+            alog(f"Saved {saved_count} seeds to {seeds_dir}", "CORE", "INFO")
         else:
             self.queue.save_corpus(output_dir)

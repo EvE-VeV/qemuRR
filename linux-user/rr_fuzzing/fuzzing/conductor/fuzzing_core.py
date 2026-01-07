@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-FuzzingCore - 第2层: 核心Fuzzing引擎 + 第5层: 监控与分析
+FuzzingCore - Layer 2: Core Fuzzing Engine + Layer 5: Monitoring & Analysis
 
-主fuzzing循环协调器，编排所有fuzzing组件。
-实现DETAILED_ARCHITECTURE.md中描述的第2层和第5层架构。
+Main fuzzing loop coordinator, orchestrating all fuzzing components.
+Implements Layer 2 and Layer 5 architectures described in DETAILED_ARCHITECTURE.md.
 
-第5层集成 (DETAILED_ARCHITECTURE.md第382-408行):
-- SyscallTree可视化器: 自动生成syscall tree HTML (重点功能)
-- CrashAnalyzer: 自动分析和去重crashes
-- CorpusManager: 自动保存和管理corpus
+Layer 5 Integration (DETAILED_ARCHITECTURE.md lines 382-408):
+- SyscallTree Visualizer: Automatically generate syscall tree HTML (Key feature)
+- CrashAnalyzer: Automatically analyze and deduplicate crashes
+- CorpusManager: Automatically save and manage corpus
 """
 
 import os
@@ -16,6 +16,7 @@ import sys
 import time
 import subprocess
 import threading
+import glob
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,28 +32,30 @@ from .iteration_result import (
 )
 from .mutation_dependency_graph import MutationDependencyGraph
 from .async_logger import AsyncLogger, alog
+from .watchdog import FuzzingWatchdog
+from .checkpoint import CheckpointManager
 
 # Ensure parent directory is in sys.path for internal imports
 _fuzzing_dir = Path(__file__).parent.parent.resolve()
 if str(_fuzzing_dir) not in sys.path:
     sys.path.insert(0, str(_fuzzing_dir))
 
-# 尝试导入PathFinder (优先使用双层CFG版本)
+# Attempt to import PathFinder (Prioritize the dual-level CFG version)
 _HAS_PATH_FINDER = False
 PathFinder = None
 PathFinderConfig = None
 
 # Prioritize DualLevelPathFinder for CFG-guided fuzzing
 try:
-    from multiprocess.dual_level_path_finder import DualLevelPathFinder
+    from .dual_level_path_finder import DualLevelPathFinder
     PathFinder = DualLevelPathFinder
     _HAS_PATH_FINDER = True
     print("[FuzzingCore] Loaded DualLevelPathFinder")
-except ImportError:
-    print("[FuzzingCore] ⚠️ DualLevelPathFinder import failed. PathFinder unavailable.")
+except ImportError as e:
+    print(f"[FuzzingCore] ⚠️ DualLevelPathFinder import failed: {e}. PathFinder unavailable.")
     _HAS_PATH_FINDER = False
 
-# 尝试导入RecipePool
+# Attempt to import RecipePool
 _HAS_RECIPE_POOL = False
 RecipePool = None
 try:
@@ -62,7 +65,7 @@ try:
 except ImportError:
     pass
 
-# 尝试导入DynamicForkController
+# Attempt to import DynamicForkController
 _HAS_DYNAMIC_FORK = False
 DynamicForkController = None
 try:
@@ -72,7 +75,7 @@ try:
 except ImportError:
     pass
 
-# 第5层: 导入监控和分析组件
+# Layer 5: Import monitoring and analysis components
 try:
     from multiprocess.crash_analyzer import CrashAnalyzer as Layer5CrashAnalyzer
     from multiprocess.corpus_manager import CorpusManager
@@ -82,8 +85,8 @@ except ImportError:
     _HAS_LAYER5_CRASH = False
     _HAS_LAYER5_CORPUS = False
 
-# ✅ 方案A: 使用Realtime Tree Visualizer (从QEMU动态消息)
-# ❌ 废弃: tree_visualizer (从静态trace文件，数据不准确)
+# ✅ Option A: Use Realtime Tree Visualizer (from QEMU dynamic messages)
+# ❌ Deprecated: tree_visualizer (from static trace file, inaccurate data)
 # try:
 #     from tree_visualizer import TreeVisualizer
 #     _HAS_TREE_VIZ = True
@@ -91,13 +94,20 @@ except ImportError:
 #     _HAS_TREE_VIZ = False
 #     print("[FuzzingCore] ⚠️  TreeVisualizer不可用")
 
-# ✅ 实时tree visualizer不需要导入，将作为独立进程运行
+# ✅ BB Trace support
+try:
+    from bb_trace_parser import BBTraceParser, BBEntry
+    BB_TRACE_AVAILABLE = True
+except ImportError:
+    BB_TRACE_AVAILABLE = False
+
+# ✅ Realtime tree visualizer does not need to be imported; it will run as a separate process
 _HAS_REALTIME_VIZ = False  # ⚠️ DISABLED: Visualizer O(N) search causing 10-100x slowdown
 
 
 @dataclass
 class FuzzingStatistics:
-    """Fuzzing会话统计信息"""
+    """Fuzzing session statistics"""
     total_execs: int = 0
     paths_found: int = 0
     crashes_found: int = 0
@@ -108,7 +118,7 @@ class FuzzingStatistics:
     
     @property
     def execs_per_sec(self) -> float:
-        """计算每秒执行次数"""
+        """Calculate executions per second"""
         elapsed = time.time() - self.start_time
         if elapsed == 0:
             return 0.0
@@ -116,12 +126,12 @@ class FuzzingStatistics:
     
     @property
     def elapsed_time(self) -> float:
-        """获取已用时间"""
+        """Get elapsed time"""
         return time.time() - self.start_time
 
 
 class CrashDetector:
-    """简单的crash检测器和去重器"""
+    """Simple crash detector and deduplicator"""
     
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
@@ -129,50 +139,50 @@ class CrashDetector:
         self.crash_hashes = set()
     
     def save_crash(self, result: ExecutionResult, trace: Trace, mutations: list):
-        """保存crash信息"""
+        """Save crash info"""
         import hashlib
         import json
         import os
         from pathlib import Path
         
-        # 创建crash目录
+        # Create crash directory
         crash_dir = Path(self.output_dir) / "crashes"
         crash_dir.mkdir(parents=True, exist_ok=True)
         
-        # 生成crash哈希 
+        # Generate crash hash
         crash_data = f"{result.status}_{result.qemu_exit_code}_{result.signal_number}"
         crash_hash = hashlib.md5(crash_data.encode()).hexdigest()[:8]
         
-        # 检查是否重复
+        # Check if duplicate
         if crash_hash in self.crash_hashes:
-            print(f"[CrashDetector] 重复的crash (hash={crash_hash}), 跳过")
+            print(f"[CrashDetector] Duplicate crash (hash={crash_hash}), skipping")
             return False
         
         self.crash_hashes.add(crash_hash)
         crash_id = f"crash_{len(self.crashes):06d}_{crash_hash}"
         
-        # 保存crash trace
+        # Save crash trace
         import shutil
         crash_trace = crash_dir / f"{crash_id}.bin"
         if os.path.exists(trace.file_path):
             shutil.copy(trace.file_path, crash_trace)
         
-        # 保存crash元数据
+        # Save crash metadata
         crash_meta = crash_dir / f"{crash_id}.meta"
         
-        # 获取系统调用名称映射（使用TraceAnalyzer加载trace）
+        # Get syscall name mapping (load trace using TraceAnalyzer)
         from .constants import get_mutation_type_name
         from ..trace_analyzer import TraceAnalyzer
         
         syscall_names = {}
         try:
-            # 使用TraceAnalyzer加载trace文件以获取系统调用信息
+            # Load trace file using TraceAnalyzer to get syscall information
             analyzer = TraceAnalyzer(trace.file_path)
             if analyzer.syscalls:
                 for sc in analyzer.syscalls:
                     syscall_names[sc.index] = sc.name
         except Exception as e:
-            print(f"[CrashDetector] ⚠️  无法从trace提取系统调用名称: {e}")
+            print(f"[CrashDetector] ⚠️  Unable to extract syscall names from trace: {e}")
         
         with open(crash_meta, 'w') as f:
             json.dump({
@@ -188,9 +198,9 @@ class CrashDetector:
                 'mutations': [
                     {
                         'syscall_index': m.syscall_index,
-                        'syscall_name': syscall_names.get(m.syscall_index, 'unknown'),  # ✅ 从TraceAnalyzer获取
+                        'syscall_name': syscall_names.get(m.syscall_index, 'unknown'),  # ✅ From TraceAnalyzer
                         'cmd': m.cmd,
-                        'mutation_type': get_mutation_type_name(m.cmd),  # ✅ 使用映射
+                        'mutation_type': get_mutation_type_name(m.cmd),  # ✅ Use mapping
                         'arg_index': m.arg_index,
                         'data': m.data.hex() if isinstance(m.data, bytes) else str(m.data),
                         'offset': m.offset,
@@ -201,29 +211,22 @@ class CrashDetector:
             }, f, indent=2)
         
         self.crashes.append(crash_id)
-        print(f"[CrashDetector] 💥 保存新crash: {crash_id}")
+        print(f"[CrashDetector] 💥 New crash saved: {crash_id}")
         return True
 
 
 class FuzzingCore:
     """
-    第2层: 核心Fuzzing循环协调器
+    Layer 2: Core Fuzzing Loop Coordinator
     
-    职责:
-    1. 协调所有fuzzing组件
-    2. 实现主fuzzing循环
-    3. 管理fuzzing统计信息
-    4. 处理crashes和新覆盖率
-    5. 提供进度报告
-    
-    主循环 (架构: DETAILED_ARCHITECTURE.md第57-85行):
-    1. 从TraceManager选择trace
-    2. 使用Mutator生成变异
-    3. 使用QEMUExecutor执行
-    4. 使用CoverageTracker分析覆盖率
-    5. 保存有趣的traces
-    6. 检测并保存crashes
-    7. 更新统计信息
+    Responsibilities:
+    1. Coordinate all fuzzing components
+    2. Implement the main fuzzing loop
+    3. Manage fuzzing statistics
+    4. Handle crashes and new coverage
+    5. Save interesting traces
+    6. Detect and save crashes
+    7. Update statistics
     """
     
     def __init__(
@@ -236,32 +239,21 @@ class FuzzingCore:
         enable_monitoring: bool = True,
         enable_pathfinder: bool = True,  # PathFinder enabled by default
         enable_tree_viz: bool = False,   # Visualizer disabled by default (performance)
-        enable_persistent: bool = False, 
+        use_fork_server: bool = True,    # AFL-style persistent mode (Process Persistence)
+        enable_persistence: bool = False,# Unified session persistence (Save/Auto-Resume)
         use_energy_scheduler: bool = True,  # Energy Scheduler enabled by default (+40% coverage)
         shared_coverage=None,  # SharedCoverage for multi-process mode
         target_args: str = ""   # Target program arguments
     ):
-        """
-        初始化FuzzingCore
+        # """
+        alog(f"[FuzzingCore] __init__ called. _HAS_PATH_FINDER={_HAS_PATH_FINDER}, PathFinder class={(PathFinder.__name__ if PathFinder else 'None')}", "CORE")
+        self.qemu_path = qemu_path
+        self.recipe_pool = None
 
-        参数:
-            qemu_path: QEMU可执行文件路径
-            target_binary: 目标程序路径
-            initial_trace: 初始种子trace路径
-            output_dir: 结果输出目录
-            mutator: 自定义mutator (可选, 如果为None则创建BaseMutator)
-            enable_monitoring: 启用第5层监控 (默认: True)
-            enable_pathfinder: 启用PathFinder CFG分析 (默认: True)
-            enable_tree_viz: 启用Syscall Tree可视化 (默认: True)
-            enable_persistent: 启用持久化QEMU执行器 (默认: False)
-            use_energy_scheduler: 启用高级能量调度器 (默认: True, 2025-11-17新增)
-            shared_coverage: SharedCoverage实例（多进程模式下用于进程间coverage同步）
-            target_args: 目标程序参数字符串
-        """
         # ✅ Performance: Start AsyncLogger
-        self.logger = AsyncLogger(log_file=os.path.join(output_dir, "fuzzing.log"))
+        self.logger = AsyncLogger(log_file=os.path.join(output_dir, "fuzzing.log"), console=True)
         self.logger.start()
-        alog(f"[FuzzingCore] 正在初始化...", "CORE")
+        alog(f"Initializing...", "CORE", "INFO")
 
 
         # Core Component: Seed & Trace Management
@@ -271,121 +263,84 @@ class FuzzingCore:
                 initial_trace=initial_trace,
                 use_advanced=True
             )
-            print("[FuzzingCore] Energy Scheduler / AdvancedSeedQueue enabled")
+            alog("Energy Scheduler / AdvancedSeedQueue enabled", "CORE", "INFO")
         else:
             self.trace_manager = TraceManager(initial_trace=initial_trace)
-            print("[FuzzingCore] 📝 使用传统TraceManager")
-        print("[DEBUG] TraceManager initialized")
+            alog("📝 Using legacy TraceManager", "CORE", "INFO")
+        alog("TraceManager initialized", "CORE", "DEBUG")
 
         
-        # 第2层: 核心组件
+        # Layer 2: Core Components
         self.mutator = mutator if mutator else BaseMutator()
-        # ✅ 多进程：传递shared_coverage给CoverageTracker
-        self.coverage_tracker = CoverageTracker(pid=0, shared_coverage=shared_coverage)
-        print("[DEBUG] CoverageTracker initialized")
+        # ✅ Multi-process: Pass shared_coverage to CoverageTracker
+        self.coverage_tracker = CoverageTracker(output_dir, shared_coverage=shared_coverage)
+        alog("CoverageTracker initialized", "CORE", "DEBUG")
 
 
-        # ✅ 选择执行器：持久化 vs 传统
-        self.enable_persistent = enable_persistent
-        if enable_persistent:
-            print("[FuzzingCore] 🚀 使用 persistent_mode=True (Process Persistence / Fork Server)")
+        # ✅ Layer 2: Core Components - Execution Engine
+        self.use_fork_server = use_fork_server
+        if use_fork_server:
+            alog("🚀 Using Process Persistence (Fork Server Mode)", "CORE", "INFO")
         else:
-            print("[FuzzingCore] 📝 使用 persistent_mode=False (Process Restart / Baseline)")
+            alog("🚀 Using Fresh Execution Mode (One process per task)", "CORE", "INFO")
             
         self.execution_engine = QEMUExecutor(
             qemu_path, 
             target_binary, 
             target_args=target_args,
-            persistent_mode=enable_persistent
+            persistent_mode=use_fork_server,
+            log_file=os.path.join(output_dir, "qemu_debug.log")
         )
-        print("[DEBUG] QEMUExecutor initialized")
 
 
         self.crash_detector = CrashDetector(output_dir)
-        print("[DEBUG] CrashDetector initialized")
+        alog("CrashDetector initialized", "CORE", "DEBUG")
 
 
         # Fuzzing Session Tracking
         self.stats = FuzzingStatistics()
         self.metrics = FuzzingMetrics()
         self.mutation_graph = MutationDependencyGraph()
-
-        # 输出目录和路径
-        self.output_dir = output_dir
-        self.initial_trace = initial_trace
-        self.target_binary = target_binary  # P0-1: 为PathFinder保存
         
-        # ✅ 默认启用PathFinder（CFG引导的fuzzing）
-        self.enable_pathfinder = enable_pathfinder
+        # ✅ Checkpoint-compatible counters
+        self.total_executions = 0
+        self.total_iterations = 0
+        self.start_time = time.time()
+
+        # Output directory and paths
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.target_binary = target_binary  # P0-1: Save for PathFinder
+        
+        # PathFinder support (multi-level static analysis + dynamic trace mapping)
+        self.enable_pathfinder = enable_pathfinder and _HAS_PATH_FINDER
         self.path_finder = None
-        self.recipe_pool = None
+        
+        # Dynamic Fork Controller (intelligent multi-path exploration)
+        self.enable_dynamic_fork = _HAS_DYNAMIC_FORK
+        self.dynamic_fork = None
         
         if enable_pathfinder and _HAS_PATH_FINDER:
-            try:
-                print(f"[FuzzingCore] 🧭 初始化PathFinder...")
-                # DualLevelPathFinder不需要PathFinderConfig
-                if isinstance(self.mutator, SmartMutator) and getattr(self.mutator, 'path_finder', None):
-                     print(f"[FuzzingCore] ♻️ Reusing PathFinder from Mutator")
-                     self.path_finder = self.mutator.path_finder
-                elif PathFinderConfig is not None:
-                    cfg_config = PathFinderConfig(verbose=False)
-                    self.path_finder = PathFinder(target_binary, config=cfg_config)
-                else:
-                    # DualLevelPathFinder使用简化的初始化
-                    self.path_finder = PathFinder(target_binary, config=None)
-                
-                # 如果mutator是SmartMutator但还没有PathFinder（例如BaseMutator升级来的），注入它
-                if isinstance(self.mutator, SmartMutator) and not getattr(self.mutator, 'path_finder', None):
-                     print(f"[FuzzingCore] 💉 Injecting PathFinder into Mutator")
-                     self.mutator.path_finder = self.path_finder
-
-                # 创建RecipePool（使用模块级变量，避免shadowing）
-                if _HAS_RECIPE_POOL and RecipePool is not None:
-                    self.recipe_pool = RecipePool(max_active=50, retirement_threshold=100)
-                
-                # Stats将在需要时显示
-                
-                # CFG分析触发配置
-                self.cfg_analysis_interval = 50  # 每50次迭代
-                self.last_cfg_analysis = 0
-                
-            except Exception as e:
-                print(f"[FuzzingCore] ⚠️ PathFinder初始化失败: {e}")
-                import traceback
-                traceback.print_exc()
-                self.path_finder = None
-                self.recipe_pool = None
-            
-            # 🔥 修复：PathFinder采用延迟构建，初始化后总是可用
-            if self.path_finder and self.path_finder.is_available():
-                print(f"[FuzzingCore] ✅ PathFinder启用 (延迟CFG构建模式)")
-                print(f"[FuzzingCore] ✅ RecipePool启用 (max_active=50)")
-            elif self.path_finder and not self.path_finder.is_available():
-                reason = getattr(self.path_finder, 'disabled_reason', '未知原因')
-                print(f"[FuzzingCore] ⚠️ PathFinder已自动禁用: {reason}")
-                self.path_finder = None
-                self.recipe_pool = None
-        elif enable_pathfinder and not _HAS_PATH_FINDER:
-            print(f"[FuzzingCore] ⚠️ PathFinder不可用（需要安装angr）")
-            print(f"  _HAS_PATH_FINDER={_HAS_PATH_FINDER}")
+            # Initialize PathFinder
+            self._init_pathfinder()
         
-        # ✅ 启用Syscall Tree Visualizer
+        # ✅ Enable Syscall Tree Visualizer
         self.enable_tree_viz = enable_tree_viz
         
-        # ✅ 在__init__中启动Visualizer
+        # ✅ Start Visualizer in __init__
         if enable_tree_viz:
             try:
                 self._start_realtime_visualizer()
             except Exception as e:
-                print(f"[FuzzingCore] ⚠️ Tree Visualizer启动失败: {e}")
+                alog(f"⚠️ Tree Visualizer failed to start: {e}", "CORE", "WARN")
         
-        # ✅ 避免重复创建RecipePool
+        # ✅ Avoid duplicate RecipePool creation
         if not self.recipe_pool and _HAS_RECIPE_POOL and isinstance(mutator, SmartMutator) and mutator.recipe_mode:
             self.recipe_pool = RecipePool(max_active=50, retirement_threshold=100)
-            # 从mutator加载初始recipes
+            # Load initial recipes from mutator
             if mutator.recipes:
                 self.recipe_pool.add_recipes(mutator.recipes)
-                print(f"[FuzzingCore] ✅ RecipePool已启用 ({len(mutator.recipes)} 个recipes)")
+                alog(f"✅ RecipePool enabled ({len(mutator.recipes)} recipes)", "CORE", "INFO")
         
         # CFG Analysis interval parameters
         self.cfg_analysis_interval_iters = 20   
@@ -393,40 +348,40 @@ class FuzzingCore:
         self.last_cfg_analysis_time = time.time()
         self.last_cfg_analysis_iter = 0
         
-        # 第5层: 监控与分析
-        self.enable_monitoring = enable_monitoring  # ✅ 确保定义
+        # Layer 5: Monitoring and Analysis Components
+        self.enable_monitoring = enable_monitoring  # ✅ Ensure defined
         self.layer5_crash_analyzer = None
         self.layer5_corpus_manager = None
         
         if enable_monitoring:
-            print(f"[FuzzingCore] 🔍 启用第5层: 监控与分析")
+            alog(f"🔍 Layer 5 enabled: Monitoring & Analysis", "CORE", "INFO")
             
-            # 1. CrashAnalyzer (去重和分析)
+            # 1. CrashAnalyzer (deduplication and analysis)
             if _HAS_LAYER5_CRASH:
                 self.layer5_crash_analyzer = Layer5CrashAnalyzer(Path(output_dir))
-                print(f"  ✅ CrashAnalyzer已启用")
+                alog(f"  ✅ CrashAnalyzer enabled", "CORE", "INFO")
             else:
-                print(f"  ⚠️  CrashAnalyzer不可用 (使用基础CrashDetector)")
+                alog(f"  ⚠️  CrashAnalyzer unavailable (using basic CrashDetector)", "CORE", "WARN")
             
-            # 2. CorpusManager (持久化)
+            # 2. CorpusManager (persistence)
             if _HAS_LAYER5_CORPUS:
                 self.layer5_corpus_manager = CorpusManager(Path(output_dir) / "corpus")
-                print(f"  ✅ CorpusManager已启用")
+                alog(f"  ✅ CorpusManager enabled", "CORE", "INFO")
             else:
-                print(f"  ⚠️  CorpusManager不可用")
+                alog(f"  ⚠️  CorpusManager unavailable", "CORE", "WARN")
             
-            # ✅ 3. Realtime Tree Visualizer (方案A: 集成版)
+            # ✅ 3. Realtime Tree Visualizer (Option A: Integrated version)
             # if _HAS_REALTIME_VIZ:
-            #     print(f"  ✅ Realtime Tree可视化器已启用 (准确的execution paths)")
+            #     print(f"  ✅ Realtime Tree Visualizer enabled (accurate execution paths)")
             # else:
-            #     print(f"  ⚠️  Realtime Tree可视化器不可用")
+            #     print(f"  ⚠️  Realtime Tree Visualizer unavailable")
         
         # ═══════════════════════════════════════════════════════════════
-        # 方案A: Realtime Visualizer管理
+        # Option A: Realtime Visualizer Management
         # ═══════════════════════════════════════════════════════════════
         self.realtime_viz_process = None
         self.realtime_viz_pipe = None
-        self.realtime_viz_thread = None  # 用于读取visualizer输出
+        self.realtime_viz_thread = None  # For reading visualizer output
         
         self.dynamic_fork_controller = None
         if _HAS_DYNAMIC_FORK and DynamicForkController is not None:
@@ -442,64 +397,165 @@ class FuzzingCore:
                     mutation_graph=self.mutation_graph,
                     crash_detector=self.crash_detector
                 )
-                print(f"[FuzzingCore] DynamicForkController enabled (Depth-First mode)")
+                alog(f"DynamicForkController enabled (Depth-First mode)", "CORE", "INFO")
             except Exception as e:
-                print(f"[FuzzingCore] ⚠️ DynamicForkController初始化失败: {e}")
+                alog(f"⚠️ DynamicForkController initialization failed: {e}", "CORE", "WARN")
                 import traceback
                 traceback.print_exc()
                 self.dynamic_fork_controller = None
         else:
-            print(f"[FuzzingCore] ⚠️ DynamicForkController不可用")
+            alog(f"⚠️ DynamicForkController unavailable", "CORE", "WARN")
+
+        # ✅ Initialize Watchdog
+        self.watchdog = FuzzingWatchdog(
+            executor_check_func=self._check_executor_alive,
+            restart_func=self._restart_execution_engine,
+            timeout_seconds=30,  # 30s timeout for QEMU stall
+            check_interval=2
+        )
+        alog(f"  Watchdog: Enabled (Timeout=30s)", "CORE", "INFO")
         
-        print(f"[FuzzingCore] ✅ 初始化完成")
-        print(f"  输出目录: {output_dir}")
-        print(f"  初始trace: {initial_trace}")
-        print(f"  监控: {'已启用' if enable_monitoring else '已禁用'}")
-        print(f"  PathFinder: {'已启用' if self.path_finder else '未启用'}")
-        print(f"  Syscall Tree Export: {'已启用' if enable_tree_viz else '未启用'}")
-        # print(f"  Dynamic Fork: {'已启用' if self.dynamic_fork_controller else '未启用'}")
+        # ✅ State Persistence (Checkpoint System)
+        self.enable_persistence = enable_persistence
+        self.checkpoint_manager = CheckpointManager(output_dir) if enable_persistence else None
+        self.checkpoint_interval = 300  # Save every 5 minutes
+        self.last_checkpoint_time = time.time()
+        
+        alog(f"  Output directory: {output_dir}", "CORE", "INFO")
+        alog(f"  Initial trace: {initial_trace}", "CORE", "INFO")
+        alog(f"  Monitoring: {'Enabled' if enable_monitoring else 'Disabled'}", "CORE", "INFO")
+        alog(f"  PathFinder: {'Enabled' if self.path_finder else 'Disabled'}", "CORE", "INFO")
+        alog(f"  Syscall Tree Export: {'Enabled' if enable_tree_viz else 'Disabled'}", "CORE", "INFO")
+        # print(f"  Dynamic Fork: {'Enabled' if self.dynamic_fork_controller else 'Disabled'}")
+
+        if self.checkpoint_manager:
+            if self.checkpoint_manager.exists():
+                alog(f"📂 Found existing checkpoint in {output_dir}. Auto-resuming...", "CORE", "INFO")
+                self.checkpoint_manager.load(self)
+            else:
+                alog(f"💾 Persistence enabled. Periodic saving every {self.checkpoint_interval}s", "CORE", "INFO")
+        
+        alog(f"✅ Initialization complete", "CORE", "INFO")
+
+    def _init_pathfinder(self):
+        """P1: Initialize PathFinder with lazy build support"""
+        if not self.enable_pathfinder or not PathFinder:
+            return
+        
+        try:
+            alog(f"🧭 Initializing PathFinder...", "CORE", "INFO")
+            # 1. Selection logic for PathFinder
+            if isinstance(self.mutator, SmartMutator) and getattr(self.mutator, 'path_finder', None):
+                 alog(f"♻️ Reusing PathFinder from Mutator", "CORE", "INFO")
+                 self.path_finder = self.mutator.path_finder
+            else:
+                 # DualLevelPathFinder uses simplified initialization
+                 self.path_finder = PathFinder(self.target_binary, config=None)
+            
+            # 2. Injection logic
+            if isinstance(self.mutator, SmartMutator) and not getattr(self.mutator, 'path_finder', None):
+                 alog(f"💉 Injecting PathFinder into Mutator", "CORE", "INFO")
+                 self.mutator.path_finder = self.path_finder
+
+            # 3. Component enablement
+            if _HAS_RECIPE_POOL and RecipePool is not None:
+                self.recipe_pool = RecipePool(max_active=50, retirement_threshold=100)
+            
+            alog(f"✅ PathFinder initialized (Lazy CFG mode enabled)", "CORE", "INFO")
+        except Exception as e:
+            alog(f"❌ PathFinder initialization failed: {e}", "CORE", "ERROR")
+            self.path_finder = None
+            self.recipe_pool = None
+            import traceback
+            traceback.print_exc()
+        
+        # If PathFinder is available, log its status
+        if self.path_finder and self.path_finder.is_available():
+            alog(f"✅ PathFinder enabled (Lazy CFG build mode)", "CORE", "INFO")
+            if self.recipe_pool:
+                alog(f"✅ RecipePool enabled (max_active=50)", "CORE", "INFO")
+        elif self.path_finder and not self.path_finder.is_available():
+            reason = getattr(self.path_finder, 'disabled_reason', 'unknown reason')
+            alog(f"⚠️ PathFinder automatically disabled: {reason}", "CORE", "WARN")
+            self.path_finder = None
+            self.recipe_pool = None
+        elif self.enable_pathfinder and not _HAS_PATH_FINDER:
+            alog(f"⚠️ PathFinder unavailable (requires angr)", "CORE", "WARN")
+            alog(f"  _HAS_PATH_FINDER={_HAS_PATH_FINDER}", "CORE", "WARN")
+
+    def _check_executor_alive(self) -> bool:
+        """Watchdog callback: Check if QEMU process is alive"""
+        if self.execution_engine and self.execution_engine.process:
+            return self.execution_engine.process.poll() is None
+        return False
+
+    def _restart_execution_engine(self):
+        """Watchdog callback: Force restart QEMU"""
+        alog("Watchdog triggering QEMU restart...", "CORE", "WARN")
+        if self.execution_engine:
+            try:
+                self.execution_engine.stop_persistent_mode()
+            except:
+                pass 
+        # Re-initialize engine
+        self.execution_engine = QEMUExecutor(
+            self.qemu_path, 
+            self.target_binary, 
+            target_args="", # TODO: Save original args
+            persistent_mode=True,
+            log_file=os.path.join(self.output_dir, "qemu_debug.log")
+        )
+        alog("QEMU Engine restarted by Watchdog", "CORE", "INFO")
     
-    # ✅ 删除重复的_start_realtime_visualizer定义
-    # 使用第655行的版本，它更完整且设置了正确的变量名
+    # ✅ Remove duplicate _start_realtime_visualizer definition
+    # Use the version on line 655, it is more complete and sets the correct variable names
     
     def _extract_covered_blocks(self) -> set:
         """
-        从覆盖率位图中提取已覆盖的基本块
+        Extracts covered basic blocks from the coverage bitmap
         
-        返回:
-            已覆盖的块地址集合
+        Returns:
+            A set of covered block addresses
         """
         covered = set()
         
-        # Coverage bitmap中每个非零位置代表一个edge
-        # Edge ID = (prev_block << 16) | curr_block (简化)
-        # 我们提取所有covered edges的curr_block部分
+        # Each non-zero position in the Coverage bitmap represents an edge
+        # Edge ID = (prev_block << 16) | curr_block (simplified)
+        # We extract the curr_block part of all covered edges
+        bits_set = 0
         for i, val in enumerate(self.coverage_tracker.global_bitmap):
             if val > 0:
-                # 简化处理：将bitmap index作为block ID
-                # 实际应该从edge映射到block
-                covered.add(i & 0xFFFF)  # 提取低16位作为block ID
+                bits_set += 1
+                # Simplified: use bitmap index as block ID
+                # Should actually map from edge to block
+                covered.add(i & 0xFFFF)  # Extract lower 16 bits as block ID
+        
+        if bits_set > 0:
+            alog(f"[FuzzingCore] _extract_covered_blocks: bits_set={bits_set}, unique_ids={len(covered)}", "DEBUG")
+            if len(covered) > 0:
+                sample = list(covered)[:5]
+                alog(f"[FuzzingCore] _extract_covered_blocks sample IDs: {sample}", "DEBUG")
         
         return covered
 
     def _select_coverage_driven_fork_points(self, trace: Trace, count: int) -> List[int]:
         """
-        选择coverage驱动的fork点
+        Selects coverage-driven fork points
 
-        策略:
-        1. 如果PathFinder可用，使用未覆盖分支附近的syscall作为fork点
-        2. 否则，使用IO syscall轮换策略作为fallback
+        Strategy:
+        1. If PathFinder is available, use syscalls near uncovered branches as fork points
+        2. Otherwise, use an IO syscall rotation strategy as a fallback
 
-        参数:
-            trace: 当前trace
-            count: 需要的fork点数量
+        Parameters:
+            trace: The current trace
+            count: The number of fork points needed
 
-        返回:
-            fork点索引列表
+        Returns:
+            A list of fork point indices
         """
         fork_points = []
 
-        # 策略1: 使用PathFinder的未覆盖分支
+        # Strategy 1: Use PathFinder's uncovered branches
         if self.path_finder and hasattr(self.path_finder, 'uncovered_branches'):
             uncovered = self.path_finder.uncovered_branches
             if uncovered and len(uncovered) > 0:
@@ -515,85 +571,198 @@ class FuzzingCore:
                         break
 
                 if fork_points:
-                    print(f"[FuzzingCore] 🎯 Using PathFinder-guided fork points: {fork_points[:count]}")
+                    alog(f"🎯 Using PathFinder-guided fork points: {fork_points[:count]}", "CORE", "INFO")
                     return fork_points[:count]
 
-        # 策略2: Fallback - 如果PathFinder没有建议 (如已全覆盖或分析失败)
-        # 使用随机Syscall Index作为Fork点，以探索可能的隐藏状态
-        print(f"[FuzzingCore] ⚠️ PathFinder无建议，启用随机探索 (Random Exploration)")
+        # Strategy 2: Fallback if PathFinder has no suggestions (e.g., fully covered or analysis failed)
+        # Use random Syscall Index as Fork point to explore possible hidden states
+        alog(f"⚠️ PathFinder has no suggestions, enabling Random Exploration", "CORE", "WARN")
         
-        # 假设trace有syscall_count属性，或者是通过trace.metadata获取
-        # 简单起见，从 0 到 30 (假设) 随机选
+        # Assume trace has syscall_count attribute, or get it via trace.metadata
+        # For simplicity, randomly select from 0 to 30 (assumption)
         import random
-        # 尝试获取真实的syscall count
+        # Try to get the actual syscall count
         limit = 20
         if hasattr(trace, 'metadata') and hasattr(trace.metadata, 'syscall_count'):
              limit = trace.metadata.syscall_count
         
-        # 随机选择 count 个点
+        # Randomly select 'count' points
         random_points = sorted(random.sample(range(max(1, limit)), min(count, limit)))
         return random_points
 
     def _display_progress(self, force: bool = False):
-        """显示fuzzing进度 (每100次执行或强制显示)"""
+        """Display fuzzing progress (every 100 executions or forced)"""
         if not force and self.stats.total_execs % 100 != 0:
             return
         
         cov_stats = self.coverage_tracker.get_stats()
         
-        print(f"\n{'━' * 60}")
-        print(f"Iteration: {self.stats.total_execs}")
-        print(f"{'━' * 60}")
-        print(f"Exec speed:  {self.stats.execs_per_sec:.1f} exec/s")
+        alog(f"\n{'━' * 60}", "STATS", "INFO")
+        alog(f"Iteration: {self.stats.total_execs}", "STATS", "INFO")
+        alog(f"{'━' * 60}", "STATS", "INFO")
+        alog(f"Exec speed:  {self.stats.execs_per_sec:.1f} exec/s", "STATS", "INFO")
 
-        # ✅ 兼容SeedManagerAdapter和TraceManager
+        # ✅ Compatible with SeedManagerAdapter and TraceManager
         if hasattr(self.trace_manager, 'trace_pool'):
             trace_count = len(self.trace_manager.trace_pool)
         elif hasattr(self.trace_manager, 'trace_to_seed_map'):
             trace_count = len(self.trace_manager.trace_to_seed_map)
         else:
             trace_count = 0
-        print(f"Trace pool:  {trace_count} traces")
+        alog(f"Trace pool:  {trace_count} traces", "STATS", "INFO")
 
-        print(f"Coverage:    {cov_stats['total_edges']} edges")
-        print(f"Paths found: {self.stats.paths_found}")
-        print(f"Crashes:     {self.stats.crashes_found} "
-              f"({len(self.crash_detector.crashes)} unique)")
+        alog(f"Coverage:    {cov_stats['total_edges']} edges", "STATS", "INFO")
+        alog(f"Paths found: {self.stats.paths_found}", "STATS", "INFO")
+        alog(f"Crashes:     {self.stats.crashes_found} "
+              f"({len(self.crash_detector.crashes)} unique)", "STATS", "INFO")
         
         time_since_last = time.time() - self.stats.last_new_path
-        print(f"Last path:   {time_since_last:.1f}s ago")
-        print(f"{'━' * 60}")
+        alog(f"Last path:   {time_since_last:.1f}s ago", "STATS", "INFO")
+        alog(f"{'━' * 60}", "STATS", "INFO")
     
+    def _perform_cfg_analysis(self, trace: Trace, has_new_coverage: bool, trigger_reason: str, iteration_id: int):
+        """Performs unified CFG/PathFinder analysis"""
+        if not self.path_finder:
+            return
+
+        # Check interval
+        interval = self.cfg_analysis_interval_iters
+        elapsed = self.stats.total_execs - self.last_cfg_analysis_iter
+        
+        should_run_cfg = False
+        if elapsed >= interval:
+            should_run_cfg = True
+        
+        # Force run on new coverage (Verification mode logic)
+        if has_new_coverage:
+            should_run_cfg = True
+
+        # Check time interval
+        elapsed_since_cfg = time.time() - self.last_cfg_analysis_time
+        if elapsed_since_cfg >= self.cfg_analysis_interval_time:
+            should_run_cfg = True
+
+        if not should_run_cfg:
+            return
+
+        alog(f"[FuzzingCore] 🧭 Running CFG Analysis (Trigger: {trigger_reason})", "CORE")
+        self.last_cfg_analysis_iter = self.stats.total_execs
+        self.last_cfg_analysis_time = time.time()
+
+        try:
+            # Load syscall tree mapping (Auto-detect from HTML bundle)
+            import glob
+            import os
+            from pathlib import Path
+            
+            # Search order: 1. Output Dir (Latest), 2. /tmp (Legacy/Default)
+            search_paths = [
+                os.path.join(self.output_dir, "latest_syscall_tree.html"),
+                "/tmp/syscall_tree_*.html",
+                "/tmp/syscall_tree.json"
+            ]
+            
+            tree_file = None
+            for pattern in search_paths:
+                files = glob.glob(pattern) if '*' in pattern else ([pattern] if os.path.exists(pattern) else [])
+                if files:
+                    tree_file = max(files, key=os.path.getctime)
+                    break
+            
+            if tree_file:
+                tree_loaded = self.path_finder.load_syscall_tree(tree_file)
+                if tree_loaded:
+                    alog(f"[FuzzingCore] Loaded precise syscall tree mapping from {tree_file}", "CORE")
+                    
+                    # ✅ P3 Fix 2: If new coverage was found in the current round, directly mark nodes as covered based on the tree
+                    # This eliminates reliance on inaccurate bitmap->PC mapping
+                    if has_new_coverage:
+                        marked = self.path_finder.mark_nodes_covered(tree_file)
+                        if marked:
+                            alog(f"[FuzzingCore] 🎯 PathFinder marked {marked} new nodes as covered based on tree", "CORE")
+                else:
+                    alog(f"[FuzzingCore] ⚠️ Failed to load syscall tree from {tree_file}", "WARN")
+            else:
+                alog(f"[FuzzingCore] ⚠️ Syscall tree file not found in search paths", "WARN")
+            
+            # Ensure CFG is ready
+            if not self.path_finder.ensure_cfg_ready():
+                alog(f"[FuzzingCore] Building PathFinder CFG from {trace.file_path}...", "CORE")
+                build_ok = self.path_finder.build_from_trace(trace.file_path)
+            else:
+                build_ok = True
+
+            if build_ok:
+                # Get covered blocks
+                covered_blocks = self._extract_covered_blocks()
+                if covered_blocks:
+                    # Enhance with trace file
+                    # ✅ Optimization: Prioritize searching for the most recently generated temporary trace file
+                    # If the latest tree_file is found, its corresponding .bin and .bbl files are usually nearby
+                    current_bb_trace = None
+                    if tree_file and "syscall_tree_" in tree_file:
+                        # Attempt to infer trace path from tree_file path
+                        # E.g., /tmp/syscall_tree_123_4.html -> /tmp/trace_123_4.bin.bbl
+                        base = tree_file.replace("syscall_tree_", "trace_").replace(".html", "")
+                        potential_bbl = base + ".bin.bbl"
+                        if os.path.exists(potential_bbl):
+                            current_bb_trace = potential_bbl
+                    
+                    # Fallback to seed trace
+                    if not current_bb_trace:
+                        current_bb_trace = trace.file_path + ".bbl"
+                    
+                    if os.path.exists(current_bb_trace):
+                        mapped = self.path_finder.enhance_from_trace_files(
+                            syscall_trace_file="", # Unused
+                            bb_trace_file=current_bb_trace,
+                            covered_set=covered_blocks
+                        )
+                        if mapped:
+                            alog(f"[FuzzingCore] 🔗 PathFinder enhanced {mapped} CFG nodes via {os.path.basename(current_bb_trace)}", "CORE")
+                    
+                    # Find uncovered branches
+                    uncovered = self.path_finder.find_uncovered_branches(covered_blocks)
+                    alog(f"[PathFinder] Debug: Found {len(uncovered)} uncovered branches", "DEBUG")
+                    if uncovered:
+                        new_recipes = self.path_finder.generate_recipes(uncovered, max_recipes=20)
+                        alog(f"[FuzzingCore] PathFinder produced {len(new_recipes) if new_recipes else 0} recipes", "DEBUG")
+                        if new_recipes:
+                            if self.recipe_pool:
+                                self.recipe_pool.add_recipes(new_recipes)
+                                alog(f"[FuzzingCore] Added {len(new_recipes)} recipes to pool", "CORE")
+                            
+                            if isinstance(self.mutator, SmartMutator):
+                                self.mutator.recipes.extend(new_recipes)
+                                alog(f"[FuzzingCore] ✅ Injected {len(new_recipes)} recipes into SmartMutator", "CORE")
+        except Exception as e:
+            alog(f"[FuzzingCore] ⚠️ PathFinder Analysis failed: {e}", "ERROR")
+
     def run_single_iteration(self, iteration_id: int = 0) -> IterationResult:
-        """
-        运行单次fuzzing迭代
-
-        参数:
-            iteration_id: 当前迭代ID（用于tree可视化）
-
-        返回:
-            IterationResult: 迭代结果（包含成功/失败状态和详细信息）
-
-        实现DETAILED_ARCHITECTURE.md中的详细fuzzing流程
-        第416-1076行 (单次迭代)
-        """
-        # ✅ Task #7: 记录迭代开始
+        """Runs a single fuzzing iteration"""
+        import os
+        import glob
+        
+        # ✅ Task #7: Record iteration start
         self.metrics.success_counts['total_iterations'] += 1
+        
+        import os
+        import glob
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 步骤1: Trace选择
+        # Step 1: Trace Selection
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         trace = self.trace_manager.select_trace()
         if not trace:
-            # ✅ Task #7: 记录失败
+            # ✅ Task #7: Record failure
             self.metrics.record_failure(
                 reason=FailureReason.CONFIG_INVALID_TRACE,
                 component="TraceManager",
                 details="No available traces in pool",
                 iteration=iteration_id
             )
-            print("[FuzzingCore] ⚠️  池中无可用traces")
-            # ✅ Task #8: 返回失败结果
+            alog("⚠️  No available traces in pool", "CORE", "WARN")
+            # ✅ Task #8: Return failure result
             return create_failure_result(
                 iteration_id=iteration_id,
                 status=IterationStatus.NO_TRACE,
@@ -601,8 +770,19 @@ class FuzzingCore:
                 error_component="TraceManager"
             )
         
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 步骤2: 深度优先探索 - 智能fork点选择 (Dynamic Fork Integration)
+        # ✅ FIX: Update SmartMutator if the trace file has changed
+        # This ensures that mutations are targeted based on the correct syscall sequence
+        if isinstance(self.mutator, SmartMutator):
+            current_mutator_trace = getattr(self.mutator, 'trace_file', None)
+            if current_mutator_trace != trace.file_path:
+                # alog(f"🔄 Updating Mutator for new trace: {trace.id} ({trace.file_path})", "CORE", "DEBUG")
+                # Creating a new SmartMutator is efficient because it uses SmartMutator._trace_cache
+                self.mutator = SmartMutator(
+                    trace_file=trace.file_path,
+                    target_binary=self.target_binary,
+                    path_finder=self.path_finder
+                )
+        # Step 2: Depth-First Exploration - Intelligent Fork Point Selection (Dynamic Fork Integration)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
         # Dynamic Fork Integration: Delegate to controller if available
@@ -612,7 +792,9 @@ class FuzzingCore:
             
             if success:
                 self.metrics.record_success('dynamic_fork_batch')
-                
+            
+                # Unified CFG Analysis
+                self._perform_cfg_analysis(trace, success, f"DynamicFork: {'NewCov' if success else 'Interval'}", iteration_id)
             return create_success_result(
                 iteration_id=iteration_id,
                 new_coverage=success,
@@ -620,13 +802,12 @@ class FuzzingCore:
                 crashes_found=0 # Crashes are handled by DynamicForkController via CrashDetector
             )
 
-        import os
         batch_size = int(os.environ.get('RR_BATCH_SIZE', 5))  # 🔥 Configurable batch_size
 
-        # 🔥 修复: Coverage驱动的fork点选择
+        # 🔥 Fix: Coverage-driven fork point selection
         fork_points = self._select_coverage_driven_fork_points(trace, batch_size)
 
-        # 迭代结果追踪
+        # Iteration result tracking
         has_any_success = False
         total_execs = 0
         total_mutations = 0
@@ -636,75 +817,79 @@ class FuzzingCore:
         crashes_found_count = 0
         result = None
 
-        for i, fork_point in enumerate(fork_points):
-            mutations = self.mutator.mutate(trace)
-            if not mutations:
-                # ✅ Task #7: 记录失败
-                self.metrics.record_failure(
-                    reason=FailureReason.MUTATION_NO_CANDIDATES,
-                    component="Mutator",
-                    details=f"No mutations generated for trace {trace.id}",
-                    iteration=iteration_id
-                )
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Step 3: Batch Execution - Group mutations by fork point
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        from collections import defaultdict
+        fork_to_mutations = defaultdict(list)
+        
+        # Perform multiple mutations per fork point for efficiency (batching reduces QEMU restarts)
+        mutations_per_fork = int(os.environ.get('RR_MUTATIONS_PER_FORK', 4))
+        
+        for fork_point in fork_points:
+            for _ in range(mutations_per_fork):
+                m = self.mutator.mutate(trace, fork_point=fork_point)
+                if m:
+                    fork_to_mutations[fork_point].append(m)
+        
+        for fork_point, mutations_list in fork_to_mutations.items():
+            if not mutations_list:
                 continue
+                
+            total_mutations += len(mutations_list)
+            
+            # Record mutations in graph
+            node_ids = []
+            for i, muts in enumerate(mutations_list):
+                 node_id = self.mutation_graph.add_mutation(
+                    iteration=iteration_id,
+                    mutation_index=i,
+                    mutation_type='batch',
+                    parent_trace_id=trace.id,
+                )
+                 node_ids.append(node_id)
 
-            total_mutations += 1
+            # Execute batch at this fork point
+            results = self.execution_engine.execute_fork(trace.file_path, fork_point, mutations_list, 0, iteration_id)
 
-            # Trace mutation relationship in graph
-            if isinstance(mutations, list) and len(mutations) > 0:
-                mut_type = getattr(mutations[0], 'mutation_type', 'unknown')
-            else:
-                mut_type = getattr(self.mutator, 'last_mutation_type', 'unknown')
-
-            node_id = self.mutation_graph.add_mutation(
-                iteration=iteration_id,
-                mutation_index=i,
-                mutation_type=mut_type,
-                parent_trace_id=trace.id,
-                syscall_index=mutations.get('syscall_index') if isinstance(mutations, dict) else None,
-                field_name=mutations.get('field') if isinstance(mutations, dict) else None,
-            )
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # 步骤3: 在智能选择的fork点执行mutation
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            results = self.execution_engine.execute_fork(trace.file_path, fork_point, [mutations], 0, iteration_id)
-
-            # ✅ 记录成功的fork操作（修复统计bug）
+            # ✅ Record successful fork operations (fix statistics bug)
             if results and len(results) > 0:
                 self.metrics.success_counts['successful_forks'] += 1
 
-            # 处理结果
-            for result in results:
+            # Process results
+            for result_idx, result in enumerate(results):
                 if result is None:
                     continue
 
+                # ✅ FIX: Map result back to its corresponding mutation
+                mutations = mutations_list[result_idx] if result_idx < len(mutations_list) else None
+                node_id = node_ids[result_idx] if result_idx < len(node_ids) else None
+
                 self.stats.total_execs += 1
-                trace.metadata.exec_count += 1  # 🔥 修复: 更新trace执行计数
+                trace.metadata.exec_count += 1  # 🔥 Fix: Update trace execution count
                 total_execs += 1
                 has_any_success = True
 
-                # ✅ Task #7: 记录成功的变异执行
+                # ✅ Task #7: Record successful mutation execution
                 self.metrics.record_success('successful_mutations')
 
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # 步骤4: 覆盖率分析
+                # Step 4: Coverage Analysis
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                has_new_coverage = False
                 if result.coverage_bitmap:
-                    has_new_coverage = self.coverage_tracker.has_new_coverage(
+                    found_new = self.coverage_tracker.has_new_coverage(
                         result.coverage_bitmap
                     )
 
-                    if has_new_coverage:
+                    if found_new:
+                        has_new_coverage = True
                         new_coverage_found = True
                         new_paths_found += 1
                         self.stats.paths_found += 1
                         self.stats.last_new_path = time.time()
-                        print(f"[FuzzingCore] 🎯 发现新覆盖率! "
-                              f"(总边数: {self.coverage_tracker.get_stats()['total_edges']})")
+                        alog(f"🎯 New coverage found! (Total edges: {self.coverage_tracker.get_stats()['total_edges']})", "CORE", "INFO")
 
-                # 步骤4.5: 记录执行统计
+                # Step 4.5: Record execution statistics
                 self.trace_manager.record_execution(
                     trace_id=trace.id,
                     trace_file=trace.file_path,
@@ -712,8 +897,8 @@ class FuzzingCore:
                     has_new_coverage=has_new_coverage
                 )
 
-                # 更新停滞检测状态
-                # 🔥 修复: 使用total_execs作为全局迭代计数器（与trace.exec_count不同）
+                # Update stagnation detection status
+                # 🔥 Fix: Use total_execs as global iteration counter (different from trace.exec_count)
                 if isinstance(self.mutator, SmartMutator) and hasattr(self.mutator, 'update_stagnation_status'):
                     self.mutator.update_stagnation_status(
                         iteration=self.stats.total_execs,
@@ -736,112 +921,56 @@ class FuzzingCore:
                 # Original code was redundant and caused double-counting
         
         # ═════════════════════════════════════════════════════════════════
-        # CFG引导的Fuzzing (关键修复!)
-        # 🔥 修复：移除has_new_coverage依赖，允许主动CFG分析
+        # CFG-guided Fuzzing (Critical Fix!)
+        # 🔥 Fix: Remove has_new_coverage dependency, allow proactive CFG analysis
+        # ═════════════════════════════════════════════════════════════════
+        # ═════════════════════════════════════════════════════════════════
+        # CFG-guided Fuzzing (Critical Fix!)
+        # 🔥 Fix: Remove has_new_coverage dependency, allow proactive CFG analysis
         # ═════════════════════════════════════════════════════════════════
         if self.path_finder:
             should_run_cfg = False
 
-            # 🔥 调试：打印当前状态
-            if self.stats.total_execs % 10 == 0:  # 每10次迭代打印一次
-                print(f"[FuzzingCore] 🔍 CFG检查: exec={self.stats.total_execs}, last={self.last_cfg_analysis_iter}, interval={self.cfg_analysis_interval_iters}")
+            trigger_reason = None
 
-            # ✅ P1: 混合触发条件
-            # 条件1: 达到迭代阈值
-            if self.stats.total_execs - self.last_cfg_analysis_iter >= self.cfg_analysis_interval_iters:
+            # 🔥 Debug: Print current status
+            if self.stats.total_execs % 10 == 0:  # Print every 10 iterations
+                alog(f"[FuzzingCore] 🔍 CFG Check: exec={self.stats.total_execs}, last={self.last_cfg_analysis_iter}, interval={self.cfg_analysis_interval_iters}", "DEBUG")
+
+            # ✅ P1: Mixed trigger conditions
+            # ✅ P1: Mixed trigger conditions
+            # Condition 1: Iteration threshold reached
+            interval = self.cfg_analysis_interval_iters
+            elapsed = self.stats.total_execs - self.last_cfg_analysis_iter
+            
+            # 🔥 Debug: Log CFG status
+            alog(f"[PathFinder] Status Check: elapsed={elapsed}, interval={interval}, has_new_cov={has_new_coverage}", "DEBUG")
+
+            if elapsed >= interval:
                 should_run_cfg = True
-                trigger_reason = f"{self.stats.total_execs - self.last_cfg_analysis_iter} 次迭代"
+                trigger_reason = f"{elapsed} iterations"
+            
+            # 🔥 Force run on new coverage for verification
+            if has_new_coverage:
+                 should_run_cfg = True
+                 trigger_reason = "New Coverage Found"
 
-            # 条件2: 达到时间阈值
+            # Condition 2: Time threshold reached
             elapsed_since_cfg = time.time() - self.last_cfg_analysis_time
             if elapsed_since_cfg >= self.cfg_analysis_interval_time:
                 should_run_cfg = True
-                trigger_reason = f"{elapsed_since_cfg:.0f} 秒"
+                trigger_reason = f"{elapsed_since_cfg:.0f} seconds"
             
+            # Unified CFG Analysis (Regular Path)
             if should_run_cfg:
-                print(f"\n[FuzzingCore] 🧭 运行CFG分析 (触发条件: {trigger_reason})...")
-                self.last_cfg_analysis_iter = self.stats.total_execs
-                self.last_cfg_analysis_time = time.time()
-
-                try:
-                    # Load syscall tree mapping for accurate CFG linkage
-                    tree_file = "/tmp/syscall_tree.json"
-                    if os.path.exists(tree_file):
-                        tree_loaded = self.path_finder.load_syscall_tree(tree_file)
-                        if tree_loaded:
-                            print(f"[FuzzingCore] Loaded precise syscall tree mapping")
-                        else:
-                            print(f"[FuzzingCore] Syscall tree mapping failed, using estimation")
-                    else:
-                        print(f"[FuzzingCore] Syscall tree file not found")
-
-                    if not self.path_finder.ensure_cfg_ready():
-                        print(f"[FuzzingCore] Building PathFinder CFG...")
-                        build_ok = self.path_finder.build_from_trace(trace.file_path)
-                        if not build_ok:
-                            print(f"[FuzzingCore] PathFinder CFG build failed")
-                    else:
-                        build_ok = True
-                        print(f"[FuzzingCore] ♻️ 使用已有CFG，只更新覆盖状态")
-
-                    if build_ok:
-                        # 获取当前覆盖的BBs
-                        covered_blocks = self._extract_covered_blocks()
-                        
-                        if covered_blocks:
-                            # 使用最新trace数据增强CFG与syscall映射
-                            syscall_trace_file = trace.file_path
-                            bb_trace_file = syscall_trace_file + ".bbl"
-                            if os.path.exists(bb_trace_file):
-                                mapped = self.path_finder.enhance_from_trace_files(
-                                    syscall_trace_file=syscall_trace_file,
-                                    bb_trace_file=bb_trace_file,
-                                    covered_set=covered_blocks
-                                )
-                                if mapped:
-                                    print(f"[FuzzingCore] 🔗 PathFinder增强了 {mapped} 个CFG节点 (来自{os.path.basename(trace.file_path)})")
-                            else:
-                                print(f"[FuzzingCore] ⚠️ 未找到BB trace文件: {bb_trace_file}")
-
-                            # 查找未覆盖的分支
-                            uncovered = self.path_finder.find_uncovered_branches(covered_blocks)
-                            print(f"[FuzzingCore] 📊 发现 {len(uncovered)} 个未覆盖的分支")
-                            
-                            if uncovered:
-                                # 生成新recipes（最多20个）
-                                new_recipes = self.path_finder.generate_recipes(
-                                    uncovered,
-                                    max_recipes=20
-                                )
-                                print(f"[FuzzingCore] 📝 生成了 {len(new_recipes)} 个新recipes")
-                                
-                                # 添加到RecipePool
-                                if self.recipe_pool and new_recipes:
-                                    self.recipe_pool.add_recipes(new_recipes)
-                                    
-                                    # 如果SmartMutator在recipe模式，更新其recipes
-                                    if isinstance(self.mutator, SmartMutator) and self.mutator.recipe_mode:
-                                        # 合并新recipes到SmartMutator
-                                        self.mutator.recipes.extend(new_recipes)
-                                        print(f"[FuzzingCore] ✅ 添加了 {len(new_recipes)} 个recipes到SmartMutator")
-                                        print(f"[FuzzingCore] 📚 总recipes数: {len(self.mutator.recipes)}")
-                
-                except Exception as e:
-                    # ✅ Task #7: 记录CFG分析失败
-                    self.metrics.record_failure(
-                        reason=FailureReason.UNKNOWN,
-                        component="PathFinder",
-                        details=f"CFG analysis failed: {str(e)}",
-                        iteration=iteration_id
-                    )
-                    print(f"[FuzzingCore] ⚠️  CFG分析失败: {e}")
+                self._perform_cfg_analysis(trace, has_new_coverage, trigger_reason, iteration_id)
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 步骤5: Trace保存 (如果有趣)
+        # Step 5: Trace Saving (if interesting)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if has_new_coverage:
-            # 目前重用相同的trace文件 (第1阶段简化)
-            # 第2阶段将实现带变异的trace重新记录
+            # Currently reusing the same trace file (Stage 1 simplification)
+            # Stage 2 will implement re-recording traces with mutations
             coverage_stats = self.coverage_tracker.get_stats()
             new_edges = coverage_stats.get('new_edges', set())
 
@@ -884,30 +1013,30 @@ class FuzzingCore:
                 )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 步骤5.5: Recipe反馈 (如果recipe模式)
+        # Step 5.5: Recipe Feedback (if recipe mode)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if self.recipe_pool and hasattr(self.mutator, 'last_recipe_used'):
             recipe_used = getattr(self.mutator, 'last_recipe_used', None)
             
             if recipe_used and result:
-                # 检查recipe是否成功
+                # Check if recipe was successful
                 if has_new_coverage:
-                    # TODO: 检查目标分支是否真的被覆盖
-                    # 目前，将任何新覆盖率视为部分成功
+                    # TODO: Check if the target branch was actually covered
+                    # For now, any new coverage is considered partial success
                     self.recipe_pool.update_recipe_result(
                         recipe_used,
                         success=True,
                         new_coverage=1
                     )
                     
-                    # 获取recipe统计
+                    # Get recipe statistics
                     recipe_id = recipe_used.get('id', -1)
                     if recipe_id in self.recipe_pool.stats:
                         stats = self.recipe_pool.stats[recipe_id]
-                        print(f"[FuzzingCore] ✅ Recipe {recipe_id} 成功! "
-                              f"(成功率: {stats.success_rate*100:.1f}%)")
+                        print(f"[FuzzingCore] ✅ Recipe {recipe_id} successful! "
+                              f"(Success rate: {stats.success_rate*100:.1f}%)")
                 else:
-                    # Recipe未能生成新覆盖率
+                    # Recipe failed to generate new coverage
                     self.recipe_pool.update_recipe_result(
                         recipe_used,
                         success=False,
@@ -915,7 +1044,7 @@ class FuzzingCore:
                     )
         
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # 步骤6: Crash检测和保存
+                # Step 6: Crash Detection and Saving
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 if result.crashed:
                     self.stats.crashes_found += 1
@@ -923,21 +1052,21 @@ class FuzzingCore:
                     print(f"[FuzzingCore] 💥 CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
                     self.crash_detector.save_crash(result, trace, mutations)
 
-                # 处理超时
+                # Handle timeouts
                 if result.timeout:
                     self.stats.timeouts += 1
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # 步骤7: 统计更新与显示
+        # Step 7: Statistics Update and Display
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         self._display_progress()
 
-        # ✅ Task #7: 记录成功的迭代
+        # ✅ Task #7: Record successful iteration
         self.metrics.record_success('successful_iterations')
 
-        # ✅ Task #8: 返回IterationResult
+        # ✅ Task #8: Return IterationResult
         if not has_any_success:
-            # 完全失败：没有任何成功的执行
+            # Complete failure: no successful executions
             return create_failure_result(
                 iteration_id=iteration_id,
                 status=IterationStatus.NO_MUTATIONS,
@@ -946,7 +1075,7 @@ class FuzzingCore:
                 trace_id=trace.id
             )
         else:
-            # 成功：至少有一次成功的执行
+            # Success: at least one successful execution
             return create_success_result(
                 iteration_id=iteration_id,
                 new_coverage=new_coverage_found,
@@ -958,7 +1087,7 @@ class FuzzingCore:
             )
     
     def _read_visualizer_output(self):
-        """在单独线程中读取Realtime Visualizer的输出（参考fuzz_conductor.py）"""
+        """Reads Realtime Visualizer output in a separate thread (refer to fuzz_conductor.py)"""
         if not self.realtime_viz_process or not self.realtime_viz_process.stdout:
             return
         
@@ -967,32 +1096,35 @@ class FuzzingCore:
                 line = self.realtime_viz_process.stdout.readline()
                 if not line:
                     break
-                # 只打印重要的visualizer消息（减少噪音）
+                # Only print important visualizer messages (reduce noise)
                 line_str = line.rstrip()
                 if any(keyword in line_str for keyword in ['✅', '❌', '⚠️', 'FORK', 'ERROR', 'Tree', 'MSG', 'ITER', 'DEBUG', 'SimpleVisualizer', 'Connected', 'Initialized']):
-                    print(f"[Visualizer] {line_str}", flush=True)
+                    alog(f"[Visualizer] {line_str}", "CORE", "INFO")
         except Exception as e:
-            print(f"[FuzzingCore] Visualizer输出读取错误: {e}")
+            alog(f"Visualizer output read error: {e}", "CORE", "ERROR")
     
     def _start_realtime_visualizer(self):
         """
-        配置C-Side Syscall Tree Export
-        (不再启动Python Visualizer，而是让QEMU C后端直接导出JSON)
+        Configures C-Side Syscall Tree Export
+        (No longer starts Python Visualizer, instead QEMU C backend directly exports JSON)
         """
         try:
-            # 设置输出路径 (每个child都会覆盖此文件，保留最后一次执行的tree)
-            from pathlib import Path
-            tree_output_path = Path(self.output_dir) / "latest_syscall_tree.html"
-            os.environ["RR_TREE_OUTPUT"] = str(tree_output_path.absolute())
-            
-            # 同时也清除旧的管道变量，避免混淆
-            if "RR_TRACE_PIPE" in os.environ:
-                del os.environ["RR_TRACE_PIPE"]
-                
-            print(f"[FuzzingCore] 🌲 Syscall Tree Configured: output={tree_output_path}")
+            # Set output path
+            if self.enable_pathfinder:
+                # Force enable syscall tree export for PathFinder mapping accuracy
+                from pathlib import Path
+                tree_output_path = Path(self.output_dir) / "latest_syscall_tree.html"
+                os.environ["RR_TREE_OUTPUT"] = str(tree_output_path.absolute())
+                alog(f"[FuzzingCore] 🌲 PathFinder Syscall Tree Configured: output={tree_output_path}", "CORE")
+
+            if self.enable_visualizer:
+                # Clear old pipe vars if any
+                if "RR_TRACE_PIPE" in os.environ:
+                    del os.environ["RR_TRACE_PIPE"]
+                alog(f"[FuzzingCore] 🎨 Visualizer enabled", "CORE")
             
         except Exception as e:
-            print(f"[FuzzingCore] ❌ Failed to configure syscall tree: {e}")
+            alog(f"❌ Failed to configure syscall tree: {e}", "CORE", "ERROR")
 
     def _stop_realtime_visualizer(self):
         """Stub"""
@@ -1000,7 +1132,7 @@ class FuzzingCore:
 
 
     def _get_coverage_percentage(self):
-        """获取当前覆盖率百分比"""
+        """Gets current coverage percentage"""
         try:
             stats = self.coverage_tracker.get_stats()
             return stats.get('bitmap_density', 0.0)
@@ -1009,23 +1141,23 @@ class FuzzingCore:
 
     def run_advanced(self, stop_conditions: dict):
         """
-        运行主fuzzing循环 (高级停止条件版本)
+        Runs the main fuzzing loop (advanced stop conditions version)
 
-        参数:
-            stop_conditions: 停止条件字典，包含：
-                - max_iterations: 最大迭代次数
-                - max_time: 最大时间(秒)
-                - max_crashes: 最大crash数量
-                - max_paths: 最大新路径数量
-                - coverage_target: 覆盖率目标(%)
-                - no_progress_timeout: 无进展超时(秒)
-                - infinite: 是否无限运行
+        Parameters:
+            stop_conditions: Dictionary of stop conditions, including:
+                - max_iterations: Maximum number of iterations
+                - max_time: Maximum time (seconds)
+                - max_crashes: Maximum number of crashes
+                - max_paths: Maximum number of new paths
+                - coverage_target: Coverage target (%)
+                - no_progress_timeout: No progress timeout (seconds)
+                - infinite: Whether to run indefinitely
         """
-        # 兼容旧接口
+        # Compatible with old interface
         max_iterations = stop_conditions.get('max_iterations')
         max_time = stop_conditions.get('max_time')
 
-        # 新的高级停止条件
+        # New advanced stop conditions
         max_crashes = stop_conditions.get('max_crashes')
         max_paths = stop_conditions.get('max_paths')
         coverage_target = stop_conditions.get('coverage_target')
@@ -1039,11 +1171,11 @@ class FuzzingCore:
 
     def run(self, max_iterations: Optional[int] = None, max_time: Optional[float] = None):
         """
-        运行主fuzzing循环 (向后兼容版本)
+        Runs the main fuzzing loop (backward compatible version)
 
-        参数:
-            max_iterations: 最大迭代次数 (None表示无限制)
-            max_time: 最大时间(秒) (None表示无限制)
+        Parameters:
+            max_iterations: Maximum number of iterations (None for unlimited)
+            max_time: Maximum time (seconds) (None for unlimited)
         """
         return self._run_with_conditions(max_iterations, max_time)
 
@@ -1051,91 +1183,106 @@ class FuzzingCore:
                            max_paths=None, coverage_target=None, no_progress_timeout=None,
                            infinite_mode=False):
         """
-        执行实际的fuzzing循环，支持各种停止条件
+        Execute actual fuzzing loop, supporting various stop conditions
         """
         # ═══════════════════════════════════════════════════════════════
-        # ✅ 注意：Visualizer已在__init__中启动，不要重复启动
+        # ✅ Note: Visualizer already started in __init__, do not restart
         # ═══════════════════════════════════════════════════════════════
-        # 如果还未启动，现在启动
+        # Start now if not already started
         if self.enable_tree_viz and not self.realtime_viz_process:
             self._start_realtime_visualizer()
 
-        # 显示启动信息
-        print(f"\n{'=' * 60}")
-        print(f"[FuzzingCore] 开始fuzzing活动")
+        # ✅ Check and Start Watchdog
+        if self.watchdog and not self.watchdog.running:
+             self.watchdog.start()
+
+        # Display startup info
+        alog(f"\n{'=' * 60}", "CORE", "INFO")
+        alog(f"Starting fuzzing campaign", "CORE", "INFO")
         if infinite_mode:
-            print(f"  模式: 无限运行 (直到Ctrl+C)")
+            alog(f"  Mode: Infinite Run (until Ctrl+C)", "CORE", "INFO")
         else:
             if max_iterations:
-                print(f"  最大迭代次数: {max_iterations}")
+                alog(f"  Max Iterations: {max_iterations}", "CORE", "INFO")
             if max_time:
-                print(f"  最大时间: {max_time}秒")
+                alog(f"  Max Time: {max_time}s", "CORE", "INFO")
             if max_crashes:
-                print(f"  最大crash数: {max_crashes}")
+                alog(f"  Max Crashes: {max_crashes}", "CORE", "INFO")
             if max_paths:
-                print(f"  最大新路径数: {max_paths}")
+                alog(f"  Max New Paths: {max_paths}", "CORE", "INFO")
             if coverage_target:
-                print(f"  覆盖率目标: {coverage_target}%")
+                alog(f"  Coverage Target: {coverage_target}%", "CORE", "INFO")
             if no_progress_timeout:
-                print(f"  无进展超时: {no_progress_timeout}秒")
-        print(f"{'=' * 60}\n")
+                alog(f"  No Progress Timeout: {no_progress_timeout}s", "CORE", "INFO")
+        alog(f"{'=' * 60}\n", "CORE", "INFO")
 
-        # 初始化变量
-        iteration = 0
-        start_time = time.time()
+        # Initialize variables
+        iteration = self.total_iterations
+        start_time = self.start_time
         last_progress_time = time.time()
         initial_paths = self.stats.paths_found
         initial_coverage = self._get_coverage_percentage()
 
         try:
             while True:
-                current_time = time.time()
+                # 🐶 Watchdog Kick
+                if self.watchdog:
+                     self.watchdog.kick()
 
-                # 🔥 高级停止条件检查
+                current_time = time.time()
+                
+                # 💾 Periodic Checkpoint Save
+                if self.checkpoint_manager:
+                    if current_time - self.last_checkpoint_time >= self.checkpoint_interval:
+                        self.checkpoint_manager.save(self)
+                        self.last_checkpoint_time = current_time
+
+                # 🔥 Advanced stop condition check
                 if not infinite_mode:
-                    # 基础条件
+                    # Base conditions
+                    # Basic conditions
                     if max_iterations and iteration >= max_iterations:
-                        print(f"\n[FuzzingCore] ✅ 达到最大迭代次数 ({max_iterations})")
+                        alog(f"✅ Maximum iterations reached ({max_iterations})", "CORE", "INFO")
                         break
 
                     if max_time and (current_time - start_time) >= max_time:
-                        print(f"\n[FuzzingCore] ⏰ 达到最大时间 ({max_time}秒)")
+                        alog(f"⏰ Maximum time reached ({max_time}s)", "CORE", "INFO")
                         break
 
-                    # 新的高级停止条件
+                    # New advanced stop conditions
                     if max_crashes and self.stats.crashes_found >= max_crashes:
-                        print(f"\n[FuzzingCore] 🎯 发现足够crashes ({self.stats.crashes_found}/{max_crashes})")
+                        alog(f"🎯 Found enough crashes ({self.stats.crashes_found}/{max_crashes})", "CORE", "INFO")
                         break
 
                     if max_paths and (self.stats.paths_found - initial_paths) >= max_paths:
-                        print(f"\n[FuzzingCore] 🛤️  发现足够新路径 ({self.stats.paths_found - initial_paths}/{max_paths})")
+                        alog(f"Tracked enough new paths ({self.stats.paths_found - initial_paths}/{max_paths})", "CORE", "INFO")
                         break
 
                     if coverage_target:
                         current_coverage = self._get_coverage_percentage()
                         if current_coverage >= coverage_target:
-                            print(f"\n[FuzzingCore] 📊 达到覆盖率目标 ({current_coverage:.1f}%/{coverage_target}%)")
+                            alog(f"📊 Coverage target reached ({current_coverage:.1f}%/{coverage_target}%)", "STATS", "INFO")
                             break
 
                     if no_progress_timeout:
-                        # 检查是否有新路径
+                        # Check for new progress
                         if self.stats.paths_found > initial_paths:
                             last_progress_time = current_time
                             initial_paths = self.stats.paths_found
                         elif (current_time - last_progress_time) >= no_progress_timeout:
-                            print(f"\n[FuzzingCore] 📉 超过{no_progress_timeout}秒无新路径发现")
+                            alog(f"📉 No progress for {no_progress_timeout}s, stopping...", "CORE", "WARN")
                             break
                 
-                # ✅ 新增：动态fork探索（基于概率）
+                # ✅ New: Dynamic Fork Exploration (probabilistic)
                 use_dynamic_fork = (self.dynamic_fork_controller and 
                                   self.dynamic_fork_controller.should_trigger_multi_fork(iteration))
                 
                 result = None  # ✅ Fix: Initialize result to avoid UnboundLocalError
                 if use_dynamic_fork:
-                    # 动态fork模式：在trace中间点fork多个variants
-                    print(f"\n{'='*60}")
-                    print(f"[FuzzingCore] 🌿 Iteration {iteration}: Dynamic Fork Mode")
-                    print(f"{'='*60}")
+                    # Dynamic Fork Mode: fork multiple variants at trace midpoints
+                    alog(f"\n{'='*60}", "CORE", "INFO")
+                    alog(f"🌿 Iteration {iteration}: Dynamic Fork Mode", "CORE", "INFO")
+                    alog(f"{'='*60}", "CORE", "INFO")
                     trace = self.trace_manager.select_trace()
                     if trace:
                         # Set current_trace_id for correct parent linkage in corpus
@@ -1150,50 +1297,61 @@ class FuzzingCore:
                             if success:
                                 self.stats.paths_found += 1
                         except Exception as e:
-                            print(f"[FuzzingCore] ⚠️  Iteration {iteration} failed: {e}")
+                            alog(f"⚠️  Iteration {iteration} failed: {e}", "CORE", "WARN")
                             import traceback
                             traceback.print_exc()
                 else:
-                    # 正常单次迭代 (✅ 传递iteration_id)
+                    # Normal single iteration (✅ pass iteration_id)
                     result = self.run_single_iteration(iteration_id=iteration)
-                    # ✅ Task #8: 使用IterationResult
-                    # 打印详细结果（可选）
+                    # ✅ Task #8: Use IterationResult
+                    # Print detailed result (optional)
                     if result and result.is_failure():
-                        print(f"[FuzzingCore] ⚠️  {result}")
+                        alog(f"⚠️  {result}", "CORE", "WARN")
                 
                 iteration += 1
+                self.total_iterations = iteration
         
         except KeyboardInterrupt:
-            print(f"\n[FuzzingCore] 用户中断")
+            alog(f"User interrupted", "CORE", "WARN")
         
         finally:
+            # 🛑 Stop Watchdog
+            if self.watchdog:
+                 self.watchdog.stop()
+            
+            # 💾 Final Checkpoint Save
+            if self.checkpoint_manager:
+                alog(f"💾 Saving final checkpoint...", "CORE", "INFO")
+                self.checkpoint_manager.save(self)
+
             # ═══════════════════════════════════════════════════════════════
-            # 方案A: 停止Realtime Visualizer并生成最终tree
+            # Option A: Stop Realtime Visualizer and generate final tree
             # ═══════════════════════════════════════════════════════════════
-            print(f"\n[FuzzingCore] ⏳ 等待Visualizer接收所有消息...")
-            time.sleep(5)  # ✅ 增加等待时间，确保所有消息都被接收
-            print(f"[FuzzingCore] ⏳ 开始停止Visualizer...")
+            alog(f"⏳ Waiting for components to finalize...", "CORE", "INFO")
+            alog(f"⏳ Waiting for components to finalize...", "CORE", "INFO")
+            time.sleep(5)  # ✅ Wait for all messages to be processed
+            alog(f"⏳ Stopping Visualizer...", "CORE", "INFO")
             self._stop_realtime_visualizer()
             
-            # 最终统计
+            # Final statistics
             self._display_final_statistics()
     
     def _display_final_statistics(self):
-        """显示最终fuzzing统计信息"""
+        """Display final fuzzing statistics"""
         cov_stats = self.coverage_tracker.get_stats()
         trace_stats = self.trace_manager.get_statistics()
         exec_stats = self.execution_engine.get_statistics()
         
-        print(f"\n[FuzzingCore] ✅ Fuzzing loop completed. Preparing final report...")
+        alog(f"✅ Fuzzing loop completed. Preparing final report...", "CORE", "INFO")
         
-        # 保存最终结果（corpus、统计信息等）
+        # Save final results (corpus, stats, etc.)
         self.save_final_results()
     
     def save_final_results(self):
         """
-        将最终结果保存到磁盘
+        Save final results to disk
         
-        第5层集成: 自动生成所有监控和分析报告
+        Layer 5 Integration: Auto-generate all monitoring and analysis reports
         """
         import json
         from pathlib import Path
@@ -1201,14 +1359,15 @@ class FuzzingCore:
         output_path = Path(self.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        print(f"\n[FuzzingCore] 💾 正在保存最终结果...")
+        alog(f"💾 Saving final results...", "CORE", "INFO")
         
-        # 保存corpus (第2层)
+        # Save corpus (Layer 2)
         self.trace_manager.save_corpus(self.output_dir)
         
-        # 保存最终统计信息
+        # Save final statistics
         stats_file = output_path / "final_stats.json"
         with open(stats_file, 'w') as f:
+            # Use default=list to convert any remaining sets to lists
             json.dump({
                 'execution': {
                     'total_execs': self.stats.total_execs,
@@ -1221,34 +1380,32 @@ class FuzzingCore:
                 'coverage': self.coverage_tracker.get_stats(),
                 'traces': self.trace_manager.get_statistics(),
                 'executor': self.execution_engine.get_statistics(),
-                # ✅ Task #7: 导出FuzzingMetrics
                 'metrics': self.metrics.to_dict(),
-                # ✅ Task #6: 导出MutationDependencyGraph
                 'mutation_graph': self.mutation_graph.to_dict()
-            }, f, indent=2)
+            }, f, indent=2, default=lambda o: list(o) if isinstance(o, set) else str(o))
 
-        print(f"  ✅ 统计信息已保存到 {stats_file}")
+        alog(f"  ✅ Statistics saved to {stats_file}", "CORE", "INFO")
 
-        # ✅ Task #7: 保存FuzzingMetrics详细报告
+        # ✅ Task #7: Save FuzzingMetrics detailed report
         metrics_report_file = output_path / "metrics_report.txt"
         with open(metrics_report_file, 'w') as f:
             f.write(self.metrics.generate_report())
-        print(f"  ✅ Metrics报告已保存到 {metrics_report_file}")
+        alog(f"  ✅ Metrics report saved to {metrics_report_file}", "CORE", "INFO")
 
-        # ✅ Task #6: 保存MutationDependencyGraph详细报告
+        # ✅ Task #6: Save MutationDependencyGraph detailed report
         mutation_report_file = output_path / "mutation_analysis.txt"
         with open(mutation_report_file, 'w') as f:
             f.write(self.mutation_graph.generate_report())
-        print(f"  ✅ Mutation分析报告已保存到 {mutation_report_file}")
+        alog(f"  ✅ Mutation analysis report saved to {mutation_report_file}", "CORE", "INFO")
 
-        # ✅ Task #6: 导出完整的mutation图结构 (用于深入分析)
+        # ✅ Task #6: Export complete mutation graph structure (for in-depth analysis)
         if self.mutation_graph.nodes:
             mutation_graph_file = output_path / "mutation_graph.json"
             self.mutation_graph.export_to_json(mutation_graph_file)
-            print(f"  ✅ Mutation图结构已保存到 {mutation_graph_file}")
+            alog(f"  ✅ Mutation graph structure saved to {mutation_graph_file}", "CORE", "INFO")
         
         # ═══════════════════════════════════════════════════════════
-        # 第5层: 监控与分析 (重点!)
+        # Layer 5: Monitoring & Analysis (Important!)
         # ═══════════════════════════════════════════════════════════
         
         if self.enable_monitoring:
@@ -1258,72 +1415,109 @@ class FuzzingCore:
             trace_stats = self.trace_manager.get_statistics()
             exec_stats = self.execution_engine.get_statistics()
             
-            print("\n" + "═"*70)
-            print(f"{'🏁 Fuzzing Campaign Summary':^70}")
-            print("═"*70)
+            alog("\n" + "═"*70, "SUMMARY", "INFO")
+            alog(f"{'🏁 Fuzzing Campaign Summary':^70}", "SUMMARY", "INFO")
+            alog("═"*70, "SUMMARY", "INFO")
             
             # Row 1: Execution & Coverage
-            print(f" │ {'📊 Execution Metrics':<32} │ {'🎯 Coverage Metrics':<32} │")
-            print(f" │ {'─'*32} │ {'─'*32} │")
-            print(f" │ Total Execs : {self.stats.total_execs:<18} │ Total Edges : {cov_stats['total_edges']:<18} │")
-            print(f" │ Speed       : {self.stats.execs_per_sec:>.1f} exec/s       │ New Paths   : {self.stats.paths_found:<18} │")
-            print(f" │ Duration    : {self.stats.elapsed_time:>.1f}s            │ Density     : {cov_stats['bitmap_density']:>.2f}%            │")
-            print(" " + "─"*70)
+            # ✅ Fix: Use authoritative source for exec count
+            final_total_execs = self.stats.total_execs
+            if final_total_execs == 0:
+                final_total_execs = exec_stats.get('total_executions', 0)
+                if final_total_execs == 0:
+                    final_total_execs = self.total_executions
+            
+            final_speed = self.stats.execs_per_sec
+            if final_speed == 0 and final_total_execs > 0 and self.stats.elapsed_time > 0:
+                final_speed = final_total_execs / self.stats.elapsed_time
+            
+            # If aggregated stats exist (e.g. from DynamicForkController updation)
+            if hasattr(self.stats, 'aggregated_total_execs') and self.stats.aggregated_total_execs > 0:
+                 final_total_execs = self.stats.aggregated_total_execs
+                 if self.stats.elapsed_time > 0:
+                     final_speed = final_total_execs / self.stats.elapsed_time
+
+            alog(f" │ {'📊 Execution Metrics':<32} │ {'🎯 Coverage Metrics':<32} │", "SUMMARY", "INFO")
+            alog(f" │ {'─'*32} │ {'─'*32} │", "SUMMARY", "INFO")
+            alog(f" │ Total Execs : {final_total_execs:<18} │ Total Edges : {cov_stats['total_edges']:<18} │", "SUMMARY", "INFO")
+            alog(f" │ Speed       : {final_speed:>.1f} exec/s       │ New Paths   : {self.stats.paths_found:<18} │", "SUMMARY", "INFO")
+            alog(f" │ Duration    : {self.stats.elapsed_time:>.1f}s            │ Density     : {cov_stats['bitmap_density']:>.2f}%            │", "SUMMARY", "INFO")
+            alog(" " + "─"*70, "SUMMARY", "INFO")
             
             # Row 2: Corpus & Reliability
-            print(f" │ {'📦 Corpus Health':<32} │ {'💥 Reliability Metrics':<32} │")
-            print(f" │ {'─'*32} │ {'─'*32} │")
-            print(f" │ Total Traces: {trace_stats['total_traces']:<18} │ Total Crashes: {self.stats.crashes_found:<17} │")
-            print(f" │ Active      : {trace_stats['active_traces']:<18} │ Unique       : {len(self.crash_detector.crashes):<17} │")
-            print(f" │ Saved       : {trace_stats['traces_saved']:<18} │ Crash Rate   : {exec_stats['crash_rate']:>.2%}            │")
-            print("═"*70 + "\n")
+            alog(f" │ {'📦 Corpus Health':<32} │ {'💥 Reliability Metrics':<32} │", "SUMMARY", "INFO")
+            alog(f" │ {'─'*32} │ {'─'*32} │", "SUMMARY", "INFO")
+            alog(f" │ Total Traces: {trace_stats['total_traces']:<18} │ Total Crashes: {self.stats.crashes_found:<17} │", "SUMMARY", "INFO")
+            alog(f" │ Active      : {trace_stats['active_traces']:<18} │ Unique       : {len(self.crash_detector.crashes):<17} │", "SUMMARY", "INFO")
+            alog(f" │ Saved       : {trace_stats['traces_saved']:<18} │ Crash Rate   : {exec_stats['crash_rate']:>.2%}            │", "SUMMARY", "INFO")
+            alog("═"*70 + "\n", "SUMMARY", "INFO")
             
-            # 1. CorpusManager: 保存持久化corpus
+            # 1. CorpusManager: Persistent corpus
             if self.layer5_corpus_manager:
                 try:
-                    # 注意: corpus_manager需要seed_queue对象，这里简化处理
-                    print(f"  ✅ [Corpus] Manager Active (Manual save required)")
+                    # Note: corpus_manager requires seed_queue object, simplified here
+                    alog(f"  ✅ [Corpus] Manager Active (Manual save required)", "CORE", "INFO")
                 except Exception as e:
-                    print(f"  ❌ [Corpus] Save Failed: {e}")
+                    alog(f"  ❌ [Corpus] Save Failed: {e}", "CORE", "ERROR")
             
-            # 2. CrashAnalyzer: 生成crash报告
+            # 2. CrashAnalyzer: Generate crash report
             if self.layer5_crash_analyzer:
                 try:
-                    print(f"  📊 [Analysis] Generating crash report...")
-                    print("  " + "─"*50)
-                    self.layer5_crash_analyzer.print_summary(top_n=20, verbose=True)
-                    print("  " + "─"*50)
+                    alog(f"  📊 [Analysis] Generating crash report...", "CORE", "INFO")
+                    alog("  " + "─"*50, "CORE", "INFO")
                     
-                    # 导出crash报告
+                    # Hack: Capture sys.stdout to redirect print_summary to alog
+                    import io
+                    from contextlib import redirect_stdout
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        self.layer5_crash_analyzer.print_summary(top_n=20, verbose=True)
+                    
+                    for line in f.getvalue().splitlines():
+                        alog(f"  {line}", "CORE", "INFO")
+                    
+                    alog("  " + "─"*50, "CORE", "INFO")
+                    
+                    # Export crash report
                     crash_report = output_path / "crash_analysis.json"
                     self.layer5_crash_analyzer.export_to_file(crash_report, format='json')
-                    print(f"  ✅ [Report] Saved to: {crash_report}")
+                    alog(f"  ✅ [Report] Saved to: {crash_report}", "CORE", "INFO")
                 except Exception as e:
-                    print(f"  ❌ [Analysis] Failed: {e}")
+                    alog(f"  ❌ [Analysis] Failed: {e}", "CORE", "ERROR")
             
             # 3. ⭐ C-Side Syscall Tree Export (HTML Bundle)
             tree_path = output_path / "latest_syscall_tree.html"
             if tree_path.exists():
-                print(f"  🌳 [Syscall Tree] HTML Bundle Exported")
-                print(f"     => file://{tree_path.absolute()}")
+                alog(f"  🌳 [Syscall Tree] HTML Bundle Exported", "CORE", "INFO")
+                alog(f"     => file://{tree_path.absolute()}", "CORE", "INFO")
             else:
-                print(f"  ⚠️  [Syscall Tree] Export Failed (File not found)")
+                # alog(f"  ⚠️  [Syscall Tree] Export Failed (File not found)", "CORE", "WARN")
+                pass
             
-            print("\n" + "═"*60)
-            print(f"  📂 All artifacts saved to: {output_path}")
-            print("═"*60 + "\n")
+            alog("\n" + "═"*60, "CORE", "INFO")
+            alog(f"  📂 All artifacts saved to: {output_path}", "CORE", "INFO")
+            alog("═"*60 + "\n", "CORE", "INFO")
+            
+            # ✅ Final Resource Cleanup
+            if self.execution_engine:
+                self.execution_engine.stop_persistent_qemu()
+            
+            # ✅ STOP LOGGER LAST
+            if self.logger:
+                alog("✅ Project cleanup complete. Goodbye!", "CORE", "INFO")
+                self.logger.stop()
     
     def _generate_syscall_trees(self, output_path: Path):
         """
-        生成Syscall树可视化 (第5层重点功能)
+        Generate Syscall Tree Visualization (Layer 5 key feature)
         
-        生成统一的树状可视化，包含所有traces
-        使用D3.js tree layout，真正的树形结构
+        Generates a unified horizontal tree visualization for all traces.
+        Uses D3.js tree layout for a true hierarchical structure.
         """
         trees_dir = output_path / "syscall_trees"
         trees_dir.mkdir(exist_ok=True)
         
-        # 收集所有trace文件
+        # Collect all trace files
         trace_files = []
         labels = []
         
@@ -1332,14 +1526,14 @@ class FuzzingCore:
             trace_files.append(self.initial_trace)
             labels.append("Initial Trace")
         
-        # 2. Corpus traces (限制前10个)
+        # 2. Corpus traces (limit to top 10)
         corpus_dir = Path(self.output_dir) / "corpus"
         if corpus_dir.exists():
             for trace_file in sorted(corpus_dir.glob("*.bin"))[:10]:
                 trace_files.append(str(trace_file))
                 labels.append(f"Corpus: {trace_file.stem}")
         
-        # 3. Crash traces (限制前5个)
+        # 3. Crash traces (limit to top 5)
         crashes_dir = Path(self.output_dir) / "crashes"
         if crashes_dir.exists():
             for crash_file in sorted(crashes_dir.glob("*.bin"))[:5]:
@@ -1347,25 +1541,25 @@ class FuzzingCore:
                 labels.append(f"Crash: {crash_file.stem}")
         
         if not trace_files:
-            print(f"  ⚠️  未找到用于可视化的traces")
+
             return
         
-        # 使用TreeVisualizer生成真正的树状可视化（带统计信息）
-        print(f"  🌳 正在为{len(trace_files)}个traces生成树可视化...")
+        # Use TreeVisualizer to generate horizontal tree (with stats)
+        alog(f"  🌳 Generating tree visualization for {len(trace_files)} traces...", "CORE", "INFO")
         
         try:
             viz = TreeVisualizer()
             
             for trace_file, label in zip(trace_files, labels):
-                # ✅ 获取该trace的统计信息
-                # 从文件名提取trace_id（如果是corpus文件）
+                # ✅ Get statistics for this trace
+                # Extract trace_id from filename (if it's a corpus file)
                 trace_id = None
                 if 'corpus' in str(trace_file):
                     trace_id = Path(trace_file).stem
-                # ✅ 修复: Initial trace应该独立，不使用corpus的stats
-                # 因为initial trace没有mutation，不应该和mutated traces共享stats
+                # ✅ Fix: Initial trace should be independent, not using corpus stats
+                # Because initial trace has no mutations, it shouldn't share stats with mutated traces
                 
-                # 构建stats字典
+                # Build stats dict
                 stats_dict = None
                 if trace_id:
                     syscall_stats = self.trace_manager.get_syscall_stats(trace_id)
@@ -1374,52 +1568,57 @@ class FuzzingCore:
                             'syscall_stats': syscall_stats,
                             'trace_id': trace_id
                         }
-                        print(f"  📊 找到{trace_id}的stats: {len(syscall_stats)}个syscall有数据")
+                    alog(f"  📊 Found stats for {trace_id}: {len(syscall_stats)} syscalls have data", "CORE", "DEBUG")
                 else:
-                    # Initial trace没有stats（所有mutation_applied=False）
-                    print(f"  📊 {label}无stats (初始trace, 无变异)")
+                    # Initial trace has no stats (all mutation_applied=False)
+                    alog(f"  📊 {label} has no stats (initial trace, no mutations)", "CORE", "DEBUG")
                 
-                # 添加trace（带统计信息）
+                # Add trace (with stats)
                 viz.add_trace(trace_file, label, stats=stats_dict)
             
             tree_html = trees_dir / "syscall_tree.html"
             if viz.generate_html(str(tree_html)):
-                print(f"  ✅ 已生成树: {tree_html}")
-                print(f"  📂 查看树: file://{tree_html.absolute()}")
+                alog(f"  ✅ Tree generated: {tree_html}", "CORE", "INFO")
+                alog(f"  📂 View tree: file://{tree_html.absolute()}", "CORE", "INFO")
             else:
-                print(f"  ⚠️  生成树可视化失败")
+                alog(f"  ⚠️  Failed to generate tree visualization", "CORE", "WARN")
         
         except Exception as e:
-            print(f"  ⚠️  树生成失败: {e}")
+            alog(f"  ⚠️  Tree generation failed: {e}", "CORE", "ERROR")
             import traceback
             traceback.print_exc()
     
     def cleanup(self):
-        """清理资源 (在程序退出时调用)"""
-        print("[FuzzingCore] 正在清理资源...")
+        """Clean up resources (called on exit)"""
+        alog("Cleaning up resources...", "CORE", "INFO")
         
         # ═══════════════════════════════════════════════════════════════
-        # 方案A: 确保Realtime Visualizer被停止
+        # Option A: Ensure Realtime Visualizer is stopped
         # ═══════════════════════════════════════════════════════════════
         self._stop_realtime_visualizer()
         
-        # ✅ 修复: 优雅地停止持久化的QEMU执行器
+        # ✅ Fix: Gracefully stop persistent QEMU executor
         if hasattr(self, 'execution_engine') and self.execution_engine:
             if hasattr(self.execution_engine, 'stop_persistent_mode'):
-                # 新的持久化执行器
+                # New persistent executor
                 self.execution_engine.stop_persistent_mode()
             elif hasattr(self.execution_engine, 'stop_persistent_qemu'):
-                # 传统的执行器
+                # Legacy executor
                 self.execution_engine.stop_persistent_qemu()
         
-        # 清理共享覆盖率位图
+        # Clean up shared coverage bitmap
         from .qemu_executor import QEMUExecutor
         QEMUExecutor.cleanup_shared_coverage()
         
-        print("[FuzzingCore] ✅ 清理完成")
+        # Clean up CoverageTracker (release multiprocessing resources)
+        if hasattr(self, 'coverage_tracker') and self.coverage_tracker:
+            if hasattr(self.coverage_tracker, 'cleanup'):
+                self.coverage_tracker.cleanup()
+        
+        alog("✅ Cleanup complete", "CORE", "INFO")
     
     def __del__(self):
-        """析构函数以确保清理"""
+        """Destructor to ensure cleanup"""
         try:
             self.cleanup()
         except:

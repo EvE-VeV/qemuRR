@@ -90,19 +90,19 @@ class FuzzSharedMemory:
                           depth: int = 0,
                           iteration_id: int = 0):
         """
-        统一的fork请求写入方法（替代所有旧方法）
+        Unified fork request writing method (replaces all legacy methods)
         
         Args:
-            fork_point: 0=从头开始, N=mid-point fork
-            mutation_variants: None/空=单次执行, [v1,v2,...]=批量fork
-            depth: 嵌套深度（0=顶层，1=一级嵌套，...）
-            iteration_id: 当前iteration编号（用于Visualizer）
+            fork_point: 0=start from beginning, N=mid-point fork
+            mutation_variants: None/empty=single execution, [v1,v2,...]=batch fork
+            depth: Nesting depth (0=top-level, 1=level-1 nesting, ...)
+            iteration_id: Current iteration number (for Visualizer)
         
-        场景映射:
-            - 旧write_instructions: fork_request(fork_point=0, variants=[[inst1,inst2]], depth=0)
-            - 旧write_batch_variants: fork_request(fork_point=0, variants=[v1,v2,v3], depth=0)
-            - 旧write_checkpoint_variants: fork_request(fork_point=N, variants=[v1,v2,v3], depth=0)
-            - 嵌套fork: fork_request(fork_point=N, variants=[v1,v2,v3], depth=1)
+        Scenario Mapping:
+            - Legacy write_instructions: fork_request(fork_point=0, variants=[[inst1,inst2]], depth=0)
+            - Legacy write_batch_variants: fork_request(fork_point=0, variants=[v1,v2,v3], depth=0)
+            - Legacy write_checkpoint_variants: fork_request(fork_point=N, variants=[v1,v2,v3], depth=0)
+            - Nested fork: fork_request(fork_point=N, variants=[v1,v2,v3], depth=1)
         """
         if not self.mem:
             raise RuntimeError("Shared memory not created")
@@ -112,14 +112,14 @@ class FuzzSharedMemory:
 
         num_variants = len(mutation_variants)
 
-        # ✅ 边界检查1: 检查变体数量是否超过限制
+        # ✅ Boundary check 1: Check if number of variants exceeds limit
         if num_variants > FUZZ_MAX_VARIANTS:
             raise ValueError(
                 f"Too many variants: {num_variants} (max {FUZZ_MAX_VARIANTS}). "
                 f"This would overflow FuzzSharedMemory.variants[{FUZZ_MAX_VARIANTS}] array."
             )
 
-        # ✅ 边界检查2: 检查每个变体的指令数量是否超过限制
+        # ✅ Boundary check 2: Check if instruction count per variant exceeds limit
         for i, instructions in enumerate(mutation_variants):
             if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
                 raise ValueError(
@@ -134,56 +134,44 @@ class FuzzSharedMemory:
         # Checksum
         checksum = FUZZ_MAGIC ^ self.sequence ^ num_variants ^ fork_point ^ depth
         
-        # Header: 包含所有必要信息
-        # Layout: magic(4) + sequence(4) + num_variants(4) + checksum(4) + iteration_id(4) + reserved(4)
-        #         + fork_point(4) + depth(4) + reserved(4)
-        header = struct.pack('IIIIII', 
-            FUZZ_MAGIC,      # magic
-            self.sequence,   # sequence
-            num_variants,    # num_variants（复用原instruction_count字段）
-            checksum,        # checksum
-            iteration_id,    # iteration_id（复用原flags字段）
-            0)               # reserved
-        header += struct.pack('III', 
-            fork_point,      # fork_point
-            depth,           # depth（新增）
-            0)               # reserved
+        # Prepare header parts
+        # Header layout: magic(0), sequence(4), num_variants(8), checksum(12), iteration_id(16), reserved(20)
+        #                fork_point(24), depth(28), reserved(32)
         
-        self.mem.seek(0)
-        self.mem.write(header)
+        header_part1 = struct.pack('III', FUZZ_MAGIC, self.sequence, num_variants)
+        header_part2 = struct.pack('IIIIII', iteration_id, 0, fork_point, depth, 0, 0)
         
-        # 🔥 修复：写入variants的正确offset计算
-        # Header: 9个uint32_t = 36字节
-        # instructions[32]: 32 * 280字节(FuzzInstruction.struct_size) = 8960字节
-        # variants[0]起始: 36 + 8960 = 8996字节
+        # 1. First write variant data
         base_offset = 36 + 32 * 280
-
-        # 🔥 关键修复：每个FuzzVariant固定大小 = 4 + 32*280 = 8964字节
-        variant_struct_size = 4 + 32 * 280  # instruction_count + instructions[32]
-
+        variant_struct_size = 4 + 32 * 280
         for variant_idx, instructions in enumerate(mutation_variants):
-            # 计算当前variant的起始offset
             variant_offset = base_offset + variant_idx * variant_struct_size
-
-            # Variant header: instruction_count
             self.mem.seek(variant_offset)
             self.mem.write(struct.pack('I', len(instructions)))
-
-            # Variant instructions (写入到固定位置，确保对齐)
             inst_offset = variant_offset + 4
             for inst in instructions:
                 self.mem.seek(inst_offset)
                 self.mem.write(inst.pack())
-                inst_offset += 280  # FuzzInstruction固定大小
-
-            # 注意：剩余的instruction槽位保持为零（已在create时初始化）
+                inst_offset += 280
         
+        # 2. Write non-checksum parts of Header
+        self.mem.seek(0)
+        self.mem.write(header_part1)
+        self.mem.seek(16) # skip checksum(12-16)
+        self.mem.write(header_part2)
+        
+        # 3. Ensure data is flushed to memory
+        self.mem.flush()
+        
+        # 4. Finally write checksum as "commit" operation
+        self.mem.seek(12)
+        self.mem.write(struct.pack('I', checksum))
         self.mem.flush()
         
         print(f"[SharedMemory] Fork request: fork_point={fork_point}, "
               f"variants={num_variants}, depth={depth}, iteration={iteration_id}")
         for i, variant in enumerate(mutation_variants):
-            if variant:  # 只有非空variant才打印
+            if variant:  # only print non-empty variants
                 print(f"  Variant {i}: {len(variant)} instructions")
     
     def close(self):

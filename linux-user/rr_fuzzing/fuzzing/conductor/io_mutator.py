@@ -15,6 +15,13 @@ import random
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
+try:
+    from .async_logger import alog
+except ImportError:
+    # Fallback if accessed via direct script run or path issues
+    def alog(msg, *args, **kwargs):
+        print(f"[{args[0] if args else 'LOG'}] {msg}")
+
 
 @dataclass
 class IOMutation:
@@ -93,7 +100,7 @@ class IOReturnValueMutator:
                     # 1. 跳过返回值很大的read (>200字节) - 可能是读文件
                     # 2. 优先选择靠后的read - 用户输入通常在初始化之后
                     if syscall_name == 'read' and retval > 200:
-                        print(f"[IOReturnValueMutator] Skipping read @{idx} (retval={retval} > 200, likely file read)")
+                        alog(f"Skipping read @{idx} (retval={retval} > 200, likely file read)", "IOReturnValueMutator", "DEBUG")
                         continue
 
                     io_syscalls.append({
@@ -104,7 +111,7 @@ class IOReturnValueMutator:
                     })
 
         except Exception as e:
-            print(f"[IOReturnValueMutator] Error parsing trace: {e}")
+            alog(f"Error parsing trace: {e}", "IOReturnValueMutator", "ERROR")
 
         return io_syscalls
 
