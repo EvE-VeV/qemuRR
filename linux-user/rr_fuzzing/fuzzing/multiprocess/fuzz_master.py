@@ -49,6 +49,7 @@ class WorkerConfig:
     recipe_file: Optional[str] = None
     enable_pathfinder: bool = True
     enable_persistence: bool = False
+    target_args: str = ""        # ✅ Target program arguments
 
 
 @dataclass
@@ -200,6 +201,7 @@ class FuzzMaster:
             initial_trace=self.initial_trace,
             sync_dir=self.sync_dir,
             worker_dir=worker_dir,
+            target_args=self.target_args, # ✅ Pass target_args to worker
             mutator_type=self.mutator_type,
             recipe_file=self.recipe_file,
             enable_pathfinder=self.enable_pathfinder,
@@ -280,6 +282,7 @@ class FuzzMaster:
                 enable_tree_viz=False,  # Disable tree viz in multi-process to avoid conflict
                 enable_monitoring=False,
                 use_energy_scheduler=False,  # ✅ MP mode uses TraceManager instead of SeedManagerAdapter
+                target_args=config.target_args, # ✅ Pass target_args
                 initial_stats=initial_stats, # ✅ Pass restored stats
                 shared_coverage=shared_coverage  # ✅ Multi-process coverage sync
             )

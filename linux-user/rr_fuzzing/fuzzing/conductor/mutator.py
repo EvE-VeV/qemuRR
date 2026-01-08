@@ -58,7 +58,7 @@ class BaseMutator:
         mode_str = "Random Mutation + IO Retval Mutation" if use_io_mutation else "Random Mutation Mode"
         alog(f"Initialized ({mode_str})", "MUTATOR", "INFO")
     
-    def mutate(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
+    def mutate(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
         """
         Generate random mutation
 

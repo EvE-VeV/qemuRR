@@ -318,6 +318,8 @@ class FuzzingCore:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.target_binary = target_binary  # P0-1: Save for PathFinder
+        self.target_args = target_args       # ✅ Fix: Store target_args for restart
+
         
         # PathFinder support (multi-level static analysis + dynamic trace mapping)
         self.enable_pathfinder = enable_pathfinder and _HAS_PATH_FINDER

@@ -343,7 +343,13 @@ class DynamicForkController:
         mutation_node_ids = []  # Track mutation node IDs in graph
         for i in range(self.max_variants_per_checkpoint):
             # 🔥 Pass current trace object for IO mutation use
-            mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index, analyzer=self.analyzer)
+            # ✅ Robust mutation call (handle both BaseMutator and SmartMutator interfaces)
+            try:
+                mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index, analyzer=self.analyzer)
+            except TypeError:
+                # Fallback for mutators that don't accept analyzer keyword
+                mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index)
+
             mutations.append(mutation)
 
             # Track mutation in graph and extract type from instructions
