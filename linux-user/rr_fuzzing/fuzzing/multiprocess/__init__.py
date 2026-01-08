@@ -17,13 +17,18 @@ RR-Fuzz 多进程模糊测试模块
 # from .shared_resources import SharedCoverage, WorkerSeedQueue
 # from .recipe_pool import RecipePool, RecipeStats
 
-# DualLevelPathFinder 是可选的（需要 angr）
+# DualLevelPathFinder imported from conductor (the optimized version)
 try:
-    from .dual_level_path_finder import DualLevelPathFinder as PathFinder
+    from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
     _has_path_finder = True
 except ImportError:
-    PathFinder = None
-    _has_path_finder = False
+    # Fallback to local if conductor not in path
+    try:
+        from .dual_level_path_finder import DualLevelPathFinder as PathFinder
+        _has_path_finder = True
+    except ImportError:
+        PathFinder = None
+        _has_path_finder = False
 
 __all__ = [
     # 模块名（用于 from multiprocess import module_name）

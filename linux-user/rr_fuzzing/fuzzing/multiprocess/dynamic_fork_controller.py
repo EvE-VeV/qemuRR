@@ -33,10 +33,13 @@ else:
 from conductor.mutator import SmartMutator
 from conductor.coverage import CoverageTracker
 from conductor.trace_manager import TraceManager, Trace
-from .dual_level_path_finder import DualLevelPathFinder as PathFinder
+try:
+    from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
+except ImportError:
+    from .dual_level_path_finder import DualLevelPathFinder as PathFinder
 from .recipe_pool import RecipePool
 from conductor.async_logger import alog
-
+from conductor.constants import PRIMARY_IO_SYSCALLS
 
 @dataclass
 class FuzzCheckpoint:
@@ -85,7 +88,8 @@ class DynamicForkController:
                  trace_manager: TraceManager = None,
                  fuzzing_stats=None,
                  mutation_graph=None,
-                 crash_detector=None):  # ✅ Task #8: Add crash detector
+                 crash_detector=None,
+                 analyzer=None):  # ✅ Task #8: Add crash detector
         """Initialize dynamic fork controller
         
         Args:
@@ -98,6 +102,7 @@ class DynamicForkController:
             fuzzing_stats: FuzzingStatistics instance (for unified tracking)
             mutation_graph: MutationDependencyGraph instance (for mutation tracking)
             crash_detector: CrashDetector instance (for saving crashes)
+            analyzer: TraceAnalyzer instance (optional)
         """
         self.executor = executor
         self.path_finder = path_finder
@@ -108,7 +113,9 @@ class DynamicForkController:
         self.fuzzing_stats = fuzzing_stats
         self.mutation_graph = mutation_graph
         self.crash_detector = crash_detector
-
+        self.analyzer = analyzer
+        self.last_batch_execs = 0  # ✅ Track executions in last batch
+        
         # Depth-first exploration mode configuration
         self.depth_first_mode = True 
         
@@ -292,6 +299,9 @@ class DynamicForkController:
 
         ✅ OPTIMIZATION: Cache baseline execution results to avoid repeated QEMU forks
         """
+        # Reset batch counter for this exploration
+        self.last_batch_execs = 0
+
         cache_key = trace.id
         if cache_key in self._io_syscall_cache:
             # Use cached IO syscalls to avoid repeated analysis
@@ -333,7 +343,7 @@ class DynamicForkController:
         mutation_node_ids = []  # Track mutation node IDs in graph
         for i in range(self.max_variants_per_checkpoint):
             # 🔥 Pass current trace object for IO mutation use
-            mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index)
+            mutation = self.mutator.mutate(self.current_trace, fork_point=syscall_index, analyzer=self.analyzer)
             mutations.append(mutation)
 
             # Track mutation in graph and extract type from instructions
@@ -386,7 +396,9 @@ class DynamicForkController:
 
                 # ✅ Update unified stats counter (1 execution per variant)
                 if self.fuzzing_stats and results:
-                    self.fuzzing_stats.total_execs += len(results)
+                    batch_count = len(results)
+                    self.fuzzing_stats.total_execs += batch_count
+                    self.last_batch_execs += batch_count
 
                 any_new_path = False
                 if results and len(results) > 0:
@@ -770,17 +782,21 @@ class DynamicForkController:
         # Import TraceAnalyzer
         import sys
         from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'analysis'))
-        from trace_analyzer import TraceAnalyzer
-
-        analyzer = TraceAnalyzer(trace.file_path)
+        import trace_analyzer
+        if self.analyzer and getattr(self.analyzer, 'trace_file', None) == trace.file_path:
+             analyzer = self.analyzer
+        else:
+             analyzer = trace_analyzer.TraceAnalyzer(trace.file_path)
+             if not hasattr(analyzer, 'trace_file'):
+                 analyzer.trace_file = trace.file_path
+             self.analyzer = analyzer  # ✅ FIX: Save for reuse
 
         # ✅ Collect IO syscalls and their metadata
         io_candidates = []
 
         for sc in analyzer.syscalls:
             # Only consider IO syscalls
-            if sc.name in ['read', 'recv', 'recvfrom', 'getrandom', 'write', 'send']:
+            if sc.name in PRIMARY_IO_SYSCALLS:
                 # Skip first 10% of syscalls (initialization phase)
                 if sc.index < len(analyzer.syscalls) * 0.1:
                     continue

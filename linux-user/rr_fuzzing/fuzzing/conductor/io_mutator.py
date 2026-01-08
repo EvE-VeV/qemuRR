@@ -66,52 +66,50 @@ class IOReturnValueMutator:
             ]
         }
 
-    def identify_io_syscalls(self, trace) -> List[Dict[str, Any]]:
+    def identify_io_syscalls(self, trace, analyzer: Optional[Any] = None) -> List[Dict[str, Any]]:
         """识别trace中的IO syscalls
-
+        
         Args:
             trace: Trace对象，包含file_path
-
+            analyzer: Existing TraceAnalyzer instance (optional)
+        
         Returns:
             IO syscall信息列表
         """
         io_syscalls = []
 
         # Parse trace file to retrieve syscall sequence
-        try:
+        if not analyzer:
             import sys
             from pathlib import Path
             sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
-            from trace_analyzer import TraceAnalyzer
-
+            import trace_analyzer
             # 解析trace文件
-            analyzer = TraceAnalyzer(trace.file_path)
-            if not analyzer.syscalls:
-                return io_syscalls
+            analyzer = trace_analyzer.TraceAnalyzer(trace.file_path)
 
-            for idx, syscall in enumerate(analyzer.syscalls):
-                # Access record attributes
-                syscall_name = getattr(syscall, 'name', '')
-                if syscall_name in self.io_syscall_names:
-                    retval = getattr(syscall, 'retval', 0)
+        if not analyzer or not analyzer.syscalls:
+            return io_syscalls
 
-                    # Filter read() calls that are likely not user inputs
-                    # 启发式规则：
-                    # 1. 跳过返回值很大的read (>200字节) - 可能是读文件
-                    # 2. 优先选择靠后的read - 用户输入通常在初始化之后
-                    if syscall_name == 'read' and retval > 200:
-                        alog(f"Skipping read @{idx} (retval={retval} > 200, likely file read)", "IOReturnValueMutator", "DEBUG")
-                        continue
+        for idx, syscall in enumerate(analyzer.syscalls):
+            # Access record attributes
+            syscall_name = getattr(syscall, 'name', '')
+            if syscall_name in self.io_syscall_names:
+                retval = getattr(syscall, 'retval', 0)
 
-                    io_syscalls.append({
-                        'index': idx,
-                        'name': syscall_name,
-                        'original_return': retval,
-                        'is_input': syscall_name in ['read', 'recv', 'recvfrom', 'recvmsg', 'getrandom']
-                    })
+                # Filter read() calls that are likely not user inputs
+                # 启发式规则：
+                # 1. 跳过返回值很大的read (>200字节) - 可能是读文件
+                # 2. 优先选择靠后的read - 用户输入通常在初始化之后
+                if syscall_name == 'read' and retval > 200:
+                    alog(f"Skipping read @{idx} (retval={retval} > 200, likely file read)", "IOReturnValueMutator", "DEBUG")
+                    continue
 
-        except Exception as e:
-            alog(f"Error parsing trace: {e}", "IOReturnValueMutator", "ERROR")
+                io_syscalls.append({
+                    'index': idx,
+                    'name': syscall_name,
+                    'original_return': retval,
+                    'is_input': syscall_name in ['read', 'recv', 'recvfrom', 'recvmsg', 'getrandom']
+                })
 
         return io_syscalls
 
@@ -175,13 +173,15 @@ class IOReturnValueMutator:
     def generate_all_mutations(
         self,
         trace,
-        max_mutations_per_io: int = 10
+        max_mutations_per_io: int = 10,
+        analyzer: Optional[Any] = None
     ) -> List[IOMutation]:
         """为trace中所有IO syscalls生成变异
-
+        
         Args:
             trace: Trace对象
             max_mutations_per_io: 每个IO syscall的最大变异数
+            analyzer: Existing TraceAnalyzer instance (optional)
 
         Returns:
             IOMutation列表
@@ -189,7 +189,7 @@ class IOReturnValueMutator:
         all_mutations = []
 
         # 识别IO syscalls
-        io_syscalls = self.identify_io_syscalls(trace)
+        io_syscalls = self.identify_io_syscalls(trace, analyzer=analyzer)
 
         if not io_syscalls:
             return all_mutations

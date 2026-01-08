@@ -17,7 +17,7 @@ import time
 import subprocess
 import threading
 import glob
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -242,7 +242,8 @@ class FuzzingCore:
         use_fork_server: bool = True,    # AFL-style persistent mode (Process Persistence)
         enable_persistence: bool = False,# Unified session persistence (Save/Auto-Resume)
         use_energy_scheduler: bool = True,  # Energy Scheduler enabled by default (+40% coverage)
-        shared_coverage=None,  # SharedCoverage for multi-process mode
+        initial_stats: Optional[Dict] = None,
+        shared_coverage: Optional[Any] = None,  # SharedCoverage for multi-process mode
         target_args: str = ""   # Target program arguments
     ):
         # """
@@ -299,13 +300,19 @@ class FuzzingCore:
 
         # Fuzzing Session Tracking
         self.stats = FuzzingStatistics()
+        if initial_stats:
+            for k, v in initial_stats.items():
+                if hasattr(self.stats, k):
+                    setattr(self.stats, k, v)
+            alog(f"Restored stats: execs={self.stats.total_execs}, paths={self.stats.paths_found}", "CORE", "INFO")
+            
         self.metrics = FuzzingMetrics()
         self.mutation_graph = MutationDependencyGraph()
         
-        # ✅ Checkpoint-compatible counters
-        self.total_executions = 0
-        self.total_iterations = 0
-        self.start_time = time.time()
+        # ✅ Restore persistence state if provided
+        self.start_time = initial_stats.get('start_time', time.time()) if initial_stats else time.time()
+        self.total_executions = initial_stats.get('total_execs', 0) if initial_stats else 0
+        self.total_iterations = 0 # Iterations are always relative to current run
 
         # Output directory and paths
         self.output_dir = Path(output_dir)
@@ -342,9 +349,14 @@ class FuzzingCore:
                 self.recipe_pool.add_recipes(mutator.recipes)
                 alog(f"✅ RecipePool enabled ({len(mutator.recipes)} recipes)", "CORE", "INFO")
         
-        # CFG Analysis interval parameters
-        self.cfg_analysis_interval_iters = 20   
-        self.cfg_analysis_interval_time = 30    
+        self.last_cfg_analysis_iter = 0
+        self.last_cfg_analysis_time = 0
+        self.cfg_analysis_interval_iters = 100
+        self.cfg_analysis_interval_time = 60
+        self.min_cfg_analysis_interval = 5.0 # Minimum seconds between analyses even if new coverage
+        
+        self.trace_analyzer_cache = {} # {trace_file: TraceAnalyzer}
+    
         self.last_cfg_analysis_time = time.time()
         self.last_cfg_analysis_iter = 0
         
@@ -386,6 +398,13 @@ class FuzzingCore:
         self.dynamic_fork_controller = None
         if _HAS_DYNAMIC_FORK and DynamicForkController is not None:
             try:
+                # Pre-load analyzer for initial trace to share among components
+                initial_analyzer = self._get_analyzer(initial_trace)
+                
+                # If mutator is SmartMutator, ensure it uses this analyzer
+                if isinstance(self.mutator, SmartMutator):
+                     self.mutator.analyzer = initial_analyzer
+                
                 self.dynamic_fork_controller = DynamicForkController(
                     executor=self.execution_engine,
                     path_finder=self.path_finder,
@@ -395,7 +414,8 @@ class FuzzingCore:
                     trace_manager=self.trace_manager,
                     fuzzing_stats=self.stats,
                     mutation_graph=self.mutation_graph,
-                    crash_detector=self.crash_detector
+                    crash_detector=self.crash_detector,
+                    analyzer=initial_analyzer
                 )
                 alog(f"DynamicForkController enabled (Depth-First mode)", "CORE", "INFO")
             except Exception as e:
@@ -406,12 +426,12 @@ class FuzzingCore:
         else:
             alog(f"⚠️ DynamicForkController unavailable", "CORE", "WARN")
 
-        # ✅ Initialize Watchdog
+        # ✅ Initialize Watchdog (Phase 1 Fix: Tighten timeout for performance)
         self.watchdog = FuzzingWatchdog(
             executor_check_func=self._check_executor_alive,
             restart_func=self._restart_execution_engine,
-            timeout_seconds=30,  # 30s timeout for QEMU stall
-            check_interval=2
+            timeout_seconds=10,  # Reduced from 30s to 10s for faster error recovery
+            check_interval=1     # Increased frequency to 1s
         )
         alog(f"  Watchdog: Enabled (Timeout=30s)", "CORE", "INFO")
         
@@ -501,10 +521,15 @@ class FuzzingCore:
         self.execution_engine = QEMUExecutor(
             self.qemu_path, 
             self.target_binary, 
-            target_args="", # TODO: Save original args
+            target_args=self.target_args, # ✅ SAVE original args
             persistent_mode=True,
             log_file=os.path.join(self.output_dir, "qemu_debug.log")
         )
+        
+        # 🔥 CRITICAL FIX: Update DynamicForkController with the NEW executor
+        if self.dynamic_fork_controller:
+            self.dynamic_fork_controller.executor = self.execution_engine
+            
         alog("QEMU Engine restarted by Watchdog", "CORE", "INFO")
     
     # ✅ Remove duplicate _start_realtime_visualizer definition
@@ -570,11 +595,21 @@ class FuzzingCore:
                     if len(fork_points) >= count:
                         break
 
-                if fork_points:
+        if fork_points:
                     alog(f"🎯 Using PathFinder-guided fork points: {fork_points[:count]}", "CORE", "INFO")
                     return fork_points[:count]
 
-        # Strategy 2: Fallback if PathFinder has no suggestions (e.g., fully covered or analysis failed)
+        # Strategy 2: Exploration Mode (Fallback for saturated graph)
+        if self.path_finder and hasattr(self.path_finder, 'exploration_targets') and self.path_finder.exploration_targets:
+            targets = self.path_finder.exploration_targets
+            import random
+            # Pick targets
+            selected = random.sample(targets, min(len(targets), count))
+            fork_points = [t['target_syscall_idx'] for t in selected]
+            alog(f"🚀 Using Exploration Mode fork points: {fork_points}", "CORE", "INFO")
+            return fork_points
+
+        # Strategy 3: Blind Random Fallback (Last resort)
         # Use random Syscall Index as Fork point to explore possible hidden states
         alog(f"⚠️ PathFinder has no suggestions, enabling Random Exploration", "CORE", "WARN")
         
@@ -590,12 +625,35 @@ class FuzzingCore:
         random_points = sorted(random.sample(range(max(1, limit)), min(count, limit)))
         return random_points
 
+    def _get_analyzer(self, trace_file: str):
+        """Get or create TraceAnalyzer for a trace file (per-process cache)"""
+        if trace_file in self.trace_analyzer_cache:
+            return self.trace_analyzer_cache[trace_file]
+        
+        # ✅ Check SmartMutator cache (global to process)
+        from .mutator import SmartMutator
+        if trace_file in SmartMutator._trace_cache:
+            analyzer = SmartMutator._trace_cache[trace_file]
+            self.trace_analyzer_cache[trace_file] = analyzer
+            return analyzer
+        
+        import trace_analyzer
+        analyzer = trace_analyzer.TraceAnalyzer(trace_file)
+        self.trace_analyzer_cache[trace_file] = analyzer
+        return analyzer
+
     def _display_progress(self, force: bool = False):
         """Display fuzzing progress (every 100 executions or forced)"""
         if not force and self.stats.total_execs % 100 != 0:
             return
         
         cov_stats = self.coverage_tracker.get_stats()
+        
+        # Calculate speed
+        elapsed = time.time() - self.start_time
+        if elapsed > 0:
+            # execs_per_sec and elapsed_time are properties, no need to set them
+            pass
         
         alog(f"\n{'━' * 60}", "STATS", "INFO")
         alog(f"Iteration: {self.stats.total_execs}", "STATS", "INFO")
@@ -625,21 +683,30 @@ class FuzzingCore:
         if not self.path_finder:
             return
 
-        # Check interval
+        # 1. Iteration interval check
         interval = self.cfg_analysis_interval_iters
         elapsed = self.stats.total_execs - self.last_cfg_analysis_iter
+        
+        # 2. Time interval check
+        elapsed_since_cfg = time.time() - self.last_cfg_analysis_time
         
         should_run_cfg = False
         if elapsed >= interval:
             should_run_cfg = True
         
-        # Force run on new coverage (Verification mode logic)
+        # Force run on new coverage (with a minimum safety interval to avoid thrashing)
         if has_new_coverage:
+            if elapsed_since_cfg >= self.min_cfg_analysis_interval:
+                should_run_cfg = True
+            elif self.stats.total_execs < 10: # Allow frequent runs at the very beginning
+                should_run_cfg = True
+
+        # Check explicit time interval (e.g. 60s)
+        if elapsed_since_cfg >= self.cfg_analysis_interval_time:
             should_run_cfg = True
 
-        # Check time interval
-        elapsed_since_cfg = time.time() - self.last_cfg_analysis_time
-        if elapsed_since_cfg >= self.cfg_analysis_interval_time:
+        # 🔥 P1 Fix: Force runs on first iteration to ensure PathFinder is ready
+        if self.stats.total_execs == 0:
             should_run_cfg = True
 
         if not should_run_cfg:
@@ -688,7 +755,8 @@ class FuzzingCore:
             # Ensure CFG is ready
             if not self.path_finder.ensure_cfg_ready():
                 alog(f"[FuzzingCore] Building PathFinder CFG from {trace.file_path}...", "CORE")
-                build_ok = self.path_finder.build_from_trace(trace.file_path)
+                analyzer = self._get_analyzer(trace.file_path)
+                build_ok = self.path_finder.build_from_trace(trace.file_path, analyzer=analyzer)
             else:
                 build_ok = True
 
@@ -735,6 +803,38 @@ class FuzzingCore:
                             if isinstance(self.mutator, SmartMutator):
                                 self.mutator.recipes.extend(new_recipes)
                                 alog(f"[FuzzingCore] ✅ Injected {len(new_recipes)} recipes into SmartMutator", "CORE")
+                    else:
+                        # Fallback: Exploration Mode (Task #710)
+                        # If graph is fully covered (no logical uncovered branches), force mutate covered syscalls
+                        alog(f"[FuzzingCore] ⚠️ No uncovered branches (Graph saturated). activating Exploration Mode.", "CORE")
+                        
+                        # Generate "Self-Loop" targets for all covered syscalls to force state headers
+                        exploration_targets = []
+                        for idx, block in self.path_finder.syscall_blocks.items():
+                            if block.is_covered:
+                                # Create a dummy 'uncovered' entry that points to itself/generic
+                                exploration_targets.append({
+                                    'from_syscall_idx': idx,
+                                    'to_syscall_idx': idx, # Self
+                                    'from_syscall_name': block.syscall_name,
+                                    'to_syscall_name': block.syscall_name,
+                                    'type': 'exploration',
+                                    'target_syscall_idx': idx,
+                                    'has_syscall': True
+                                })
+                        
+                        # ✅ Store in PathFinder for Fork Point Selection
+                        self.path_finder.exploration_targets = exploration_targets
+
+                        if exploration_targets:
+                            # Pick random subset to avoid overwhelming
+                            import random
+                            subset = random.sample(exploration_targets, min(len(exploration_targets), 10))
+                            ex_recipes = self.path_finder.generate_recipes(subset, max_recipes=10)
+                            if ex_recipes:
+                                if isinstance(self.mutator, SmartMutator):
+                                    self.mutator.recipes.extend(ex_recipes)
+                                    alog(f"[FuzzingCore] 🚀 Injected {len(ex_recipes)} EXPLORATION recipes", "CORE")
         except Exception as e:
             alog(f"[FuzzingCore] ⚠️ PathFinder Analysis failed: {e}", "ERROR")
 
@@ -776,12 +876,16 @@ class FuzzingCore:
             current_mutator_trace = getattr(self.mutator, 'trace_file', None)
             if current_mutator_trace != trace.file_path:
                 # alog(f"🔄 Updating Mutator for new trace: {trace.id} ({trace.file_path})", "CORE", "DEBUG")
-                # Creating a new SmartMutator is efficient because it uses SmartMutator._trace_cache
+                # Creating a new SmartMutator is efficient because it uses shared analyzer
+                analyzer = self._get_analyzer(trace.file_path)
                 self.mutator = SmartMutator(
                     trace_file=trace.file_path,
                     target_binary=self.target_binary,
-                    path_finder=self.path_finder
+                    path_finder=self.path_finder,
+                    analyzer=analyzer
                 )
+                if self.dynamic_fork_controller:
+                    self.dynamic_fork_controller.analyzer = analyzer
         # Step 2: Depth-First Exploration - Intelligent Fork Point Selection (Dynamic Fork Integration)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
@@ -791,16 +895,24 @@ class FuzzingCore:
             success = self.dynamic_fork_controller.explore_multi_path(trace, iteration_id)
             
             if success:
+                # Update total executions count in core as well
+                if hasattr(self.dynamic_fork_controller, 'last_batch_execs'):
+                    self.total_executions += self.dynamic_fork_controller.last_batch_execs
+                
                 self.metrics.record_success('dynamic_fork_batch')
             
                 # Unified CFG Analysis
                 self._perform_cfg_analysis(trace, success, f"DynamicFork: {'NewCov' if success else 'Interval'}", iteration_id)
+            
+            # ✅ FIX: Display progress even in dynamic fork mode
+            self._display_progress()
+            
             return create_success_result(
                 iteration_id=iteration_id,
-                new_coverage=success,
-                new_paths=1 if success else 0,
-                crashes_found=0 # Crashes are handled by DynamicForkController via CrashDetector
+                status=IterationStatus.SUCCESS,
+                new_coverage=success
             )
+            # crashes_found=0 # Crashes are handled by DynamicForkController via CrashDetector
 
         batch_size = int(os.environ.get('RR_BATCH_SIZE', 5))  # 🔥 Configurable batch_size
 
@@ -826,9 +938,10 @@ class FuzzingCore:
         # Perform multiple mutations per fork point for efficiency (batching reduces QEMU restarts)
         mutations_per_fork = int(os.environ.get('RR_MUTATIONS_PER_FORK', 4))
         
+        analyzer = self._get_analyzer(trace.file_path)
         for fork_point in fork_points:
             for _ in range(mutations_per_fork):
-                m = self.mutator.mutate(trace, fork_point=fork_point)
+                m = self.mutator.mutate(trace, fork_point=fork_point, analyzer=analyzer)
                 if m:
                     fork_to_mutations[fork_point].append(m)
         
@@ -890,11 +1003,13 @@ class FuzzingCore:
                         alog(f"🎯 New coverage found! (Total edges: {self.coverage_tracker.get_stats()['total_edges']})", "CORE", "INFO")
 
                 # Step 4.5: Record execution statistics
+                analyzer = self._get_analyzer(trace.file_path)
                 self.trace_manager.record_execution(
                     trace_id=trace.id,
                     trace_file=trace.file_path,
                     mutations=mutations,
-                    has_new_coverage=has_new_coverage
+                    has_new_coverage=has_new_coverage,
+                    analyzer=analyzer
                 )
 
                 # Update stagnation detection status
@@ -1273,40 +1388,11 @@ class FuzzingCore:
                             alog(f"📉 No progress for {no_progress_timeout}s, stopping...", "CORE", "WARN")
                             break
                 
-                # ✅ New: Dynamic Fork Exploration (probabilistic)
-                use_dynamic_fork = (self.dynamic_fork_controller and 
-                                  self.dynamic_fork_controller.should_trigger_multi_fork(iteration))
+                # Unified iteration entry point (handles both normal and dynamic fork)
+                result = self.run_single_iteration(iteration_id=iteration)
                 
-                result = None  # ✅ Fix: Initialize result to avoid UnboundLocalError
-                if use_dynamic_fork:
-                    # Dynamic Fork Mode: fork multiple variants at trace midpoints
-                    alog(f"\n{'='*60}", "CORE", "INFO")
-                    alog(f"🌿 Iteration {iteration}: Dynamic Fork Mode", "CORE", "INFO")
-                    alog(f"{'='*60}", "CORE", "INFO")
-                    trace = self.trace_manager.select_trace()
-                    if trace:
-                        # Set current_trace_id for correct parent linkage in corpus
-                        self.dynamic_fork_controller.current_trace_id = trace.id
-                        
-                        try:
-                            # Explore multi-path using dynamic fork
-                            success = self.dynamic_fork_controller.explore_multi_path(
-                                trace,
-                                iteration_id=iteration
-                            )
-                            if success:
-                                self.stats.paths_found += 1
-                        except Exception as e:
-                            alog(f"⚠️  Iteration {iteration} failed: {e}", "CORE", "WARN")
-                            import traceback
-                            traceback.print_exc()
-                else:
-                    # Normal single iteration (✅ pass iteration_id)
-                    result = self.run_single_iteration(iteration_id=iteration)
-                    # ✅ Task #8: Use IterationResult
-                    # Print detailed result (optional)
-                    if result and result.is_failure():
-                        alog(f"⚠️  {result}", "CORE", "WARN")
+                if result and result.is_failure():
+                    alog(f"⚠️  Iteration {iteration} failed: {result}", "CORE", "WARN")
                 
                 iteration += 1
                 self.total_iterations = iteration
@@ -1359,6 +1445,13 @@ class FuzzingCore:
         output_path = Path(self.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
+        # Display final statistics before saving
+        self._display_progress(force=True)
+        
+        # 🔥 DEBUG: Check stats object identity and values
+        alog(f"DEBUG: stats.total_execs={self.stats.total_execs}, type={type(self.stats)}", "CORE", "DEBUG")
+        alog(f"DEBUG: cov_tracker.total_edges={self.coverage_tracker.total_edges_cached}", "CORE", "DEBUG")
+        
         alog(f"💾 Saving final results...", "CORE", "INFO")
         
         # Save corpus (Layer 2)
@@ -1377,6 +1470,7 @@ class FuzzingCore:
                     'paths_found': self.stats.paths_found,
                     'timeouts': self.stats.timeouts
                 },
+                'start_time': self.start_time,
                 'coverage': self.coverage_tracker.get_stats(),
                 'traces': self.trace_manager.get_statistics(),
                 'executor': self.execution_engine.get_statistics(),
@@ -1591,6 +1685,9 @@ class FuzzingCore:
     def cleanup(self):
         """Clean up resources (called on exit)"""
         alog("Cleaning up resources...", "CORE", "INFO")
+        
+        # Display final statistics if not already shown recently
+        self._display_progress(force=True)
         
         # ═══════════════════════════════════════════════════════════════
         # Option A: Ensure Realtime Visualizer is stopped

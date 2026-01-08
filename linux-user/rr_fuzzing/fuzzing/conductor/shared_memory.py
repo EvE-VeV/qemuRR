@@ -208,3 +208,10 @@ class FuzzSharedMemory:
             pass
         except Exception as exc:
             print(f"[Conductor] ⚠️  Failed to unlink shared memory '{target}': {exc}")
+            
+    def __del__(self):
+        """Ensure resources are released on object destruction"""
+        try:
+            self.close()
+        except:
+            pass

@@ -113,6 +113,8 @@ For more information, see ARCHITECTURE_README.md
                         help='Path to target binary')
     parser.add_argument('--trace', required=True,
                         help='Path to initial trace file (seed)')
+    parser.add_argument('--args', default=None,
+                        help='Target binary arguments')
     
     # Multi-process configuration
     parser.add_argument('-n', '--workers', type=int, default=mp.cpu_count(),
@@ -170,6 +172,8 @@ For more information, see ARCHITECTURE_README.md
     print(f"{'=' * 70}")
     print(f"QEMU:         {args.qemu}")
     print(f"Target:       {args.target}")
+    if args.args:
+        print(f"Args:         {args.args}")
     print(f"Trace:        {args.trace}")
     print(f"Sync Dir:     {args.sync_dir}")
     print(f"Workers:      {args.workers}")
@@ -186,6 +190,7 @@ For more information, see ARCHITECTURE_README.md
         fuzz_master = FuzzMaster(
             qemu_path=args.qemu,
             target_binary=args.target,
+            target_args=args.args,
             initial_trace=args.trace,
             num_workers=args.workers,
             sync_dir=args.sync_dir,

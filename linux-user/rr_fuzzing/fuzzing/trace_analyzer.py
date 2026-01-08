@@ -79,35 +79,65 @@ class SyscallRecord:
             3: 'close',
             4: 'stat',
             5: 'fstat',
+            6: 'lstat',
+            7: 'poll',
             8: 'lseek',
             9: 'mmap',
             10: 'mprotect',
             11: 'munmap',
             12: 'brk',
+            13: 'rt_sigaction',
+            14: 'rt_sigprocmask',
+            15: 'rt_sigreturn',
+            16: 'ioctl',
+            17: 'pread64',
+            18: 'pwrite64',
+            19: 'readv',
+            20: 'writev',
             21: 'access',
+            22: 'pipe',
+            23: 'select',
+            24: 'sched_yield',
+            25: 'mremap',
+            32: 'dup',
+            33: 'dup2',
+            35: 'nanosleep',
+            37: 'alarm',
+            39: 'getpid',
             41: 'socket',
             42: 'connect',
             43: 'accept',
             44: 'sendto',
             45: 'recvfrom',
+            46: 'sendmsg',
+            47: 'recvmsg',
             56: 'clone',
             57: 'fork',
             59: 'execve',
             60: 'exit',
+            61: 'wait4',
+            63: 'uname',
             72: 'fcntl',
+            73: 'flock',
+            74: 'fsync',
+            77: 'ftruncate',
             79: 'getcwd',
             80: 'chdir',
+            89: 'readlink',
             96: 'gettimeofday',
             102: 'getuid',
             104: 'getgid',
+            110: 'getppid',
             158: 'arch_prctl',
             186: 'gettid',
             202: 'futex',
+            217: 'getdents64',
             218: 'set_tid_address',
             228: 'clock_gettime',
             231: 'exit_group',
             257: 'openat',
             262: 'newfstatat',
+            273: 'set_robust_list',
             318: 'getrandom',
         }
         return syscall_map.get(nr, f'syscall_{nr}')
@@ -205,7 +235,43 @@ class TraceAnalyzer:
         if not os.path.exists(self.trace_file):
             alog(f"[TraceAnalyzer] ❌ Trace file not found: {self.trace_file}", "TRACE", "ERROR")
             return False
+
+        # ✅ Performance Optimization: Try to load from cache first
+        import pickle
+        import time
+        cache_file = str(self.trace_file) + ".analyzer.pkl"
         
+        try:
+            if os.path.exists(cache_file):
+                # Check timestamps (re-analyze if trace is newer)
+                trace_mtime = os.path.getmtime(self.trace_file)
+                cache_mtime = os.path.getmtime(cache_file)
+                
+                if cache_mtime >= trace_mtime:
+                    alog(f"[TraceAnalyzer] 📦 Loading cached analysis from {cache_file}...", "TRACE", "INFO")
+                    with open(cache_file, 'rb') as f:
+                        cached_data = pickle.load(f)
+                        self.syscalls = cached_data['syscalls']
+                        self.stats = cached_data['stats']
+                        self.pure_syscalls = cached_data['pure_syscalls']
+                        self.hybrid_syscalls = cached_data['hybrid_syscalls']
+                        self.bb_trace_available = cached_data['bb_trace_available']
+                        # BB parser logic is complex to pickle full state, so we might need to handle it carefully
+                        # But for now, let's assume if bb_trace was available, we also cached execution sequence
+                        self.merged_execution_sequence = cached_data.get('merged_execution_sequence', [])
+                        
+                        # Re-attach bb parser if possible or just use cached data
+                        # Ideally we fully reconstruct, but for lighter use we might just need stats
+                        if self.bb_trace_available and 'bb_entries' in cached_data:
+                             # Reconstruct lightweight parser if needed, or just rely on merged sequence
+                             pass
+                             
+                        self._analyzed = True
+                        return True
+        except Exception as e:
+            alog(f"[TraceAnalyzer] ⚠️ Cache load failed, re-analyzing: {e}", "TRACE", "WARN")
+
+        # Full Analysis
         try:
             with open(self.trace_file, 'rb') as f:
                 # Read header
@@ -225,10 +291,31 @@ class TraceAnalyzer:
                      f"Pure={self.stats['pure_replay']}, Hybrid={self.stats['hybrid_replay']}", "TRACE", "DEBUG")
                 if self.bb_trace_available:
                      alog(f"  BB Trace: ✅ Available ({self.bb_trace_parser.stats['total_bbs']} BBs)", "TRACE", "DEBUG")
-                # BB trace is optional, don't show "Not available" to avoid confusion
                 
                 # ✅ FIX: Mark as analyzed
                 self._analyzed = True
+                
+                # ✅ Save to cache
+                try:
+                    cache_data = {
+                        'syscalls': self.syscalls,
+                        'stats': self.stats,
+                        'pure_syscalls': self.pure_syscalls,
+                        'hybrid_syscalls': self.hybrid_syscalls,
+                        'bb_trace_available': self.bb_trace_available,
+                        'merged_execution_sequence': self.merged_execution_sequence,
+                        # We don't pickle the entire bb_trace_parser as it might be huge or non-picklable
+                    }
+                    if self.bb_trace_available and self.bb_trace_parser:
+                         # cache key attributes if needed later
+                         pass
+                    
+                    with open(cache_file, 'wb') as f:
+                        pickle.dump(cache_data, f)
+                    alog(f"[TraceAnalyzer] 📦 Saved analysis cache to {cache_file}", "TRACE", "INFO")
+                except Exception as e:
+                    alog(f"[TraceAnalyzer] ⚠️ Failed to save cache: {e}", "TRACE", "WARN")
+
                 return True
                 
         except Exception as e:
@@ -439,7 +526,7 @@ class TraceAnalyzer:
             return
         
         # Construct BB trace file path (trace_file + ".bbl")
-        bb_trace_file = self.trace_file + ".bbl"
+        bb_trace_file = str(self.trace_file) + ".bbl"
         
         if not os.path.exists(bb_trace_file):
             print(f"[TraceAnalyzer] BB trace file not found: {bb_trace_file}")
@@ -605,7 +692,7 @@ class TraceAnalyzer:
         
         data = {
             'trace_file': self.trace_file,
-            'bb_trace_file': self.trace_file + ".bbl",
+            'bb_trace_file': str(self.trace_file) + ".bbl",
             'stats': self.bb_trace_parser.stats,
             'bb_sequence': [
                 {

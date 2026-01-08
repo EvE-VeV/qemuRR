@@ -179,6 +179,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
      */
     if (g_target_start > 0 && pc >= g_target_start && pc <= g_target_end) {
          gen_helper_rr_coverage_trace_edge(tcg_constant_i64(pc));
+         /* RR-Fuzz: Also instrument BB trace for PathFinder */
+         gen_helper_rr_bb_trace_log(tcg_constant_i64(pc));
     } else if (g_target_start > 0 && (pc < g_target_start || pc > g_target_end)) {
         // pc outside range - expected for libs
     } else {

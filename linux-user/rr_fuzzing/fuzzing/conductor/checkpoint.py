@@ -130,13 +130,12 @@ class CheckpointManager:
         if total_iterations == 0 and hasattr(core, 'metrics'):
             total_iterations = core.metrics.success_counts.get('total_iterations', 0)
             
-        # Source of truth for executions: execution_engine or stats
+        # Source of truth for executions: Aggregated from all sources
         total_executions = getattr(core, 'total_executions', 0)
-        if total_executions == 0:
-            if hasattr(core, 'execution_engine'):
-                total_executions = getattr(core.execution_engine, 'total_executions', 0)
-            if total_executions == 0 and hasattr(core, 'stats'):
-                total_executions = getattr(core.stats, 'total_execs', 0)
+        if hasattr(core, 'stats'):
+            total_executions = max(total_executions, getattr(core.stats, 'total_execs', 0))
+        if hasattr(core, 'execution_engine'):
+            total_executions = max(total_executions, getattr(core.execution_engine, 'total_executions', 0))
         
         stats = {
             "total_executions": total_executions,

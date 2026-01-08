@@ -18,6 +18,9 @@
 rr_coverage_t *g_base_coverage = NULL;
 rr_coverage_t *g_coverage = NULL;
 
+// Use thread-local storage for prev_pc to ensure it resets on fork
+static __thread uint64_t g_prev_pc = 0;
+
 /* ================= Internal Helper Functions ================= */
 
 /**
@@ -121,9 +124,11 @@ void rr_coverage_reset(void)
     if (g_base_coverage) {
         memset(g_base_coverage->coverage_map, 0, RR_COVERAGE_MAP_SIZE);
         g_base_coverage->unique_edges = 0;
+        g_base_coverage->unique_edges = 0;
         g_base_coverage->total_edges = 0;
-        g_base_coverage->prev_pc = 0;
     }
+    // Also reset local state
+    g_prev_pc = 0;
 }
 
 /* RR-Fuzz: Range Filtering */
@@ -173,8 +178,14 @@ void rr_coverage_trace_edge(uint64_t cur_pc)
         return;
     }
     
-    // AFL-style edge hashing
-    uint64_t edge_hash = (g_coverage->prev_pc >> 1) ^ cur_pc;
+    // Standardize PC by subtracting base address (ASLR support)
+    uint64_t normalized_pc = cur_pc;
+    if (g_target_start > 0 && cur_pc >= g_target_start) {
+        normalized_pc = cur_pc - g_target_start;
+    }
+    
+    // AFL-style edge hashing with normalized PC
+    uint64_t edge_hash = (g_prev_pc >> 1) ^ normalized_pc;
     uint32_t idx = edge_hash % RR_COVERAGE_MAP_SIZE;
     
     uint8_t old_count = g_coverage->coverage_map[idx];
@@ -192,7 +203,7 @@ void rr_coverage_trace_edge(uint64_t cur_pc)
     }
     
     g_coverage->total_edges++;
-    g_coverage->prev_pc = cur_pc;
+    g_prev_pc = normalized_pc;
 }
 
 void rr_coverage_copy_map(uint8_t *dest)

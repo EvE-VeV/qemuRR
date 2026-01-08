@@ -65,6 +65,11 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
+        
+    finally:
+        if fuzzing_core:
+            print("[Main] Cleaning up...")
+            fuzzing_core.cleanup()
 
 if __name__ == '__main__':
     sys.exit(main())

@@ -14,7 +14,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 # Add analysis directory to path to import trace_analyzer
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
@@ -175,12 +175,13 @@ class BaseMutator:
 
         return instructions  # This is the content for QEMU, wrapped as FuzzInstruction
 
-    def _generate_io_mutations(self, trace, fork_point: int = None) -> List[FuzzInstruction]:
+    def _generate_io_mutations(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
         """Generate IO return value mutation instructions
 
         Args:
             trace: Trace object
             fork_point: Fork point syscall index (optional)
+            analyzer: Existing TraceAnalyzer instance (optional)
 
         Returns:
             List of FuzzInstructions
@@ -188,7 +189,7 @@ class BaseMutator:
         alog(f"Attempting IO mutation, trace={trace}, fork_point={fork_point}", "MUTATOR")
 
         # Identify IO syscalls
-        io_syscalls = self.io_mutator.identify_io_syscalls(trace)
+        io_syscalls = self.io_mutator.identify_io_syscalls(trace, analyzer=analyzer)
         alog(f"Found {len(io_syscalls)} IO syscalls", "MUTATOR")
 
         if not io_syscalls:
@@ -385,7 +386,7 @@ class SmartMutator:
     # Class-level cache to avoid redundant parsing of same trace
     _trace_cache = {}  # {trace_file: TraceAnalyzer}
     
-    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None):
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None):
         """
         Initialize SmartMutator
 
@@ -394,9 +395,16 @@ class SmartMutator:
             recipe_file: Path to recipe file (optional, Phase 2)
             target_binary: Path to target binary (for PathFinder CFG analysis)
             path_finder: Existing PathFinder instance (optional, avoids re-initialization)
+            analyzer: Existing TraceAnalyzer instance (optional, avoids redundant analysis)
         """
-        # Use cached TraceAnalyzer if available
-        if trace_file in SmartMutator._trace_cache:
+        self.trace_file = trace_file
+        
+        # Use passed analyzer or cached TraceAnalyzer if available
+        if analyzer:
+            self.analyzer = analyzer
+            if trace_file not in SmartMutator._trace_cache:
+                SmartMutator._trace_cache[trace_file] = analyzer
+        elif trace_file in SmartMutator._trace_cache:
             alog(f"Using cached analysis results: {trace_file}", "MUTATOR", "DEBUG")
             self.analyzer = SmartMutator._trace_cache[trace_file]
         else:
@@ -485,6 +493,9 @@ class SmartMutator:
         self.is_stagnant = False 
         self.total_iterations = 0 
         self.last_mutation_type = 'unknown'
+        self.use_io_mutation = True # SmartMutator always uses IO mutation
+        self.io_mutator = IOReturnValueMutator()
+        self.io_mutation_prob = 0.2 # Lower probability for IO mutation in SmartMutator
         alog(f"Stagnation detection enabled (threshold={self.stagnation_threshold} iterations)", "MUTATOR", "INFO")
     
     def _perform_fd_tracking(self):
@@ -590,7 +601,8 @@ class SmartMutator:
             if not is_target_reachable:
                 # If syscall is in trace but never called/covered by BB in target range,
                 # it's likely called by early loader or libc init code.
-                alog(f"PathFinder Filter: Skip non-target syscall (index={index}, {syscall_name})", "MUTATOR", "DEBUG")
+                # alog(f"PathFinder Filter: Skip non-target syscall (index={index}, {syscall_name})", "MUTATOR", "DEBUG")
+                pass
                 return True
         
         return False
@@ -1113,17 +1125,115 @@ class SmartMutator:
                 print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(multi bits)")
             return FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, data)
     
-    def mutate(self, trace, fork_point: int = None) -> List['FuzzInstruction']:
-        """
-        Produce mutation for trace (interface compatibility)
-        
+    def _generate_io_mutations(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
+        """Generate IO return value mutation instructions for SmartMutator
+
         Args:
-            trace: Trace object (uses metadata.exec_count as iteration count)
-            fork_point: Syscall index of fork point (ensures mutation target >= fork_point)
-        
+            trace: Trace object
+            fork_point: Fork point syscall index (optional)
+            analyzer: Existing TraceAnalyzer instance (optional)
+
         Returns:
-            list: List of FuzzInstructions
+            List of FuzzInstructions
         """
+        alog(f"SmartMutator attempting IO mutation, trace={trace}, fork_point={fork_point}", "MUTATOR")
+
+        # Identify IO syscalls using the SmartMutator's analyzer
+        io_syscalls = self.io_mutator.identify_io_syscalls(trace, analyzer=self.analyzer)
+        alog(f"SmartMutator found {len(io_syscalls)} IO syscalls", "MUTATOR")
+
+        if not io_syscalls:
+            alog("SmartMutator: No IO syscalls found, falling back to smart random mutation", "MUTATOR", "INFO")
+            return self.build_fuzz_instructions(getattr(trace.metadata, 'exec_count', 0), fork_point=fork_point)
+
+        # Prioritize IO syscall at fork_point (if specified)
+        target_io = None
+        if fork_point is not None:
+            for io in io_syscalls:
+                if io['index'] == fork_point:
+                    target_io = io
+                    break
+
+        # If no IO syscall found at fork_point, choose one randomly
+        if target_io is None:
+            target_io = random.choice(io_syscalls)
+
+        # Generate mutation for this IO syscall
+        mutations = self.io_mutator.generate_mutations_for_io(
+            target_io,
+            strategy='buffer_overflow' if target_io['is_input'] else 'boundary'
+        )
+
+        # Priority sorting
+        mutations = self.io_mutator.prioritize_mutations(mutations)
+
+        # Increase mutation density to test a wider range of values
+        num_mutations = random.randint(3, 6)
+        selected_mutations = mutations[:num_mutations]
+
+        # Convert to FuzzInstruction
+        instructions = []
+        for m in selected_mutations:
+            # 1. Return value mutation
+            data = struct.pack('Q', m.new_return_value)  # New return value
+
+            instruction = FuzzInstruction(
+                syscall_index=m.syscall_index,
+                cmd=FUZZ_CMD_MUTATE_ARG,  # Temporary use, can define specialized IO_RETURN command later
+                arg_index=0xFF,  # Special marker: 0xFF indicates changing return value
+                data=data,
+                mutation_type='io_return_value'
+            )
+            instructions.append(instruction)
+
+            alog(f"SmartMutator IO Mutation (retval): {m.description}", "MUTATOR")
+
+            # 2. If buffer_content exists, also generate REPLACE_BUFFER instruction
+            if m.buffer_content:
+                # Get buffer argument index (read's second argument is buffer pointer)
+                buf_arg_index = 1
+                
+                # Chance to use attack patterns instead of IOMutator content
+                content_to_use = m.buffer_content
+                if random.random() < 0.3:
+                     patterns = [
+                        b'%s%s%s%s', b'A' * 64, b'../../../etc/passwd', 
+                        b'; cat /etc/passwd', b'\x00' * 8, 
+                        b'CRASH_ME', b'CRASH_ME\n', 
+                        b'CRASH_ME\x00', b'CRASH_ME\n\x00'
+                     ]
+                     content_to_use = random.choice(patterns)
+
+                buffer_instruction = FuzzInstruction(
+                    syscall_index=m.syscall_index,
+                    cmd=FUZZ_CMD_REPLACE_BUFFER,
+                    arg_index=buf_arg_index,
+                    data=content_to_use[:min(len(content_to_use), 256)]
+                )
+                instructions.append(buffer_instruction)
+                alog(f"SmartMutator IO Mutation (buffer): Fill {len(content_to_use)} bytes", "MUTATOR")
+
+        # Verify instruction count does not exceed limit
+        if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
+            alog(f"SmartMutator IO mutation generated {len(instructions)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}", "MUTATOR", "WARN")
+            instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
+
+        return instructions
+
+    def mutate(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List['FuzzInstruction']:
+        """
+        Smart mutation strategy: Systematic + Recipe-driven
+        Uses shared analyzer if available.
+        """
+        # Prioritize IO return value mutation if enabled (Layer 1.5)
+        if self.use_io_mutation and random.random() < self.io_mutation_prob:
+            return self._generate_io_mutations(trace, fork_point, analyzer=self.analyzer)
+        
+        # (ensures mutation target >= fork_point)
+        
+        # Returns:
+        #     list: List of FuzzInstructions
+        # """
         iteration = getattr(trace.metadata, 'exec_count', 0) if hasattr(trace, 'metadata') else 0
         return self.build_fuzz_instructions(iteration, fork_point=fork_point)
     

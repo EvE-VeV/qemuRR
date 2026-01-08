@@ -903,9 +903,7 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     
 #ifdef CONFIG_USER_ONLY
     /* RR-Fuzz: Record basic block execution for offline analysis */
-    if (rr_bb_trace_is_enabled_check()) {
-        rr_bb_trace_log(pc);
-    }
+    /* MOVED TO TCG TRANSLATOR (translator.c) for better accuracy */
     
 #endif
     

@@ -61,6 +61,7 @@ class WorkerStats:
     timeouts: int = 0
     total_edges: int = 0
     exec_speed: float = 0.0
+    start_time: float = field(default_factory=time.time)
     last_update: float = field(default_factory=time.time)
     
     def to_dict(self) -> Dict:
@@ -86,6 +87,7 @@ class FuzzMaster:
         qemu_path: str,
         target_binary: str,
         initial_trace: str,
+        target_args: Optional[str] = None,
         num_workers: Optional[int] = None,
         sync_dir: str = "sync_dir",
         mutator_type: str = "smart",
@@ -100,16 +102,20 @@ class FuzzMaster:
         Args:
             qemu_path: Path to QEMU executable
             target_binary: Path to target binary
+            target_args: Optional arguments for target binary
             initial_trace: Path to initial seed trace
             num_workers: Number of worker processes (default: CPU count)
             sync_dir: Synchronization directory
             mutator_type: "base" or "smart"
             recipe_file: Recipe file for smart mutation
             master_timeout: Master timeout in seconds (None for unlimited)
+            enable_pathfinder: Enable PathFinder
+            enable_persistence: Enable persistence
         """
         self.qemu_path = qemu_path
         self.target_binary = target_binary
-        self.initial_trace = initial_trace
+        self.target_args = target_args
+        self.initial_trace = Path(initial_trace)
         self.num_workers = num_workers or mp.cpu_count()
         self.sync_dir = Path(sync_dir).resolve()
         self.mutator_type = mutator_type
@@ -169,6 +175,10 @@ class FuzzMaster:
         initial_queue_trace = self.sync_dir / 'queue' / 'trace_000.bin'
         if not initial_queue_trace.exists():
             shutil.copy(self.initial_trace, initial_queue_trace)
+            # Also copy .bbl if it exists
+            initial_bbl = self.initial_trace.with_suffix(self.initial_trace.suffix + '.bbl')
+            if initial_bbl.exists():
+                shutil.copy(initial_bbl, initial_queue_trace.with_suffix(initial_queue_trace.suffix + '.bbl'))
         
         # Initialize global coverage bitmap
         coverage_file = self.sync_dir / 'coverage' / 'global_bitmap.bin'
@@ -238,6 +248,26 @@ class FuzzMaster:
             else:
                 mutator = BaseMutator()
 
+            # ✅ Load previous stats if available (fix reporting bug)
+            initial_stats = {}
+            stats_file = config.sync_dir / 'stats' / f'worker{worker_id}_stats.json'
+            if stats_file.exists():
+                try:
+                    import json
+                    with open(stats_file, 'r') as f:
+                        worker_stats_data = json.load(f)
+                        # Map WorkerStats fields to FuzzingStatistics fields
+                        initial_stats = {
+                            'total_execs': worker_stats_data.get('execs', 0),
+                            'paths_found': worker_stats_data.get('paths_found', 0),
+                            'crashes_found': worker_stats_data.get('crashes_found', 0),
+                            'timeouts': worker_stats_data.get('timeouts', 0),
+                            'start_time': worker_stats_data.get('start_time', time.time()) # Keep original start time
+                        }
+                        print(f"[Worker{worker_id}] Restored stats: execs={initial_stats['total_execs']}")
+                except Exception as e:
+                    print(f"[Worker{worker_id}] Failed to restore stats: {e}")
+
             # ✅ Create FuzzingCore with shared_coverage for multi-process sync
             fuzzing_core = FuzzingCore(
                 qemu_path=config.qemu_path,
@@ -250,6 +280,7 @@ class FuzzMaster:
                 enable_tree_viz=False,  # Disable tree viz in multi-process to avoid conflict
                 enable_monitoring=False,
                 use_energy_scheduler=False,  # ✅ MP mode uses TraceManager instead of SeedManagerAdapter
+                initial_stats=initial_stats, # ✅ Pass restored stats
                 shared_coverage=shared_coverage  # ✅ Multi-process coverage sync
             )
             
@@ -272,6 +303,8 @@ class FuzzMaster:
         
         except KeyboardInterrupt:
             print(f"[Worker{worker_id}] Interrupted")
+        except SystemExit:
+            print(f"[Worker{worker_id}] Stopped by signal")
         except Exception as e:
             print(f"[Worker{worker_id}] Error: {e}")
             import traceback
@@ -279,7 +312,7 @@ class FuzzMaster:
         finally:
             # Layer 5: Save final results (including syscall trees!)
             try:
-                if 'fuzzing_core' in locals():
+                if fuzzing_core:
                     print(f"[Worker{worker_id}] Saving final results (Layer 5)...")
                     fuzzing_core.save_final_results()
             except Exception as e:
@@ -289,13 +322,13 @@ class FuzzMaster:
     
             # ✅ Final stats update before exit
             try:
-                if 'fuzzing_core' in locals() and fuzzing_core:
+                if fuzzing_core:
                     FuzzMaster._worker_update_stats(config, fuzzing_core)
             except:
                 pass
 
             # Explicit cleanup to release shared memory/semaphores
-            if "fuzzing_core" in locals():
+            if fuzzing_core:
                 fuzzing_core.cleanup()
 
     @staticmethod
@@ -317,6 +350,10 @@ class FuzzMaster:
                 if not dest.exists() and os.path.exists(trace.file_path):
                     try:
                         shutil.copy(trace.file_path, dest)
+                        # Also sync .bbl metadata
+                        bbl_src = trace.file_path + '.bbl'
+                        if os.path.exists(bbl_src):
+                            shutil.copy(bbl_src, str(dest) + '.bbl')
                     except:
                         pass
         
@@ -367,6 +404,7 @@ class FuzzMaster:
             timeouts=fuzzing_core.stats.timeouts,
             total_edges=fuzzing_core.coverage_tracker.get_stats()['total_edges'],
             exec_speed=fuzzing_core.stats.execs_per_sec,
+            start_time=fuzzing_core.start_time,
             last_update=time.time()
         )
         
@@ -432,12 +470,9 @@ class FuzzMaster:
         total_timeouts = sum(w.timeouts for w in self.worker_stats.values())
         avg_speed = sum(w.exec_speed for w in self.worker_stats.values())
         
-        # Read global coverage
-        coverage_file = self.sync_dir / 'coverage' / 'global_bitmap.bin'
+        # Read global coverage from shared memory (real-time)
         try:
-            with open(coverage_file, 'rb') as f:
-                global_cov = f.read()
-                total_edges = sum(1 for b in global_cov if b > 0)
+            total_edges = self.shared_coverage.get_coverage_count()
         except:
             total_edges = 0
         

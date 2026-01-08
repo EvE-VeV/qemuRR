@@ -170,11 +170,12 @@ def create_success_result(
     mutations_applied: int = 1,
     trace_id: Optional[str] = None,
     fork_point: Optional[int] = None,
-    recipe_used: Optional[int] = None
+    recipe_used: Optional[int] = None,
+    status: IterationStatus = IterationStatus.SUCCESS
 ) -> IterationResult:
     """创建成功结果的便捷函数"""
     return IterationResult(
-        status=IterationStatus.SUCCESS,
+        status=status,
         iteration_id=iteration_id,
         new_coverage=new_coverage,
         new_paths=new_paths,

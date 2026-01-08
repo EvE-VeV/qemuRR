@@ -39,6 +39,9 @@ class DualLevelPathFinder:
         # Mapping: BB → Syscall Block
         self.bb_to_syscall: Dict[int, int] = {}  # bb_addr → syscall_idx
 
+        # Exploration targets (for when graph is saturated)
+        self.exploration_targets: List[Dict] = []
+
         # Statistics
         self.stats = {
             'total_blocks': 0,
@@ -59,20 +62,7 @@ class DualLevelPathFinder:
     def load_syscall_tree(self, tree_file: str = "/tmp/syscall_tree.json") -> bool:
         """
         Load precise BB->Syscall mapping from syscall tree JSON exported from C-side.
-
-        This method solves the low hit rate issue of PathFinder recipes:
-        - Legacy method: Using crude estimate (source_addr >> 4) % 20, hit rate < 10%
-        - New method: Using precise C-side mapping, hit rate 85%+
-
-        Args:
-            tree_file: Path to syscall tree JSON file (exported by C-side rr_syscall_tree.c)
-
-        Returns:
-            True if successfully loaded, False otherwise
         """
-        import os
-        import json
-
         if not os.path.exists(tree_file):
             alog(f"Syscall tree file not found: {tree_file}", "PathFinder", "WARN")
             alog(f"Hint: Ensure C-side code has exported syscall tree", "PathFinder", "WARN")
@@ -80,181 +70,114 @@ class DualLevelPathFinder:
 
         import json
         import os
+        import re
         
         try:
-            # Check cache
-            try:
-                stat = os.stat(tree_file)
-                mtime = stat.st_mtime
-                size = stat.st_size
-                if tree_file in self._tree_cache:
-                    cached_mtime, cached_size, cached_nodes, cached_blocks, cached_map = self._tree_cache[tree_file]
-                    if cached_mtime == mtime and cached_size == size:
-                        alog(f"♻️ Using cached syscall tree for {tree_file}", "PathFinder", "INFO")
-                        nodes = cached_nodes
-                        # Since we cached the processed objects too, we can restore them
-                        # But self.syscall_blocks and self.bb_to_syscall are instance state
-                        # We must update them
-                        self.syscall_blocks = cached_blocks.copy()
-                        self.bb_to_syscall = cached_map.copy()
-                        
-                        # Initialize stats
-                        self.stats['total_blocks'] = len(self.syscall_blocks)
-                        self.stats['total_edges'] = len(self.syscall_edges) # Edges are not fully cached here but simple restore of blocks implies edges if we had them or if they are derived. 
-                        # Actually syscall_edges is static per tree structure. Let's assume we re-build edges or cache them too.
-                        # For simplicity, let's just cache the 'nodes' list and let the fast in-memory loop run.
-                        # The heavy part is JSON parsing.
-                        pass 
-                    else:
-                        nodes = None
+            # 1. Check cache (Check mtime/size to avoid redundant parsing)
+            stat = os.stat(tree_file)
+            mtime = stat.st_mtime
+            size = stat.st_size
+            
+            if tree_file in self._tree_cache:
+                c_mtime, c_size, c_data = self._tree_cache[tree_file]
+                if c_mtime == mtime and c_size == size:
+                    # ✅ Cache Hit: Skip parsing, but still need to restore state if needed
+                    # However, if we are in the same process, self.syscall_blocks might already be populated.
+                    if self.syscall_blocks:
+                         # alog(f"♻️ PathFinder state already active for {tree_file}", "PathFinder", "DEBUG")
+                         return True
+                    
+                    # If state was lost but cache data exists, rebuild from cached data
+                    tree_data = c_data
+                    alog(f"♻️ Using cached tree data for {tree_file}", "PathFinder", "DEBUG")
                 else:
-                    nodes = None
-            except FileNotFoundError:
-                return False
+                    tree_data = None
+            else:
+                tree_data = None
 
-            if nodes is None:
+            if tree_data is None:
+                # 2. Parse tree_file (Handle HTML bundle or pure JSON)
                 with open(tree_file, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                    
+                
                 # HTML bundle parsing
-                if 'const treeData =' in content or 'var treeData =' in content:
-                    import re
+                if 'treeData =' in content:
                     match_start = re.search(r'(?:const|var)\s+treeData\s*=\s*', content)
                     if match_start:
                         start_idx = match_start.end()
+                        end_idx = content.find(';\n', start_idx)
+                        if end_idx == -1: end_idx = content.find('};', start_idx) + 1
                         
-                        # Look for marker or fallback
-                        marker_idx = content.find('// Stats Init', start_idx)
-                        json_str = None
-                        
-                        if marker_idx != -1:
-                            end_idx = content.rfind(';', start_idx, marker_idx)
-                            if end_idx != -1:
-                                json_str = content[start_idx:end_idx].strip()
-                        
-                        if not json_str:
-                            end_idx = content.find(';\n', start_idx)
-                            if end_idx != -1:
-                                 json_str = content[start_idx:end_idx].strip()
-                        
-                        if json_str:
-                            try:
-                                tree_data = json.loads(json_str) 
-                            except json.JSONDecodeError as je:
-                                alog(f"JSON parsing failed (HTML extract): {je}", "PathFinder", "ERROR")
-                                # Deep recovery
-                                try:
-                                    brace_count = 0
-                                    for i, char in enumerate(content[start_idx:], start=start_idx):
-                                        if char == '{':
-                                            brace_count += 1
-                                        elif char == '}':
-                                            brace_count -= 1
-                                            if brace_count == 0:
-                                                json_str = content[start_idx:i+1]
-                                                tree_data = json.loads(json_str)
-                                                break
-                                except Exception:
-                                    return False
-                        else:
-                            return False
-                    else:
-                        return False
+                        json_str = content[start_idx:end_idx].strip()
+                        try:
+                            tree_data = json.loads(json_str)
+                        except:
+                            # Robust recovery for complex HTML
+                            brace_count = 0
+                            for i, char in enumerate(content[start_idx:], start=start_idx):
+                                if char == '{': brace_count += 1
+                                elif char == '}': 
+                                    brace_count -= 1
+                                    if brace_count == 0:
+                                        tree_data = json.loads(content[start_idx:i+1])
+                                        break
                 else:
-                    try:
-                        tree_data = json.loads(content)
-                    except json.JSONDecodeError:
-                        return False
+                    tree_data = json.loads(content)
 
-                # Extract node data
-                nodes = tree_data.get('nodes', [])
+                if not tree_data:
+                    alog(f"Could not parse valid JSON from {tree_file}", "PathFinder", "WARN")
+                    return False
                 
-            if not nodes:
-                return False
-            
-            # --- Common Processing Logic (Cached or New) ---
-            # Reset current mapping
-            self.syscall_blocks.clear()
-            self.bb_to_syscall.clear()
+                # Save to cache
+                self._tree_cache[tree_file] = (mtime, size, tree_data)
 
-            # Extract node data
+            # 3. Process nodes and build graph
             nodes = tree_data.get('nodes', [])
             if not nodes:
                 alog(f"Syscall tree is empty: {tree_file}", "PathFinder", "WARN")
                 return False
             
-            # Store tree data for future use
-            if not hasattr(self, 'syscall_tree_data'):
-                self.syscall_tree_data = {}
-            self.syscall_tree_data = tree_data
+            self.syscall_blocks.clear()
+            self.bb_to_syscall.clear()
+            self.syscall_edges.clear()
             
-            # ✅ P3 Fix 1: Initialize Syscall Blocks
-            temp_id_to_block = {}
+            # Map node_id -> block for edge creation
+            id_to_block = {}
             for node in nodes:
-                syscall_idx = node.get('syscall_index', -1)
-                if syscall_idx < 0:
-                    continue
+                idx = node.get('syscall_index', -1)
+                if idx < 0: continue
                 
-                # Check if block already exists to preserve its is_covered state
-                if syscall_idx in self.syscall_blocks:
-                    block = self.syscall_blocks[syscall_idx]
-                else:
-                    block = SyscallBlock(
-                        syscall_index=syscall_idx,
-                        syscall_name=node.get('syscall_name', 'unknown')
-                    )
-                    self.syscall_blocks[syscall_idx] = block
-                
+                block = SyscallBlock(idx, node.get('syscall_name', 'unknown'))
                 block.bb_addrs = node.get('bb_addresses', [])
+                # ✅ Mark covered if in the tree (the tree represents an ACTUAL execution)
+                block.is_covered = True 
                 
-                # Also index by node ID for building edges
-                node_id = node.get('id', -1)
-                if node_id >= 0:
-                    temp_id_to_block[node_id] = block
+                self.syscall_blocks[idx] = block
+                id_to_block[node.get('id', -1)] = block
+                
+                # Build BB map
+                for addr in block.bb_addrs:
+                    if isinstance(addr, str):
+                        try: addr = int(addr, 16)
+                        except: continue
+                    self.bb_to_syscall[addr] = idx
 
-            # ✅ P3 Fix 2: Build graph edges (Successors/Predecessors)
+            # Build edges
             for node in nodes:
-                node_id = node.get('id', -1)
-                parent_id = node.get('parent_id', -1)
-                
-                if node_id in temp_id_to_block and parent_id in temp_id_to_block:
-                    child_block = temp_id_to_block[node_id]
-                    parent_block = temp_id_to_block[parent_id]
-                    
-                    # Establish bilateral links
-                    parent_block.add_successor(child_block)
-                    child_block.add_predecessor(parent_block)
-                    
-                    # Record edge
-                    self.syscall_edges.add((parent_block.syscall_index, child_block.syscall_index))
+                nid = node.get('id', -1)
+                pid = node.get('parent_id', -1)
+                if nid in id_to_block and pid in id_to_block:
+                    child = id_to_block[nid]
+                    parent = id_to_block[pid]
+                    parent.add_successor(child)
+                    child.add_predecessor(parent)
+                    self.syscall_edges.add((parent.syscall_index, child.syscall_index))
 
-            # Build BB->Syscall mapping
-            # Method 1: If tree_data has pre-computed mapping
-            if 'bb_to_syscall' in tree_data:
-                bb_map = tree_data['bb_to_syscall']
-                for bb_addr_str, syscall_idx in bb_map.items():
-                    bb_addr = int(bb_addr_str, 16) if isinstance(bb_addr_str, str) else bb_addr_str
-                    self.bb_to_syscall[bb_addr] = syscall_idx
-                alog(f"✅ Loaded {len(self.bb_to_syscall)} BB->Syscall mappings from pre-computed map", "PathFinder", "INFO")
-            else:
-                # Method 2: Extract BB addresses from nodes
-                for node in nodes:
-                    syscall_idx = node.get('syscall_index', -1)
-                    bb_addrs = node.get('bb_addresses', [])
-
-                    if syscall_idx >= 0:
-                        for bb_addr in bb_addrs:
-                            # Handle string format addresses (e.g., "0x12345")
-                            if isinstance(bb_addr, str):
-                                try:
-                                    bb_addr = int(bb_addr, 16)
-                                except ValueError:
-                                    continue
-                            self.bb_to_syscall[bb_addr] = syscall_idx
-
-                alog(f"✅ Extracted {len(self.bb_to_syscall)} BB->Syscall mappings from nodes", "PathFinder", "INFO")
-
-            # Log loading statistics
+            # Statistics
+            self.stats['total_blocks'] = len(self.syscall_blocks)
+            self.stats['total_edges'] = len(self.syscall_edges)
+            self.stats['total_bbs'] = len(self.bb_to_syscall)
+            
             alog(f"✅ Syscall tree loaded and initialized:", "PathFinder", "INFO")
             alog(f"  - Nodes: {len(nodes)}", "PathFinder", "INFO")
             alog(f"  - Initialized Blocks: {len(self.syscall_blocks)}", "PathFinder", "INFO")
@@ -265,75 +188,24 @@ class DualLevelPathFinder:
 
         except Exception as e:
             alog(f"Failed to load syscall tree: {e}", "PathFinder", "ERROR")
-            import traceback
-            traceback.print_exc()
+            # import traceback
+            # traceback.print_exc() # Removed as per instruction
             return False
 
     def mark_nodes_covered(self, tree_file: str) -> int:
         """
-        Explicitly mark nodes appearing in the given tree file as covered.
-        This is more accurate than bitmap-based mapping.
+        Redundant with new load_syscall_tree which marks all nodes in tree as covered.
+        Keeping for compatibility but making it a no-op if already loaded.
         """
-        import json
-        
-        try:
-             import re
-             with open(tree_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-             tree_data = None
-            
-             # Check for HTML bundle format (const treeData = ... or var treeData = ...)
-             if 'treeData =' in content:
-                 match_start = re.search(r'(?:const|var)\s+treeData\s*=\s*', content)
-                 if match_start:
-                     start_idx = match_start.end()
-                     # Use simpler extraction: find the next ';\n' or '};'
-                     # Or reuse the logic: look for start of JSON '{'
-                     if content[start_idx:].strip().startswith('{'):
-                         # Find proper end
-                         end_idx = content.find(';\n', start_idx)
-                         if end_idx != -1:
-                             try:
-                                 tree_data = json.loads(content[start_idx:end_idx].strip())
-                             except:
-                                 pass
-            
-             # If extraction failed or it's a plain JSON file
-             if tree_data is None:
-                 try:
-                      # If file starts with {, it's likely pure JSON
-                      if content.strip().startswith('{'):
-                         tree_data = json.loads(content)
-                 except:
-                     pass
-            
-             if not tree_data:
-                 # alog(f"Could not parse valid JSON from {tree_file}", "PathFinder", "WARN")
-                 return 0
-            
-             nodes = tree_data.get('nodes', [])
-             marked = 0
-             for node in nodes:
-                 idx = node.get('syscall_index', -1)
-                 if idx in self.syscall_blocks:
-                     if not self.syscall_blocks[idx].is_covered:
-                         self.syscall_blocks[idx].is_covered = True
-                         marked += 1
-            
-             if marked > 0:
-                 alog(f"📍 Marked {marked} new nodes as covered from tree", "PathFinder", "INFO")
-             return marked
-        except Exception as e:
-            alog(f"Failed to mark nodes as covered: {e}", "PathFinder", "ERROR")
-            return 0
+        return 0
 
-    def build_dual_cfg(self, trace_file: str) -> bool:
+    def build_dual_cfg(self, trace_file: str, analyzer: Optional[Any] = None) -> bool:
         """
         Build dual-level CFG from trace file
 
         Args:
             trace_file: Path to trace file
+            analyzer: Existing TraceAnalyzer instance (optional)
 
         Returns:
             True if successfully built, False otherwise
@@ -345,10 +217,12 @@ class DualLevelPathFinder:
             from trace_analyzer import TraceAnalyzer
 
             # Parse trace
-            analyzer = TraceAnalyzer(trace_file)
-            if not analyzer.analyze():
-                alog("TraceAnalyzer parsing failed", "PathFinder", "ERROR")
-                return False
+            if not analyzer:
+                from trace_analyzer import TraceAnalyzer
+                analyzer = TraceAnalyzer(trace_file)
+                if not analyzer.analyze():
+                    alog("TraceAnalyzer parsing failed", "PathFinder", "ERROR")
+                    return False
             
             # Check BB trace
             if not analyzer.has_bb_trace() or not analyzer.bb_trace_parser:
@@ -612,12 +486,12 @@ class DualLevelPathFinder:
         """
         return True
 
-    def build_from_trace(self, trace_file: str) -> bool:
+    def build_from_trace(self, trace_file: str, analyzer: Optional[Any] = None) -> bool:
         """
         Build CFG from trace (compatibility method)
         Compatible with original PathFinder interface, calls build_dual_cfg internally
         """
-        return self.build_dual_cfg(trace_file)
+        return self.build_dual_cfg(trace_file, analyzer=analyzer)
 
     def enhance_from_trace_files(
         self,
@@ -637,6 +511,7 @@ class DualLevelPathFinder:
             int: Number of new syscall nodes mapped
         """
         import struct
+        from .bb_trace_parser import BBTraceParser
         
         if not os.path.exists(bb_trace_file):
             return 0
@@ -645,29 +520,32 @@ class DualLevelPathFinder:
         last_syscall_idx = -1
         
         try:
-            with open(bb_trace_file, 'rb') as f:
-                content = f.read()
+            # Use shared parser to handle correct struct size (16 bytes)
+            parser = BBTraceParser(bb_trace_file)
+            if not parser.parse():
+                alog(f"Failed to parse BB trace: {bb_trace_file}", "PathFinder", "ERROR")
+                return 0
                 
-            # Parse 64-bit BB addresses
-            total_bbs = len(content) // 8
-            bb_addrs = struct.unpack(f'<{total_bbs}Q', content)
-            
-            for bb_addr in bb_addrs:
-                # Try mapping BB -> Syscall
-                if bb_addr in self.bb_to_syscall:
-                    syscall_idx = self.bb_to_syscall[bb_addr]
+            for entry in parser.entries:
+                syscall_idx = entry.syscall_idx
+                
+                # Dynamic Learning: Update BB -> Syscall mapping from trace
+                # This is crucial if static analysis didn't provide BB addresses
+                self.bb_to_syscall[entry.pc] = syscall_idx
+                
+                # Try mapping BB -> Syscall (Dynamic)
+                if syscall_idx >= 0 and syscall_idx in self.syscall_blocks:
+                    block = self.syscall_blocks[syscall_idx]
                     
-                    if syscall_idx in self.syscall_blocks:
-                        block = self.syscall_blocks[syscall_idx]
-                        
-                        # 1. Mark covered
-                        if not block.is_covered:
-                            block.is_covered = True
-                            mapped_count += 1
-                        
-                        # 2. Build syscall-level edge (CFG Edge)
-                        if last_syscall_idx >= 0 and last_syscall_idx != syscall_idx:
-                            # Add predecessor/successor relationship
+                    # 1. Mark covered
+                    if not block.is_covered:
+                        block.is_covered = True
+                        mapped_count += 1
+                    
+                    # 2. Build syscall-level edge (CFG Edge)
+                    if last_syscall_idx >= 0 and last_syscall_idx != syscall_idx:
+                        # Add predecessor/successor relationship
+                        if last_syscall_idx in self.syscall_blocks:
                             last_block = self.syscall_blocks[last_syscall_idx]
                             
                             # Avoid duplicate addition
@@ -682,12 +560,17 @@ class DualLevelPathFinder:
                                 block.add_predecessor(last_block)
                                 self.syscall_edges.add((last_syscall_idx, syscall_idx))
                                 
-                        last_syscall_idx = syscall_idx
+                    last_syscall_idx = syscall_idx
+            
+            # Also update bb_to_syscall map from trace if needed
+            # (Optional: might not be needed if we trust the trace's syscall_idx)
                         
             return mapped_count
             
         except Exception as e:
             alog(f"CFG enhancement failed: {e}", "PathFinder", "ERROR")
+            import traceback
+            traceback.print_exc()
             return 0
 
     def find_uncovered_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:

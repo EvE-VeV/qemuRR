@@ -26,7 +26,6 @@ typedef struct {
     bool enabled;                               // Whether coverage tracking is enabled
     uint8_t coverage_map[RR_COVERAGE_MAP_SIZE]; // Coverage bitmap (shared memory)
     int shm_fd;                                // Shared memory file descriptor
-    uint64_t prev_pc;                          // Previous PC (for calculating edges)
     bool file_backed;                          // Use file as shared memory
     char backing_path[PATH_MAX];               // File path (only used in file_backed mode)
     

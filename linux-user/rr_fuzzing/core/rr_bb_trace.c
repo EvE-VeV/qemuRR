@@ -54,7 +54,13 @@ int rr_bb_trace_init(const char *trace_file)
     }
     
     /* Construct BB trace file path */
-    g_bb_trace->trace_file = construct_bb_trace_path(trace_file);
+    const char *env_bb_path = getenv("RR_BB_TRACE_FILE");
+    if (env_bb_path && strlen(env_bb_path) > 0) {
+        g_bb_trace->trace_file = strdup(env_bb_path);
+    } else {
+        g_bb_trace->trace_file = construct_bb_trace_path(trace_file);
+    }
+
     if (!g_bb_trace->trace_file) {
         free(g_bb_trace);
         g_bb_trace = NULL;
@@ -159,6 +165,8 @@ void rr_bb_trace_log(uint64_t pc)
     
     g_bb_trace->buffer_pos++;
     g_bb_trace->total_bbs++;
+    
+
 }
 
 void rr_bb_trace_flush(void)

@@ -229,10 +229,11 @@ class QEMUExecutor:
                     # Create a zero-filled bytes object of the exact needed length
                     reset_len = buf_len - 1
                     cls._shared_coverage_shm.buf[1:] = bytes(reset_len)
+                return True
             except Exception as e:
                 alog(f"⚠️ Failed to reset coverage SHM: {e}", "EXEC", "WARN")
                 return False
-        return False
+        return True
     
     @classmethod
     def cleanup_shared_coverage(cls):
@@ -257,6 +258,9 @@ class QEMUExecutor:
     
     def _setup_ipc(self):
         """Setup IPC channels (pipes and shared memory)"""
+        # 🔥 FIX: Cleanup old IPC resources before creating new ones to avoid leaks
+        self._cleanup_ipc()
+        
         # Create pipes
         r1, w1 = os.pipe()
         r2, w2 = os.pipe()
@@ -366,6 +370,8 @@ class QEMUExecutor:
         Args:
             trace_file: Path to trace file to replay
         """
+        # os.environ.copy() will be used below
+        
         env = os.environ.copy()
         
         # Note: Do NOT set RR_STRACE_MODE - it's for strace text format
@@ -392,9 +398,10 @@ class QEMUExecutor:
             'RR_STATUS_PIPE': str(self.status_pipe_write),
             'RR_SHARED_MEMORY': self.shm.get_env_value(),
             'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
-            'RR_COVERAGE_SHM': self.__class__._coverage_env_value,
-            'RR_DEBUG_LEVEL': os.environ.get('RR_DEBUG_LEVEL', '1'),
             'RR_BB_TRACE_ENABLED': '1', # Enable BB trace for PathFinder
+            'RR_DEBUG_LEVEL': os.environ.get('RR_DEBUG_LEVEL', '1'),
+            # ✅ FIX: Use unique BB trace file to avoid overwriting seed trace
+            'RR_BB_TRACE_FILE': f"/tmp/qemu_bb_trace_{os.getpid()}_{self.total_executions}_{time.time()}.bbl",
         })
         
         if 'RR_TREE_OUTPUT' in env:
@@ -568,7 +575,14 @@ class QEMUExecutor:
                 # Structure: [enabled(1)] [coverage_map(64K)]
                 start_offset = 1
                 map_size = 64 * 1024
-                coverage_bitmap = bytes(self._shared_coverage_shm.buf[start_offset : start_offset + map_size])
+                raw_buf = self._shared_coverage_shm.buf
+                coverage_bitmap = bytes(raw_buf[start_offset : start_offset + map_size])
+                
+                # Debug: Check first 16 bytes and non-zero count
+                header = bytes(raw_buf[:16]).hex()
+                nz_count = sum(1 for b in coverage_bitmap if b > 0)
+                if nz_count > 0 or self.total_executions % 100 == 0:
+                    alog(f"📊 [SHM-DEBUG] SHM Header: {header}, Map Non-Zero: {nz_count}", "EXEC", "DEBUG")
 
                 return coverage_bitmap
             except Exception as e:
@@ -790,9 +804,10 @@ class QEMUExecutor:
         # Track _qemu_ready state
         alog(f"execute() called (exec#{self.total_executions}), _qemu_ready={self._qemu_ready}, qemu_alive={self.qemu_process is not None and self.qemu_process.poll() is None if self.qemu_process else False}", "EXEC")
         
-        # Coverage accumulation logic: Do NOT reset shared coverage between executions.
-        # This prevents child processes from incorrectly reporting accumulated edges as new.
-        # QEMUExecutor.reset_shared_coverage() 
+        # Coverage accumulation logic: Standardize reset for each execution 
+        # to ensure accurate delta reporting in statistics.
+        # Persistent mode handles accumulation on the C side if needed.
+        QEMUExecutor.reset_shared_coverage() 
         
         try:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -997,7 +1012,7 @@ class QEMUExecutor:
         if mutation_variants is None:
             mutation_variants = [[]]
         
-        # Coverage accumulation policy: Reset shared coverage for each iteration to get accurate delta
+        # Standardized reset
         QEMUExecutor.reset_shared_coverage()
         
         # Write fork request to shared memory

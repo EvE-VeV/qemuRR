@@ -11,7 +11,7 @@ import json
 import time
 import random
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 
@@ -262,8 +262,9 @@ class TraceManager:
         Args:
             trace_id: Trace ID
             trace_file: Path to the trace file (used for parsing all syscalls)
-            mutations: List of FuzzInstructions applied
-            has_new_coverage: Whether new coverage was found
+            mutations: List[Any]
+            has_new_coverage: bool
+            analyzer: Optional[Any] = None
         """
         # Initialize syscall_stats for the trace if it doesn't exist
         if trace_id not in self.syscall_stats:
@@ -271,14 +272,9 @@ class TraceManager:
         
         # Parse trace file to retrieve full syscall sequence
         try:
-            import sys
-            from pathlib import Path
-            analysis_path = Path(__file__).parent.parent / 'analysis'
-            if str(analysis_path) not in sys.path:
-                sys.path.insert(0, str(analysis_path))
-            
-            from trace_analyzer import TraceAnalyzer
-            analyzer = TraceAnalyzer(trace_file)
+            if not analyzer:
+                from trace_analyzer import TraceAnalyzer
+                analyzer = TraceAnalyzer(trace_file)
             
             # Collect basic execution counts for all syscalls
             for i, sc in enumerate(analyzer.syscalls):

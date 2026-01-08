@@ -38,11 +38,21 @@
 
 /* RR-Fuzz Integration: External definition in linux-user or common code */
 extern void rr_coverage_trace_edge(uint64_t cur_pc);
+extern void rr_bb_trace_log(uint64_t pc);
 
 void HELPER(rr_coverage_trace_edge)(uint64_t cur_pc)
 {
 #ifdef CONFIG_USER_ONLY
     rr_coverage_trace_edge(cur_pc);
+#else
+    /* No-op for softmmu */
+#endif
+}
+
+void HELPER(rr_bb_trace_log)(uint64_t pc)
+{
+#ifdef CONFIG_USER_ONLY
+    rr_bb_trace_log(pc);
 #else
     /* No-op for softmmu */
 #endif
