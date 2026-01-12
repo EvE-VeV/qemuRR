@@ -19,19 +19,35 @@ from typing import List, Optional, Any, Dict
 # Add analysis directory to path to import trace_analyzer
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
 
-from .constants import (
-    FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
-    FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
-    FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
-    FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
-    INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
-    PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS,
-    FUZZ_MAX_INSTRUCTIONS
-)
-from .instruction import FuzzInstruction
-from .io_mutator import IOReturnValueMutator
-from .async_logger import alog
-from .types import MutationRecipe
+try:
+    from .constants import (
+        FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
+        FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
+        FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
+        FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
+        INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
+        PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS,
+        FUZZ_MAX_INSTRUCTIONS
+    )
+    from .instruction import FuzzInstruction
+    from .io_mutator import IOReturnValueMutator
+    from .async_logger import alog
+    from .conductor_types import MutationRecipe
+except ImportError:
+    # Standalone script fallback
+    from constants import (
+        FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
+        FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
+        FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
+        FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
+        INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
+        PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS,
+        FUZZ_MAX_INSTRUCTIONS
+    )
+    from instruction import FuzzInstruction
+    from io_mutator import IOReturnValueMutator
+    from async_logger import alog
+    from conductor_types import MutationRecipe
 
 
 class BaseMutator:
@@ -251,7 +267,10 @@ class BaseMutator:
                         b'%s%s%s%s', b'A' * 64, b'../../../etc/passwd', 
                         b'; cat /etc/passwd', b'\x00' * 8, 
                         b'CRASH_ME', b'CRASH_ME\n', 
-                        b'CRASH_ME\x00', b'CRASH_ME\n\x00'
+                        b'CRASH_ME\x00', b'CRASH_ME\n\x00',
+                        b'A' * 1024, b'A' * 4096,  # Stack overflow
+                        b'USER ' + b'A' * 2048 + b'\r\n',
+                        b'MKD ' + b'A' * 2048 + b'\r\n'
                      ]
                      content_to_use = random.choice(patterns)
 
@@ -316,15 +335,18 @@ class BaseMutator:
             elif cmd == FUZZ_CMD_REPLACE_BUFFER:
                 # Use attack patterns for buffer replacement too, or random
                 if random.random() < 0.5:
-                     # Use attack patterns (defined below, we need to move definition up or duplicate)
+                     # Use attack patterns 
                      patterns = [
                         b'%s%s%s%s', b'A' * 64, b'../../../etc/passwd', 
                         b'; cat /etc/passwd', b'\x00' * 8, 
-                        b'CRASH_ME', b'CRASH_ME\n'
+                        b'CRASH_ME', b'CRASH_ME\n',
+                        b'A' * 512, b'A' * 1024, b'A' * 4096,  # Stack overflow patterns
+                        b'USER ' + b'A' * 2048 + b'\r\n',      # Protocol specific
+                        b'MKD ' + b'A' * 2048 + b'\r\n'
                      ]
                      data = random.choice(patterns)
                 else:
-                     size = random.choice([4, 8, 16, 32])
+                     size = random.choice([4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096])
                      data = bytes([random.randint(0, 255) for _ in range(size)])
                 mut_type = 'replace_buffer'
             elif cmd == FUZZ_CMD_MUTATE_AUX_BUFFER:
@@ -339,6 +361,8 @@ class BaseMutator:
                     b'CRASH_ME\n',         # Explicit target trigger (newline)
                     b'CRASH_ME\x00',       # Explicit target trigger (null-terminated)
                     b'CRASH_ME\n\x00',     # Explicit target trigger (newline + null)
+                    b'A' * 1024,           # Large buffer
+                    b'A' * 4096,           # Very large buffer
                 ]
                 data = random.choice(attack_patterns)
                 mut_type = 'aux_buffer'
@@ -347,7 +371,7 @@ class BaseMutator:
                 data = struct.pack('I', truncate_size)
                 mut_type = 'truncate'
             elif cmd == FUZZ_CMD_EXTEND:
-                extend_size = random.choice([64, 128, 256, 512, 1024])
+                extend_size = random.choice([64, 128, 256, 512, 1024, 2048, 4096, 8192])
                 data = struct.pack('I', extend_size)
                 mut_type = 'extend'
             elif cmd == FUZZ_CMD_LIGHT_MUTATION:
@@ -1071,6 +1095,17 @@ class SmartMutator:
                     b"`whoami`",               
                     b"|cat /etc/passwd",       
                 ],
+                'ftp_commands': [
+                   b'USER ' + b'A' * 2048 + b'\r\n',
+                   b'PASS ' + b'A' * 2048 + b'\r\n', 
+                   b'STOR ' + b'A' * 2048 + b'\r\n',
+                   b'APPE ' + b'A' * 2048 + b'\r\n',
+                   b'DELE ' + b'A' * 2048 + b'\r\n',
+                   b'RMD ' + b'A' * 2048 + b'\r\n',
+                   b'MKD ' + b'A' * 2048 + b'\r\n',
+                   b'PWD\r\n', b'LIST\r\n', b'SYST\r\n',
+                   b'SITE CHMOD 777 ' + b'A' * 256 + b'\r\n',
+                ],
                 'path_traversal': [
                     b'/../../../etc/passwd',    
                     b'..\\..\\..\\windows\\system32\\drivers\\etc\\hosts',  
@@ -1080,7 +1115,9 @@ class SmartMutator:
                 'overflow_patterns': [
                     b'A' * 256,                 
                     b'\x41' * 512 + b'\x42\x43\x44\x45',  
-                    b'%n' * 100,                
+                    b'%n' * 100,
+                    b'A' * 4096, # Page size
+                    b'A' * 8192,                
                 ],
                 'special_chars': [
                     b'\x00' * 32,               
@@ -1102,9 +1139,9 @@ class SmartMutator:
 
             syscall_name = target_candidate.name.lower()
             if 'read' in syscall_name or 'recv' in syscall_name:
-                pattern_type = random.choice(['format_string', 'injection', 'overflow_patterns', 'special_chars'])
+                pattern_type = random.choice(['format_string', 'injection', 'overflow_patterns', 'special_chars', 'ftp_commands'])
             elif 'write' in syscall_name or 'send' in syscall_name:
-                pattern_type = random.choice(['format_string', 'special_chars', 'unicode_attacks'])
+                pattern_type = random.choice(['format_string', 'special_chars', 'unicode_attacks', 'ftp_commands'])
             elif 'open' in syscall_name:
                 pattern_type = random.choice(['path_traversal', 'special_chars'])
             else:
@@ -1290,6 +1327,27 @@ class SmartMutator:
         if not self.mutable_candidates:
             print("[Mutator] WARNING: No mutable candidates found!")
             return []
+
+        # ━━━━ Havoc Mode: Stacking Multiple Mutations ━━━━
+        # 10% probability usually, 50% if stagnant
+        havoc_prob = 0.5 if self.is_stagnant else 0.1
+        if random.random() < havoc_prob:
+            num_stacked = random.randint(2, 8)
+            print(f"[Mutator] ⚡ Havoc Mode Triggered! Stacking {num_stacked} mutations")
+            
+            # Select targets (can be one or multiple)
+            valid_candidates = [c for c in self.mutable_candidates if fork_point is None or c.index >= fork_point]
+            if not valid_candidates: valid_candidates = self.mutable_candidates
+            
+            stacked_instrs = []
+            for _ in range(num_stacked):
+                target = random.choice(valid_candidates)
+                strategy = self._select_strategy()
+                instr = self._generate_advanced_instruction(target, strategy, iteration)
+                if instr: stacked_instrs.append(instr)
+            
+            self.last_mutation_type = 'havoc'
+            return stacked_instrs[:FUZZ_MAX_INSTRUCTIONS]
         
         num_candidates = len(self.mutable_candidates)
         

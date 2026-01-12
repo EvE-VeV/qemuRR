@@ -432,8 +432,8 @@ class FuzzingCore:
         self.watchdog = FuzzingWatchdog(
             executor_check_func=self._check_executor_alive,
             restart_func=self._restart_execution_engine,
-            timeout_seconds=10,  # Reduced from 30s to 10s for faster error recovery
-            check_interval=1     # Increased frequency to 1s
+            timeout_seconds=45,  # Optimized: (2s exec + 0.5s overhead) * 8 Havoc stacked * 2 safety factor
+            check_interval=2     # Increased frequency to 2s
         )
         alog(f"  Watchdog: Enabled (Timeout=30s)", "CORE", "INFO")
         
@@ -944,6 +944,19 @@ class FuzzingCore:
         for fork_point in fork_points:
             for _ in range(mutations_per_fork):
                 m = self.mutator.mutate(trace, fork_point=fork_point, analyzer=analyzer)
+                
+                # 🔥 OPTION A: VALIDATOR HOOK (Dual-Level Mapping)
+                # Intercepts and drops mutations that violate the Static CFG
+                if m and self.enable_pathfinder and self.path_finder and hasattr(self.mutator, 'last_recipe_used'):
+                    recipe = getattr(self.mutator, 'last_recipe_used', None)
+                    # Only validate if the recipe explicitly targets a control flow transition (has known source/target)
+                    if recipe and hasattr(recipe, 'source_branch') and hasattr(recipe, 'target_branch'):
+                         # Validator Check
+                         is_valid = self.path_finder.validate_transition(recipe.source_branch, recipe.target_branch)
+                         if not is_valid:
+                             # alog(f"🛑 Validator BLOCKED invalid transition: {recipe.source_branch} -> {recipe.target_branch}", "CORE", "DEBUG")
+                             continue # Skip execution (Drop Mutation)
+
                 if m:
                     fork_to_mutations[fork_point].append(m)
         

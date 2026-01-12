@@ -28,6 +28,9 @@ __MACOSX/
 
 # 文档归档（旧文档）
 docs/old-archive/
+# Fuzzing输出
+fuzzing_summary_*.json
+analysis_reports/
 
 # tests/
 
@@ -37,9 +40,10 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Fuzzing输出
-fuzzing_summary_*.json
-analysis_reports/
+# Fuzzing reports
+fuzzing_reports/
+fuzzing_reports_mp/
+results_archive_*/
 
 # 编辑器临时文件
 *~

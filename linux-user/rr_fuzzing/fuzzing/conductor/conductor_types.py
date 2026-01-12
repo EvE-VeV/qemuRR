@@ -10,7 +10,10 @@ and maintainability.
 from dataclasses import dataclass, field
 from typing import Optional, Union, Any, List
 import struct
-from .constants import FUZZ_INSTRUCTION_DATA
+try:
+    from .constants import FUZZ_INSTRUCTION_DATA
+except ImportError:
+    from constants import FUZZ_INSTRUCTION_DATA
 
 @dataclass
 class MutationRecipe:

@@ -14,9 +14,16 @@ from collections import defaultdict
 import logging
 
 # Add parent directory to path if needed (though usually conductor/ is in path)
-from .syscall_block import SyscallBlock
-from .async_logger import alog
-from .types import MutationRecipe
+# Add parent directory to path if needed (though usually conductor/ is in path)
+try:
+    from .syscall_block import SyscallBlock
+    from .async_logger import alog
+    from .conductor_types import MutationRecipe
+except ImportError:
+    # Standalone/Script usage fallback
+    from syscall_block import SyscallBlock
+    from async_logger import alog
+    from conductor_types import MutationRecipe
 
 
 class DualLevelPathFinder:
@@ -69,7 +76,6 @@ class DualLevelPathFinder:
             return False
 
         import json
-        import os
         import re
         
         try:
@@ -352,6 +358,38 @@ class DualLevelPathFinder:
 
         alog(f"✅ Syscall-only CFG build complete: {len(self.syscall_blocks)} blocks", "PathFinder", "INFO")
         return True
+
+
+    def validate_transition(self, current_syscall_idx: int, next_syscall_idx: int) -> bool:
+        """
+        [Validator] Check if a transition is valid according to the Static CFG.
+        
+        Args:
+            current_syscall_idx: The current syscall node index
+            next_syscall_idx: The proposed next syscall node index
+            
+        Returns:
+            True if the transition exists in the static map (edge exists), False otherwise.
+            If the current node is unknown, defaults to False (conservative).
+        """
+        # 1. Check if current node is known
+        if current_syscall_idx not in self.syscall_blocks:
+            # Unknown state - assume invalid to be safe (or True if we want to be permissive?)
+            # For strict validation, return False.
+            return False
+            
+        block = self.syscall_blocks[current_syscall_idx]
+        
+        # 2. Check cached edge set for O(1) lookup
+        if (current_syscall_idx, next_syscall_idx) in self.syscall_edges:
+            return True
+            
+        # 3. Double check successors list (should be consistent with edges, but robustness check)
+        for succ in block.successors:
+            if succ.syscall_index == next_syscall_idx:
+                return True
+                
+        return False
 
     def find_uncovered_syscall_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:
         """

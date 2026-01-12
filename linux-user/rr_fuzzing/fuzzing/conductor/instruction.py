@@ -6,4 +6,7 @@ Backward compatibility shim.
 Refer to .types.FuzzInstruction for the actual implementation.
 """
 
-from .types import FuzzInstruction
+try:
+    from .conductor_types import FuzzInstruction
+except ImportError:
+    from conductor_types import FuzzInstruction
