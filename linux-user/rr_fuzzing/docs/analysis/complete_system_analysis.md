@@ -265,7 +265,14 @@ def _calculate_adaptive_probability(self):
 
 ## 4. Coverage完整系统分析
 
-### 4.1 双层架构
+### 4.1 Coverage精度验证 (最新审计)
+
+根据代码审计验证 (原 `coverage_verification.md`):
+- **调用位置**: `/home/webfuzz/Documents/qemu/accel/tcg/cpu-exec.c`
+- **粒度确认**: `rr_coverage_trace_edge` 在 QEMU TCG 主循环中被调用，**确认为 Basic Block (TB) 级别**。
+- **结论**: 覆盖率粒度极佳 (5/5)，能够精确反馈每个翻译块的执行情况。
+
+### 4.2 双层架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

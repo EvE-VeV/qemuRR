@@ -122,3 +122,10 @@ FORBIDDEN_MUTATION_SYSCALLS = {
     'close', 'dup', 'dup2', 'dup3',
 }
 
+
+# ===== Validation Scores (Phase A: Relax & Rank) =====
+# Used by PathFinder to rank mutations instead of binary blocking
+VALIDATION_SCORE_INVALID = 0      # Absolute failure (Resource-level, Phase B)
+VALIDATION_SCORE_UNKNOWN = 5      # Unknown transition (not in syscall_tree)
+VALIDATION_SCORE_KNOWN = 10       # Known valid transition (in syscall_tree)
+VALIDATION_SCORE_STATIC = 8       # Present in static CFG but not dynamic trace (Phase C)

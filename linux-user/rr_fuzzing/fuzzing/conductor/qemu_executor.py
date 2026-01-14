@@ -228,7 +228,7 @@ class QEMUExecutor:
                 if buf_len > 1:
                     # Create a zero-filled bytes object of the exact needed length
                     reset_len = buf_len - 1
-                    cls._shared_coverage_shm.buf[1:] = bytes(reset_len)
+                    cls._shared_coverage_shm.buf[1:] = b'\x00' * reset_len
                 return True
             except Exception as e:
                 alog(f"⚠️ Failed to reset coverage SHM: {e}", "EXEC", "WARN")
@@ -491,6 +491,7 @@ class QEMUExecutor:
         """
         start_time = time.time()
 
+        timeout = float(timeout)
         while (time.time() - start_time) < timeout:
             # Optimize: use small polling interval to reduce selection latency
             remaining = timeout - (time.time() - start_time)
@@ -842,7 +843,7 @@ class QEMUExecutor:
                 print("[QEMUExecutor] 📤 Sending first 'F' to reach fork server loop...")
                 os.write(self.cmd_pipe_write, b'F')
                 
-                time_module.sleep(0.1)  
+                time.sleep(0.1)  
                 
                 print("[QEMUExecutor] QEMU in fork server loop, ready for persistent fuzzing")
                 self._qemu_ready = True
@@ -883,6 +884,7 @@ class QEMUExecutor:
                 STATUS_NORMAL_EXIT: "normal_exit",
                 STATUS_CRASH: "crash",
                 STATUS_OTHER_SIGNAL: "signal",
+                STATUS_TIMEOUT: "timeout",
                 STATUS_AT_FORK_POINT: "fork_point_ready"  # Fork server waiting for next command
             }
             # Ensure STATUS_NORMAL_EXIT (3) is explicitly handled
@@ -1027,9 +1029,12 @@ class QEMUExecutor:
         self._last_fork_point = fork_point
         
         # Send unified command: 'C'
-        print(f"[QEMUExecutor] Sending 'C' command (fork_point={fork_point}, "
-              f"variants={len(mutation_variants)}, depth={depth}, iteration={iteration_id})")
+        alog(f"Sending 'C' command (fork_point={fork_point}, "
+              f"variants={len(mutation_variants)}, depth={depth}, iteration={iteration_id})", "EXEC", "INFO")
         os.write(self.cmd_pipe_write, b'C')
+        # Flush stdout to ensure the command is visible immediately in the terminal
+        import sys
+        sys.stdout.flush()
         
         # Collect results
         results = []

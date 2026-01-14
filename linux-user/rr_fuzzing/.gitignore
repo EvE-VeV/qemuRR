@@ -22,8 +22,9 @@ test/*.strace
 test/rr_test_file.txt
 test/simple_qemu_test.log
 compare/
-data/*
+tests/dataset/*
 __MACOSX/
+crash/*
 
 
 # 文档归档（旧文档）

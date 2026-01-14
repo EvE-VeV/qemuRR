@@ -89,6 +89,7 @@ class DynamicForkController:
                  fuzzing_stats=None,
                  mutation_graph=None,
                  crash_detector=None,
+                 crash_analyzer=None, # ✅ Task #8: Add deep crash analyzer
                  analyzer=None):  # ✅ Task #8: Add crash detector
         """Initialize dynamic fork controller
         
@@ -113,6 +114,7 @@ class DynamicForkController:
         self.fuzzing_stats = fuzzing_stats
         self.mutation_graph = mutation_graph
         self.crash_detector = crash_detector
+        self.crash_analyzer = crash_analyzer # ✅ Layer 5 Analyzer
         self.analyzer = analyzer
         self.last_batch_execs = 0  # ✅ Track executions in last batch
         
@@ -427,29 +429,54 @@ class DynamicForkController:
                                 exec_time=getattr(result, 'exec_time', 0.0)
                             )
 
-                        if result.crashed:
-                            alog(f"💥 CRASH detected for variant {i} at depth={depth}!", "DFC", "WARN")
-                            alog(f"🎯 Crash info: {result.crash_info if hasattr(result, 'crash_info') else 'Unknown crash'}", "DFC", "WARN")
-                            # self.stats['new_paths_discovered'] += 1
-                            any_new_path = True
-                            
-                            # ✅ Update global counter for UI
-                            if self.fuzzing_stats:
-                                self.fuzzing_stats.crashes_found += 1
-                            
-                            if self.crash_detector:
-                                alog(f"Saving crash report...", "DFC", "INFO")
-                                trace_obj = self.current_trace
-                                # Ensure trace object has file_path
-                                if trace_obj and not hasattr(trace_obj, 'file_path'):
-                                    trace_obj = None 
+                            # ✅ Task #8: Deep Analysis & Saving ONLY IF CRASHED
+                            is_unique = False
+                            if result.crashed:
+                                if self.crash_detector:
+                                    alog(f"Saving crash report...", "DFC", "INFO")
+                                    trace_obj = self.current_trace
+                                    # Ensure trace object has file_path
+                                    if trace_obj and not hasattr(trace_obj, 'file_path'):
+                                        trace_obj = None 
+                                    
+                                    # Log crash details to detector
+                                    is_unique = self.crash_detector.save_crash(
+                                        result=result,
+                                        trace=trace_obj,
+                                        mutations=mutations[i] if i < len(mutations) else mutations[0]
+                                    )
+
+                                if is_unique and self.fuzzing_stats:
+                                    self.fuzzing_stats.crashes_found += 1
                                 
-                                # Log crash details to detector
-                                self.crash_detector.save_crash(
-                                    result=result,
-                                    trace=trace_obj,
-                                    mutations=mutations[i] if i < len(mutations) else mutations[0]
-                                )
+                                # ✅ Always notify Layer 5 analyzer for deep statistics
+                                if self.crash_analyzer:
+                                    # Convert objects to dicts for Layer 5 interface
+                                    qemu_status = {
+                                        'signal': result.signal_number,
+                                        'exit_code': result.qemu_exit_code,
+                                        'pc': getattr(result, 'pc', 0),
+                                        'fault_address': getattr(result, 'fault_address', None),
+                                        'backtrace': getattr(result, 'backtrace', [])
+                                    }
+                                    
+                                    m_inst = mutations[i] if i < len(mutations) else mutations[0]
+                                    mutation_recipe = {
+                                        'syscall_index': getattr(m_inst, 'syscall_index', -1),
+                                        'mutations': [str(m_inst)] # Simplified for analyzer
+                                    }
+                                    
+                                    try:
+                                        crash_info = self.crash_analyzer.analyze_crash(
+                                            qemu_status=qemu_status,
+                                            mutation_recipe=mutation_recipe,
+                                            iteration=self.fuzzing_stats.total_execs if self.fuzzing_stats else 0
+                                        )
+                                        self.crash_analyzer.save_crash(crash_info) # ✅ Persist to DB
+                                    except Exception as e:
+                                        alog(f"⚠️ Layer5 Analysis failed: {e}", "DFC", "ERROR")
+                            else:
+                                alog(f"Variant {i} was NOT a crash (status={result.status_name}), skipping analysis.", "DFC", "DEBUG")
 
                             # ✅ Record successful fork
                             self._record_fork_result(success=True)
@@ -602,14 +629,42 @@ class DynamicForkController:
                     )
 
                 # 🔥 FIX: Correct handling after checkpoint restoration
-                if result.crashed:
-                    alog(f"💥 CRASH detected from checkpoint restoration!", "DFC", "WARN")
-                    alog(f"🎯 Crash at checkpoint {checkpoint.checkpoint_id}, depth={checkpoint.depth}", "DFC", "WARN")
-                    self.stats['new_paths_discovered'] += 1
-                    
-                    # ✅ Update global counter for UI
-                    if self.fuzzing_stats:
+                    # ✅ Update global counter for UI ONLY IF NOT DUPLICATE
+                    is_unique = False
+                    if self.crash_detector:
+                        is_unique = self.crash_detector.save_crash(
+                            result=result,
+                            trace=checkpoint.trace_file if isinstance(checkpoint.trace_file, Trace) else self.current_trace,
+                            mutations=next_mutation
+                        )
+
+                    if is_unique and self.fuzzing_stats:
                         self.fuzzing_stats.crashes_found += 1
+                    
+                    # ✅ Notify Layer 5 analyzer
+                    if self.crash_analyzer:
+                        qemu_status = {
+                            'signal': result.signal_number,
+                            'exit_code': result.qemu_exit_code,
+                            'pc': getattr(result, 'pc', 0),
+                            'fault_address': getattr(result, 'fault_address', None),
+                            'backtrace': getattr(result, 'backtrace', [])
+                        }
+                        
+                        mutation_recipe = {
+                            'syscall_index': getattr(next_mutation, 'syscall_index', -1),
+                            'mutations': [str(next_mutation)]
+                        }
+                        
+                        try:
+                            crash_info = self.crash_analyzer.analyze_crash(
+                                qemu_status=qemu_status,
+                                mutation_recipe=mutation_recipe,
+                                iteration=self.fuzzing_stats.total_execs if self.fuzzing_stats else 0
+                            )
+                            self.crash_analyzer.save_crash(crash_info) # ✅ Persist to DB
+                        except Exception as e:
+                            alog(f"⚠️ Layer5 Analysis failed (checkpoint): {e}", "DFC", "ERROR")
                     
                     return True  # crash是成功结果，继续处理其他checkpoints
 

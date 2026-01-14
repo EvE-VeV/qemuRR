@@ -59,6 +59,10 @@ class DualLevelPathFinder:
         # Cache for tree files: path -> (mtime, size, nodes_data, blocks, map)
         self._tree_cache = {}
 
+        # Layer 3: Static CFG (from angr)
+        self.static_branches: List[Dict] = []
+        self.bb_to_func: Dict[int, str] = {}
+        
         self.available = True
 
     # def _setup_logger(self) -> logging.Logger:
@@ -194,8 +198,28 @@ class DualLevelPathFinder:
 
         except Exception as e:
             alog(f"Failed to load syscall tree: {e}", "PathFinder", "ERROR")
-            # import traceback
-            # traceback.print_exc() # Removed as per instruction
+            return False
+
+    def load_static_cfg(self, cfg_file: str) -> bool:
+        """Load whole-program static CFG data exported from StaticAnalyzer."""
+        if not os.path.exists(cfg_file):
+            return False
+        
+        import json
+        try:
+            with open(cfg_file, 'r') as f:
+                data = json.load(f)
+            
+            self.static_branches = data.get('branches', [])
+            self.bb_to_func = data.get('bb_to_func', {})
+            
+            # Convert keys to int (json keys are strings)
+            self.bb_to_func = {int(k): v for k, v in self.bb_to_func.items()}
+            
+            alog(f"✅ Static CFG loaded: {len(self.static_branches)} branches", "PathFinder", "INFO")
+            return True
+        except Exception as e:
+            alog(f"Failed to load static CFG: {e}", "PathFinder", "ERROR")
             return False
 
     def mark_nodes_covered(self, tree_file: str) -> int:
@@ -360,7 +384,7 @@ class DualLevelPathFinder:
         return True
 
 
-    def validate_transition(self, current_syscall_idx: int, next_syscall_idx: int) -> bool:
+    def validate_transition(self, current_syscall_idx: int, next_syscall_idx: int) -> int:
         """
         [Validator] Check if a transition is valid according to the Static CFG.
         
@@ -369,27 +393,31 @@ class DualLevelPathFinder:
             next_syscall_idx: The proposed next syscall node index
             
         Returns:
-            True if the transition exists in the static map (edge exists), False otherwise.
-            If the current node is unknown, defaults to False (conservative).
+            int: A score representing the validity (see VALIDATION_SCORE constants).
         """
+        try:
+            from .constants import VALIDATION_SCORE_KNOWN, VALIDATION_SCORE_UNKNOWN, VALIDATION_SCORE_INVALID
+        except ImportError:
+            from constants import VALIDATION_SCORE_KNOWN, VALIDATION_SCORE_UNKNOWN, VALIDATION_SCORE_INVALID
+
         # 1. Check if current node is known
         if current_syscall_idx not in self.syscall_blocks:
-            # Unknown state - assume invalid to be safe (or True if we want to be permissive?)
-            # For strict validation, return False.
-            return False
+            # Unknown state - return UNKNOWN instead of FALSE to allow exploration
+            return VALIDATION_SCORE_UNKNOWN
             
         block = self.syscall_blocks[current_syscall_idx]
         
         # 2. Check cached edge set for O(1) lookup
         if (current_syscall_idx, next_syscall_idx) in self.syscall_edges:
-            return True
+            return VALIDATION_SCORE_KNOWN
             
-        # 3. Double check successors list (should be consistent with edges, but robustness check)
+        # 3. Double check successors list
         for succ in block.successors:
             if succ.syscall_index == next_syscall_idx:
-                return True
+                return VALIDATION_SCORE_KNOWN
                 
-        return False
+        # 4. If not known, it's an "Unknown Transition" (Exploration opportunity)
+        return VALIDATION_SCORE_UNKNOWN
 
     def find_uncovered_syscall_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:
         """
@@ -415,7 +443,7 @@ class DualLevelPathFinder:
         
         alog(f"Coverage Mapping Analysis: BBs={len(covered_bbs)}, Matched BBs={matched_bb_count}, Mapped Syscalls={len(covered_syscalls)}", "PathFinder", "DEBUG")
 
-        # Accumulate coverage status (do not reset existing status)
+        # Newly covered blocks count
         newly_covered_blocks = 0
         for idx in covered_syscalls:
             if idx in self.syscall_blocks:
@@ -423,8 +451,37 @@ class DualLevelPathFinder:
                     self.syscall_blocks[idx].is_covered = True
                     newly_covered_blocks += 1
 
-        # Step 2: Find uncovered syscall branches
         uncovered_branches = []
+
+        # Step 2: Find uncovered static branches (BB-level)
+        static_uncovered = 0
+        for branch in self.static_branches:
+            src = branch['src_addr']
+            if src in covered_bbs:
+                # Source is covered, check targets
+                for target in branch['targets']:
+                    if target not in covered_bbs:
+                        # Found an uncovered static branch!
+                        # Map back to nearest syscall if possible
+                        syscall_idx = self.bb_to_syscall.get(src, -1)
+                        if syscall_idx != -1:
+                            uncovered_branches.append({
+                                'from_addr': hex(src),
+                                'to_addr': hex(target),
+                                'type': 'static_branch',
+                                'from_syscall_idx': syscall_idx,
+                                'target_syscall_idx': syscall_idx,
+                                'description': f"Static branch in {self.bb_to_func.get(src, 'unknown')}",
+                                'has_syscall': True
+                            })
+                            static_uncovered += 1
+                        break
+        
+        if static_uncovered > 0:
+            alog(f"Added {static_uncovered} static-only branches to exploration set", "PathFinder", "INFO")
+
+        # Step 3: Find uncovered syscall branches (Syscall-level)
+        # (Append to existing list)
 
         # Iterate through all covered syscall blocks
         total_successors = 0
@@ -479,10 +536,10 @@ class DualLevelPathFinder:
             # Build MutationRecipe
             recipe = MutationRecipe(
                 source_branch=from_idx,
-                target_branch=branch['to_syscall_idx'],
+                target_branch=branch.get('to_syscall_idx', -1),
                 syscall_index=from_idx,
                 mutation_type=self._infer_mutation_type(from_block.syscall_name),
-                description=f"Trigger syscall path: {from_block.syscall_name} -> {branch['to_syscall_name']}",
+                description=branch.get('description', f"Trigger path from {from_block.syscall_name}"),
                 priority=10
             )
 

@@ -80,13 +80,13 @@
 | CoverageTracker | coverage.py | 389 | 覆盖率追踪 |
 | SharedCoverage | shared_resources.py | 479 | 多进程共享 |
 | TraceManager | trace_manager.py | 421 | 种子管理 |
-| **Python Total** | - | **7333** | - |
+| **Python Total** | - | **17158** | - |
 | rr_main | rr_main.c | 942 | 框架入口 |
 | rr_fork_server | rr_fork_server.c | 1110 | Fork Server |
 | rr_coverage | rr_coverage.c | 359 | 边覆盖 |
 | rr_fuzz_engine | rr_fuzz_engine.c | 759 | 变异应用 |
-| **C Total** | - | **3170** | - |
-| **Grand Total** | - | **10503** | - |
+| **C Total** | - | **8816** | - |
+| **Grand Total** | - | **25974** | - |
 
 ---
 
@@ -217,55 +217,29 @@ path_finder.py [1409行]
 │   ├── timeout: int = 60
 │   └── graceful_disable: bool = True
 │
-├── MutationRecipe (L68-107)
-│   ├── id, source_branch, target_branch
-│   ├── mutation_type, syscall_index
-│   └── to_dict()
-│
-└── PathFinder (L110-1409)
-    ├── __init__(binary_path, config)
-    ├── build_from_trace(trace_file)       # 动态CFG
-    ├── _build_cfg()                       # 静态CFG (angr)
-    ├── map_trace_to_cfg(bb_sequence)
-    ├── generate_recipes(uncovered_branches)
-    └── enhance_from_trace_files()
+├── DualLevelPathFinder (L50-320 in dual_level_path_finder.py)
+│   ├── static_finder: PathFinder (angr)
+│   ├── dynamic_finder: PathFinder (trace)
+│   └── get_recipes() -> 合并策略
 ```
 
 ### 3.2 双模式CFG构建
 
 ```python
-# 模式1: 动态CFG (build_from_trace) L255-353
-def build_from_trace(self, trace_file):
-    """使用TraceAnalyzer解析trace，无需angr"""
-    analyzer = TraceAnalyzer(trace_file)
-    
-    # 从BB trace构建图
-    for entry in analyzer.bb_trace_parser.entries:
-        node_id = entry.pc & 0xFFFF  # 与coverage bitmap一致
-        nodes[node_id] = entry.pc
-        
-        if entry.syscall_idx >= 0:
-            # 构建BB→Syscall映射
-            self.bb_to_syscall_map[entry.pc] = entry.syscall_idx
-        
-        if prev_node is not None:
-            edges[prev_node].add(node_id)
-        prev_node = node_id
-    
-    self.graph_mode = "dynamic"
-    return True
+# 模式1: 静态分析 (static_finder)
+def _build_static_cfg(self):
+    """使用angr构建静态CFG，作为基准图"""
+    self.project = angr.Project(self.binary_path, load_options={'auto_load_libs': False})
+    self.cfg = self.project.analyses.CFGFast(normalize=True)
 
-# 模式2: 静态CFG (_build_cfg) L411-507
-def _build_cfg(self):
-    """使用angr构建静态CFG"""
-    def run_cfg(fast_mode=False):
-        return self.project.analyses.CFGFast(
-            normalize=True,
-            data_references=not fast_mode
-        )
-    
-    # 带超时保护
-    self.cfg = run_with_timeout(lambda: run_cfg())
+# 模式2: 动态增强 (dynamic_finder)
+def enhance_with_trace(self, trace_file):
+    """利用运行时Trace修正静态图的非直接跳转缺失"""
+    bb_trace = self._parse_bb_trace(trace_file)
+    for i in range(len(bb_trace)-1):
+        src, dst = bb_trace[i], bb_trace[i+1]
+        if not self.cfg.graph.has_edge(src, dst):
+            self.cfg.graph.add_edge(src, dst, type='dynamic')
 ```
 
 ### 3.3 Recipe自动生成

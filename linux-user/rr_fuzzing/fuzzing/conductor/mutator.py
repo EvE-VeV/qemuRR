@@ -33,6 +33,7 @@ try:
     from .io_mutator import IOReturnValueMutator
     from .async_logger import alog
     from .conductor_types import MutationRecipe
+    from .shadow_registry import ShadowRegistry
 except ImportError:
     # Standalone script fallback
     from constants import (
@@ -48,6 +49,7 @@ except ImportError:
     from io_mutator import IOReturnValueMutator
     from async_logger import alog
     from conductor_types import MutationRecipe
+    from shadow_registry import ShadowRegistry
 
 
 class BaseMutator:
@@ -444,6 +446,10 @@ class SmartMutator:
             # Cache for future use
             SmartMutator._trace_cache[trace_file] = self.analyzer
         
+        # Shadow Registry for resource tracking (Phase B)
+        from shadow_registry import ShadowRegistry
+        self.shadow_registry = ShadowRegistry()
+        
         # Get all pure replay syscalls (those with aux_data)
         pure_syscalls = self.analyzer.get_pure_syscalls()
         
@@ -550,6 +556,8 @@ class SmartMutator:
                             filename = sc.arg_data[idx].split(b'\x00')[0].decode('utf-8', errors='ignore')
                         except:
                             filename = str(sc.arg_data[idx])
+                elif sc.name in ['socket', 'accept', 'accept4']:
+                    filename = f"network_{sc.name}"
                 
                 # If it's a system library, or early unknown filename at init phase, add to forbidden set
                 is_library = "/lib/" in filename or "/usr/lib/" in filename or "ld.so.cache" in filename
@@ -570,6 +578,9 @@ class SmartMutator:
                 fd = sc.args[0]
                 if fd in active_forbidden_fds:
                     active_forbidden_fds.discard(fd)
+            
+            # Phase B: Populate ShadowRegistry for resource awareness
+            self.shadow_registry.register_syscall(sc)
         
         forbidden_count = sum(1 for v in self.syscall_forbidden_map.values() if v)
         if forbidden_count > 0:
@@ -841,6 +852,17 @@ class SmartMutator:
             size = recipe.get('size', 4)
             data_template = recipe.get('data_template', 'RANDOM')
             
+            # 🔥 Phase 5 Check: Forbidden Syscall Enforcement
+            from .constants import FORBIDDEN_MUTATION_SYSCALLS
+            all_syscalls = getattr(self.analyzer, 'syscalls', [])
+            target_sc_name = "unknown"
+            if 0 <= syscall_index < len(all_syscalls):
+                target_sc_name = all_syscalls[syscall_index].name
+            
+            if target_sc_name in FORBIDDEN_MUTATION_SYSCALLS:
+                alog(f"Recipe-Safety: Skipping mutation for forbidden syscall {target_sc_name} at index {syscall_index}", "MUTATOR", "WARN")
+                return None
+            
             # Generate actual data based on data_template
             if data_template == 'RANDOM':
                 mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
@@ -991,176 +1013,98 @@ class SmartMutator:
     def _generate_advanced_instruction(self, target_candidate, strategy_type, iteration):
         """
         Generate advanced mutation instruction (fully utilize 11 C-side mutation commands)
-
-        Args:
-            target_candidate: Target syscall candidate
-            strategy_type: Strategy type (0-10)
-            iteration: Iteration count
-
-        Returns:
-            FuzzInstruction: Generated mutation instruction
         """
         index = target_candidate.index
+        instr = None
         
         # Select mutation command based on strategy type
         if strategy_type == 0:
-            # FLIP_BITS - Bit flip (lightweight, keep most data unchanged)
-            num_flips = random.randint(1, 8)  # Flip 1-8 bits
+            # FLIP_BITS
+            num_flips = random.randint(1, 8)
             data = struct.pack('I', num_flips)
-            print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=FLIP_BITS({num_flips} bits)")
-            return FuzzInstruction(index, FUZZ_CMD_FLIP_BITS, 1, data)
+            instr = FuzzInstruction(index, FUZZ_CMD_FLIP_BITS, 1, data, mutation_type='bitflip')
         
         elif strategy_type == 1:
-            # INTERESTING_VALUES - Smart special value injection (chosen based on syscall type)
+            # INTERESTING_VALUES
             syscall_name = target_candidate.name.lower()
-
             if 'read' in syscall_name or 'recv' in syscall_name:
-                # Input syscall: Use various attack patterns
-                pattern_type = random.randint(0, 7)  # 8 modes (matches C-side switch)
+                pattern_type = random.randint(0, 7)
                 data = struct.pack('B', pattern_type)
-                print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=INTERESTING_VALUES(vuln_pattern={pattern_type})")
+                instr = FuzzInstruction(index, FUZZ_CMD_INTERESTING_VALUES, 1, data, mutation_type='vuln_pattern')
             else:
-                # Other syscalls: Use traditional boundary values
-                boundary_values = [
-                    0, 1, -1,                           # Basic boundaries
-                    0x7F, 0x80, 0xFF,                   # 8-bit boundaries
-                    0x7FFF, 0x8000, 0xFFFF,             # 16-bit boundaries
-                    0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, # 32-bit boundaries
-                    0x100, 0x400, 0x1000,               # Page size related
-                ]
+                boundary_values = [0, 1, -1, 0xFF, 0xFFFF, 0x7FFFFFFF, 0xFFFFFFFF]
                 value = random.choice(boundary_values)
                 data = struct.pack('Q', value & 0xFFFFFFFFFFFFFFFF)
-                print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=INTERESTING_VALUES(0x{value:x})")
-            return FuzzInstruction(index, FUZZ_CMD_INTERESTING_VALUES, 1, data)
+                instr = FuzzInstruction(index, FUZZ_CMD_INTERESTING_VALUES, 1, data, mutation_type='interesting_value')
         
         elif strategy_type == 2:
+            # TRUNCATE
             truncate_to = random.randint(0, 8)
             data = struct.pack('I', truncate_to)
-            return FuzzInstruction(index, FUZZ_CMD_TRUNCATE, 1, data)
+            instr = FuzzInstruction(index, FUZZ_CMD_TRUNCATE, 1, data, mutation_type='truncate')
         
         elif strategy_type == 3:
-            # EXTEND - Increase data size to trigger buffer overflows
-            if self.is_stagnant or iteration % 10 == 0:
-                extend_by = random.choice([64, 128, 256, 512, 1024])
-            else:
-                extend_by = random.choice([1, 4, 16, 32, 64, 128])
-            mutation_data = struct.pack('I', extend_by)
-            return FuzzInstruction(index, FUZZ_CMD_EXTEND, 1, mutation_data)
+            # EXTEND
+            extend_by = random.choice([1, 4, 16, 64, 256, 1024])
+            data = struct.pack('I', extend_by)
+            instr = FuzzInstruction(index, FUZZ_CMD_EXTEND, 1, data, mutation_type='extend')
         
         elif strategy_type == 4:
+            # LIGHT_MUTATION
             num_flips = random.randint(1, 2)
             data = struct.pack('I', num_flips)
-            return FuzzInstruction(index, FUZZ_CMD_LIGHT_MUTATION, 1, data)
+            instr = FuzzInstruction(index, FUZZ_CMD_LIGHT_MUTATION, 1, data, mutation_type='light_mutation')
         
         elif strategy_type == 5:
-            # MUTATE_AUX_BUFFER - Mutate auxiliary buffer
-            # Randomly modify a few bytes in the buffer
+            # MUTATE_AUX_BUFFER
             num_changes = random.randint(1, 4)
             data = struct.pack('I', num_changes)
-            print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=MUTATE_AUX_BUFFER({num_changes} bytes)")
-            return FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, data)
+            instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, data, mutation_type='aux_buffer')
         
         elif strategy_type == 6:
-            # REPLACE_BUFFER - Completely replace buffer (small data)
+            # REPLACE_BUFFER (small)
             size = random.choice([4, 8, 16, 32])
             data = bytes([random.randint(0, 255) for _ in range(size)])
-            print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes)")
-            return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data)
+            instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer')
         
         elif strategy_type == 7:
-            # REPLACE_BUFFER - Large buffer replacement for overflow testing
-            if self.is_stagnant or iteration % 15 == 0:
-                size = random.choice([128, 256, 512, 1024])
-                pattern = random.choice([b'A', b'B', b'X', b'\x41'])
-                mutation_data = pattern * size
-            else:
-                size = random.choice([64, 128, 256])
-                mutation_data = bytes([random.randint(0, 255) for _ in range(size)])
-            print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=REPLACE_BUFFER({size} bytes, large)")
-            return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data)
-        
+            # REPLACE_BUFFER (large)
+            size = random.choice([128, 512, 1024])
+            pattern = random.choice([b'A', b'\x00', b'\xFF'])
+            data = pattern * size
+            instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer_large')
+            
+        elif strategy_type == 8:
+            # BOUNDARY_VALUE
+            value = random.choice([0, -1, 0x7FFFFFFF, 0xFFFFFFFF, 1024, 4096])
+            data = struct.pack('q', value)
+            instr = FuzzInstruction(index, FUZZ_CMD_BOUNDARY_VALUE, 1, data, mutation_type='boundary_value')
+
         elif strategy_type == 9:
-            # Vulnerability pattern injection
-            vuln_patterns = {
-                'format_string': [
-                    b'%s%s%s%s%n',           
-                    b'%x%x%x%x%x%x',         
-                    b'%p%p%p%p',             
-                    b'%08x.%08x.%08x',       
-                ],
-                'injection': [
-                    b"'; DROP TABLE users;--",  
-                    b"' OR '1'='1",            
-                    b"$(id)",                  
-                    b"`whoami`",               
-                    b"|cat /etc/passwd",       
-                ],
-                'ftp_commands': [
-                   b'USER ' + b'A' * 2048 + b'\r\n',
-                   b'PASS ' + b'A' * 2048 + b'\r\n', 
-                   b'STOR ' + b'A' * 2048 + b'\r\n',
-                   b'APPE ' + b'A' * 2048 + b'\r\n',
-                   b'DELE ' + b'A' * 2048 + b'\r\n',
-                   b'RMD ' + b'A' * 2048 + b'\r\n',
-                   b'MKD ' + b'A' * 2048 + b'\r\n',
-                   b'PWD\r\n', b'LIST\r\n', b'SYST\r\n',
-                   b'SITE CHMOD 777 ' + b'A' * 256 + b'\r\n',
-                ],
-                'path_traversal': [
-                    b'/../../../etc/passwd',    
-                    b'..\\..\\..\\windows\\system32\\drivers\\etc\\hosts',  
-                    b'/proc/self/environ',      
-                    b'/dev/urandom',            
-                ],
-                'overflow_patterns': [
-                    b'A' * 256,                 
-                    b'\x41' * 512 + b'\x42\x43\x44\x45',  
-                    b'%n' * 100,
-                    b'A' * 4096, # Page size
-                    b'A' * 8192,                
-                ],
-                'special_chars': [
-                    b'\x00' * 32,               
-                    b'\xFF' * 32,               
-                    b'\x0A\x0D' * 16,          
-                    b'\x80\x81\x82\x83',       
-                ],
-                'unicode_attacks': [
-                    b'\xC0\xAE\xC0\xAE\x2f',  
-                    b'\xEF\xBB\xBF',          
-                    b'\x00\x41\x00\x42',      
-                ],
-                'race_condition': [
-                    b'AAAAAAAAAAAAAAAA',        
-                    b'1234567890' * 10,        
-                    b'test\x00test\x00',       
-                ]
-            }
+            # MUTATE_FLAGS
+            data = struct.pack('B', random.choice([1, 4]))
+            instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, data, mutation_type='flags')
 
-            syscall_name = target_candidate.name.lower()
-            if 'read' in syscall_name or 'recv' in syscall_name:
-                pattern_type = random.choice(['format_string', 'injection', 'overflow_patterns', 'special_chars', 'ftp_commands'])
-            elif 'write' in syscall_name or 'send' in syscall_name:
-                pattern_type = random.choice(['format_string', 'special_chars', 'unicode_attacks', 'ftp_commands'])
-            elif 'open' in syscall_name:
-                pattern_type = random.choice(['path_traversal', 'special_chars'])
-            else:
-                pattern_type = random.choice(['overflow_patterns', 'special_chars', 'race_condition'])
+        elif strategy_type == 10:
+            # OVERWRITE_AT_OFFSET
+            offset = random.randint(0, 16)
+            val = random.randint(0, 255)
+            data = struct.pack('BB', offset, val)
+            instr = FuzzInstruction(index, FUZZ_CMD_OVERWRITE_AT_OFFSET, 1, data, mutation_type='overwrite_offset')
+            
+        # 🔥 Phase B: Resource-Aware Rails Correction
+        if instr and target_candidate.uses_fd:
+            # For most IO syscalls, arg 0 is the FD
+            # If the instruction targets arg 0, or is a generic mutation that might affect it
+            # (Though here most instructions target 'aux_data' via cmd, we can also add MUTATE_ARG support)
+            
+            if instr.cmd in [FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_INTERESTING_VALUES] and instr.arg_index == 0:
+                # Correct the FD to a valid one from registry
+                valid_fd = self.shadow_registry.get_random_valid_fd()
+                instr.data = struct.pack('Q', valid_fd & 0xFFFFFFFFFFFFFFFF)
+                # alog(f"Resource-Aware: Corrected FD to {valid_fd} for {target_candidate.name}", "MUTATOR", "DEBUG")
 
-            mutation_data = random.choice(vuln_patterns[pattern_type])
-            return FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, mutation_data)
-        
-        else:
-            # MUTATE_FLAGS - Flag mutation
-            if random.random() < 0.7:
-                # Single bit flip
-                data = struct.pack('B', 1)
-                print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(single bit)")
-            else:
-                # Multi bit flip
-                data = struct.pack('B', 4)
-                print(f"[Mutator]   Target: index={index}, name={target_candidate.name}, cmd=MUTATE_FLAGS(multi bits)")
-            return FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, data)
+        return instr
     
     def _generate_io_mutations(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
         """Generate IO return value mutation instructions for SmartMutator
@@ -1262,15 +1206,14 @@ class SmartMutator:
         Smart mutation strategy: Systematic + Recipe-driven
         Uses shared analyzer if available.
         """
+        # Phase B: Sync ShadowRegistry to fork_point to have accurate resource state
+        if fork_point is not None:
+            self.shadow_registry.sync_to_index(self.syscalls, fork_point)
+            
         # Prioritize IO return value mutation if enabled (Layer 1.5)
         if self.use_io_mutation and random.random() < self.io_mutation_prob:
             return self._generate_io_mutations(trace, fork_point, analyzer=self.analyzer)
-        
-        # (ensures mutation target >= fork_point)
-        
-        # Returns:
-        #     list: List of FuzzInstructions
-        # """
+            
         iteration = getattr(trace.metadata, 'exec_count', 0) if hasattr(trace, 'metadata') else 0
         return self.build_fuzz_instructions(iteration, fork_point=fork_point)
     

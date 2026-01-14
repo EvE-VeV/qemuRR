@@ -26,27 +26,15 @@ rr_fuzzing/
 ├── meson.build                  # Meson构建配置
 ├── reproduce_crash.py           # Crash复现脚本
 │
-├── analysis/                    # 📊 分析输出目录
-│   ├── rrfuzz_complete_architecture.md
-│   ├── complete_system_analysis.md
-│   └── deep_architecture_analysis.md
-│
-├── analysis_reports/            # 📋 详细分析报告
-│   ├── 00_EXECUTIVE_SUMMARY.md
-│   ├── 01_ARCHITECTURE_OVERVIEW.md
-│   ├── 02_DATA_FLOW_ANALYSIS.md
-│   ├── 03_CONTROL_FLOW_ANALYSIS.md
-│   ├── 04_FUNCTION_LEVEL_ANALYSIS.md
-│   ├── 05_C_PYTHON_INTERACTION.md
-│   ├── 06_PERFORMANCE_ANALYSIS.md
-│   ├── 07_CODE_QUALITY_GAPS.md
-│   ├── 08_MISSING_FEATURES_ANALYSIS.md
-│   ├── 09_EXPLORATION_STRATEGIES_ANALYSIS.md
-│   ├── 10_PERFORMANCE_REALITY_CHECK.md
-│   └── something_else/          # 其他分析
+├── reproduce_crash.py           # Crash复现脚本
 │
 ├── config/                      # ⚙️ 配置模板
 │   ├── template/
+│   │   ├── rr_config.fuzzing.template
+│   │   ├── rr_config.record.template
+│   │   └── rr_config.replay.template
+│   └── usrdef/
+││   ├── template/
 │   │   ├── rr_config.fuzzing.template
 │   │   ├── rr_config.record.template
 │   │   └── rr_config.replay.template

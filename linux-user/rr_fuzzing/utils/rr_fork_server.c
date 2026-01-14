@@ -702,7 +702,7 @@ int rr_fork_server_loop(void)
                                 RR_WARN("Child process timeout, forcibly terminating PID=%d", pid);
                                 kill(pid, SIGKILL);
                                 waitpid(pid, &status, 0); // Cleanup
-                                rr_ipc_send_status(3); // Send Normal Exit instead of Error
+                                rr_ipc_send_status(6); // STATUS_TIMEOUT (6) instead of Normal Exit (3)
                                 g_rr_framework->child_pid = 0;
                                 // Continue normal flow; let Python proceed to next iteration
                             }

@@ -34,6 +34,7 @@ from .mutation_dependency_graph import MutationDependencyGraph
 from .async_logger import AsyncLogger, alog
 from .watchdog import FuzzingWatchdog
 from .checkpoint import CheckpointManager
+from .static_analyzer import StaticAnalyzer
 
 # Ensure parent directory is in sys.path for internal imports
 _fuzzing_dir = Path(__file__).parent.parent.resolve()
@@ -417,6 +418,7 @@ class FuzzingCore:
                     fuzzing_stats=self.stats,
                     mutation_graph=self.mutation_graph,
                     crash_detector=self.crash_detector,
+                    crash_analyzer=self.layer5_crash_analyzer, # ✅ Pass Layer 5 Analyzer
                     analyzer=initial_analyzer
                 )
                 alog(f"DynamicForkController enabled (Depth-First mode)", "CORE", "INFO")
@@ -474,12 +476,22 @@ class FuzzingCore:
                  # DualLevelPathFinder uses simplified initialization
                  self.path_finder = PathFinder(self.target_binary, config=None)
             
-            # 2. Injection logic
-            if isinstance(self.mutator, SmartMutator) and not getattr(self.mutator, 'path_finder', None):
                  alog(f"💉 Injecting PathFinder into Mutator", "CORE", "INFO")
                  self.mutator.path_finder = self.path_finder
 
-            # 3. Component enablement
+            # 3. Static Analysis Augmentation (Phase C)
+            if self.target_binary:
+                cfg_cache = os.path.join("/tmp", f"static_cfg_{os.path.basename(self.target_binary)}.json")
+                if not os.path.exists(cfg_cache):
+                    alog(f"🔍 Running Static Analysis on {self.target_binary}...", "CORE", "INFO")
+                    analyzer = StaticAnalyzer(self.target_binary)
+                    if analyzer.analyze():
+                        analyzer.save_results(cfg_cache)
+                
+                if os.path.exists(cfg_cache):
+                    self.path_finder.load_static_cfg(cfg_cache)
+
+            # 4. Component enablement
             if _HAS_RECIPE_POOL and RecipePool is not None:
                 self.recipe_pool = RecipePool(max_active=50, retirement_threshold=100)
             
@@ -951,11 +963,23 @@ class FuzzingCore:
                     recipe = getattr(self.mutator, 'last_recipe_used', None)
                     # Only validate if the recipe explicitly targets a control flow transition (has known source/target)
                     if recipe and hasattr(recipe, 'source_branch') and hasattr(recipe, 'target_branch'):
-                         # Validator Check
-                         is_valid = self.path_finder.validate_transition(recipe.source_branch, recipe.target_branch)
-                         if not is_valid:
-                             # alog(f"🛑 Validator BLOCKED invalid transition: {recipe.source_branch} -> {recipe.target_branch}", "CORE", "DEBUG")
-                             continue # Skip execution (Drop Mutation)
+                         # Validator Check (Phase A: Relax & Rank)
+                         validation_score = self.path_finder.validate_transition(recipe.source_branch, recipe.target_branch)
+                         
+                         from .constants import VALIDATION_SCORE_INVALID, VALIDATION_SCORE_UNKNOWN
+                         
+                         if validation_score == VALIDATION_SCORE_INVALID:
+                             # Absolute resource failure (Phase B) - Block it
+                             alog(f"🛑 Validator BLOCKED invalid resource: {recipe.source_branch} -> {recipe.target_branch}", "CORE", "DEBUG")
+                             continue
+                         
+                         elif validation_score == VALIDATION_SCORE_UNKNOWN:
+                             # Unknown path (Exploration) - Allow but give lower priority/energy
+                             # We can handle energy adjustment here or later in the executor
+                             recipe.priority = max(1, recipe.priority // 2)
+                             alog(f"🔍 Validator DETECTED unknown path (Exploring): {recipe.source_branch} -> {recipe.target_branch}", "CORE", "DEBUG")
+                         
+                         # If it's VALIDATION_SCORE_KNOWN (10), we proceed normally with high priority
 
                 if m:
                     fork_to_mutations[fork_point].append(m)
@@ -1177,10 +1201,41 @@ class FuzzingCore:
                 # Step 6: Crash Detection and Saving
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 if result.crashed:
-                    self.stats.crashes_found += 1
-                    crashes_found_count += 1
-                    print(f"[FuzzingCore] 💥 CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
-                    self.crash_detector.save_crash(result, trace, mutations)
+                    # ✅ Corrected counting logic: only increment if unique
+                    is_unique = self.crash_detector.save_crash(result, trace, mutations)
+                    
+                    if is_unique:
+                        self.stats.crashes_found += 1
+                        crashes_found_count += 1
+                        print(f"[FuzzingCore] 💥 NEW UNIQUE CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
+                    else:
+                        print(f"[FuzzingCore] 💥 Duplicate crash ignored (Stats consistency)")
+
+                    # ✅ Always notify Layer 5
+                    if self.layer5_crash_analyzer:
+                        qemu_status = {
+                            'signal': result.signal_number,
+                            'exit_code': result.qemu_exit_code,
+                            'pc': getattr(result, 'pc', 0),
+                            'fault_address': getattr(result, 'fault_address', None),
+                            'backtrace': getattr(result, 'backtrace', [])
+                        }
+                        
+                        m_inst = mutations
+                        mutation_recipe = {
+                            'syscall_index': getattr(m_inst, 'syscall_index', -1),
+                            'mutations': [str(m_inst)]
+                        }
+                        
+                        try:
+                            crash_info = self.layer5_crash_analyzer.analyze_crash(
+                                qemu_status=qemu_status,
+                                mutation_recipe=mutation_recipe,
+                                iteration=self.stats.total_execs
+                            )
+                            self.layer5_crash_analyzer.save_crash(crash_info) # ✅ Persist to DB
+                        except Exception as e:
+                            alog(f"⚠️ Layer5 Analysis failed (Core): {e}", "CORE", "ERROR")
 
                 # Handle timeouts
                 if result.timeout:
@@ -1247,7 +1302,7 @@ class FuzzingCore:
                 os.environ["RR_TREE_OUTPUT"] = str(tree_output_path.absolute())
                 alog(f"[FuzzingCore] 🌲 PathFinder Syscall Tree Configured: output={tree_output_path}", "CORE")
 
-            if self.enable_visualizer:
+            if self.enable_tree_viz:
                 # Clear old pipe vars if any
                 if "RR_TRACE_PIPE" in os.environ:
                     del os.environ["RR_TRACE_PIPE"]
@@ -1369,7 +1424,6 @@ class FuzzingCore:
 
                 # 🔥 Advanced stop condition check
                 if not infinite_mode:
-                    # Base conditions
                     # Basic conditions
                     if max_iterations and iteration >= max_iterations:
                         alog(f"✅ Maximum iterations reached ({max_iterations})", "CORE", "INFO")
@@ -1412,8 +1466,12 @@ class FuzzingCore:
                 iteration += 1
                 self.total_iterations = iteration
         
-        except KeyboardInterrupt:
-            alog(f"User interrupted", "CORE", "WARN")
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                alog(f"User interrupted", "CORE", "WARN")
+            else:
+                alog(f"🛑 Fuzzer terminated by exception: {type(e).__name__}: {e}", "CORE", "ERROR")
+                raise
         
         finally:
             # 🛑 Stop Watchdog

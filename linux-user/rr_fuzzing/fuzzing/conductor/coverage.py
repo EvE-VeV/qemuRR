@@ -216,9 +216,9 @@ class CoverageTracker:
                 
                 # Only log detail if new coverage found
                 if new_coverage:
-                    alog(log_msg + " [NEW COV]", "COV")
-                elif self.total_executions % 200 == 0: # Log keepalive less frequently
-                     alog(log_msg, "COV")
+                    alog(f"Exec #{self.total_executions}: Edges={current_edge_count}, New={new_edges}, Total={edges_after} [NEW COV]", "COV")
+                elif self.total_executions % 100 == 0: # Log keepalive every 100 iterations
+                     alog(f"Exec #{self.total_executions}: LiveEdges={current_edge_count}, GlobalTotal={edges_after} (Bitmap: {actual_total_edges})", "COV")
 
             # Periodic statistics update
             if self.total_executions % 500 == 0:

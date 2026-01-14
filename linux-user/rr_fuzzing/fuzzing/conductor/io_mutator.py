@@ -45,7 +45,9 @@ class IOReturnValueMutator:
     def __init__(self):
         self.io_syscall_names = [
             'read', 'write', 'recv', 'send', 'recvfrom',
-            'sendto', 'recvmsg', 'sendmsg', 'getrandom'
+            'sendto', 'recvmsg', 'sendmsg', 'getrandom',
+            'pread64', 'pwrite64', 'readv', 'writev', 
+            'preadv', 'pwritev', 'sendmmsg', 'recvmmsg'
         ]
 
         # 典型的返回值策略
@@ -63,7 +65,8 @@ class IOReturnValueMutator:
                 128, 150, 200, 250, 256, 300, 400, 500, 512, 600, 700, 800, 900, 1000,
                 # 极端值
                 1024, 2048, 4096
-            ]
+            ],
+            'error_injection': [-1, -2, -9, -13, -14, -32, -104, -111] # EPERM, EIO, EBADF, EACCES, EFAULT, EPIPE, ECONNRESET, ECONNREFUSED
         }
 
     def identify_io_syscalls(self, trace, analyzer: Optional[Any] = None) -> List[Dict[str, Any]]:
@@ -98,11 +101,10 @@ class IOReturnValueMutator:
 
                 # Filter read() calls that are likely not user inputs
                 # 启发式规则：
-                # 1. 跳过返回值很大的read (>200字节) - 可能是读文件
-                # 2. 优先选择靠后的read - 用户输入通常在初始化之后
-                if syscall_name == 'read' and retval > 200:
-                    alog(f"Skipping read @{idx} (retval={retval} > 200, likely file read)", "IOReturnValueMutator", "DEBUG")
-                    continue
+                # The 200-byte limit was harmful. Removed to allow fuzzing deep protocol logic.
+                # Heuristic: only skip if it's explicitly identified as a library file by Mutator's FD tracking.
+                # (But here we don't have the map yet, so we allow all and let Mutator.mutate filter if needed)
+                pass
 
                 io_syscalls.append({
                     'index': idx,
@@ -203,6 +205,10 @@ class IOReturnValueMutator:
             else:
                 # 其他IO syscall - 使用boundary策略
                 mutations = self.generate_mutations_for_io(io_syscall, 'boundary')
+            
+            # 随机混入错误注入策略
+            if random.random() < 0.3: # 30% chance to also inject errors
+                mutations.extend(self.generate_mutations_for_io(io_syscall, 'error_injection'))
 
             # 限制每个IO的变异数量
             if len(mutations) > max_mutations_per_io:
@@ -255,6 +261,9 @@ class IOReturnValueMutator:
             elif 70 < val <= 200:
                 # 大值范围（明显溢出）
                 return 180 + base_score
+            elif val < 0:
+                # 错误注入 - 高优先级！
+                return 190 + base_score
             else:
                 # 极大值（极端溢出）
                 return 160 + base_score
