@@ -36,7 +36,7 @@ from conductor.trace_manager import TraceManager, Trace
 try:
     from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
 except ImportError:
-    from .dual_level_path_finder import DualLevelPathFinder as PathFinder
+    from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
 from .recipe_pool import RecipePool
 from conductor.async_logger import alog
 from conductor.constants import PRIMARY_IO_SYSCALLS

@@ -556,6 +556,54 @@ static void capture_syscall_args_aux(CPUArchState *env, int syscall_nr,
             break;
 #endif
 
+#ifdef TARGET_NR_accept
+        case TARGET_NR_accept:
+#endif
+#ifdef TARGET_NR_accept4
+        case TARGET_NR_accept4:
+#endif
+#ifdef TARGET_NR_getsockname
+        case TARGET_NR_getsockname:
+#endif
+#ifdef TARGET_NR_getpeername
+        case TARGET_NR_getpeername:
+#endif
+            /* Capture sockaddr structure (arg 1) */
+            if (ret >= 0 && args[1] != 0 && args[2] != 0) {
+                uint32_t addr_len;
+                if (cpu_memory_rw_debug(env_cpu(env), args[2], (uint8_t*)&addr_len, sizeof(uint32_t), 0) == 0) {
+                    if (addr_len > 0 && addr_len <= 128) {
+                        uint8_t *data = rr_capture_buffer(env, args[1], addr_len);
+                        if (data) {
+                            rr_aux_data_t *aux = rr_aux_create(AUX_BUFFER, 1, data, addr_len);
+                            if (aux) {
+                                rr_aux_append(&record->aux_data, aux);
+                                record->has_aux_data = true;
+                                RR_VERBOSE("RR-NETWORK: Captured %u bytes sockaddr for syscall %d", addr_len, syscall_nr);
+                            }
+                            g_free(data);
+                        }
+                    }
+                }
+            }
+            break;
+
+#ifdef TARGET_NR_bind
+        case TARGET_NR_bind:
+#endif
+#ifdef TARGET_NR_listen
+        case TARGET_NR_listen:
+#endif
+#ifdef TARGET_NR_setsockopt
+        case TARGET_NR_setsockopt:
+#endif
+            /* These don't return data in buffers, but we mark them as having aux_data
+             * to trigger Pure Replay (which will just return the recorded retval).
+             */
+            record->has_aux_data = true;
+            RR_VERBOSE("RR-NETWORK: Marked syscall %d as having aux_data for pure replay", syscall_nr);
+            break;
+
         default:
             /* Other syscalls do not support aux_data yet */
             break;
@@ -730,6 +778,8 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                 record->arg_data[0] = rr_capture_buffer(env, args[0], sizeof(struct timeval));
                 if (record->arg_data[0]) {
                     record->arg_size[0] = sizeof(struct timeval);
+                    /* Promote to aux_data for Pure Replay */
+                    rr_promote_arg_to_aux(record, 0, NULL, 0);
                 }
             }
             break;
@@ -741,6 +791,8 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
                 record->arg_data[1] = rr_capture_buffer(env, args[1], sizeof(struct timespec));
                 if (record->arg_data[1]) {
                     record->arg_size[1] = sizeof(struct timespec);
+                    /* Promote to aux_data for Pure Replay */
+                    rr_promote_arg_to_aux(record, 1, NULL, 0);
                 }
             }
             break;

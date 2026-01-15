@@ -3212,6 +3212,18 @@ static abi_long do_socket(int domain, int type, int protocol)
 
     ret = get_errno(socket(domain, type, protocol));
     if (ret >= 0) {
+        // FUZZING: Auto-enable SO_REUSEADDR + SO_REUSEPORT for port sharing
+        const char *rr_mode = getenv("RR_MODE");
+        if (rr_mode && strcmp(rr_mode, "fuzzing") == 0) {
+            int optval = 1;
+            // SO_REUSEADDR allows immediate reuse of addresses
+            setsockopt(ret, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+            // SO_REUSEPORT allows multiple sockets to bind to same port
+            #ifdef SO_REUSEPORT
+            setsockopt(ret, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+            #endif
+        }
+        
         ret = sock_flags_fixup(ret, target_type);
         if (type == SOCK_PACKET) {
             /* Manage an obsolete case :

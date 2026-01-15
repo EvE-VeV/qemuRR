@@ -205,6 +205,60 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
             break;
         }
 
+
+
+        /* Network Syscalls Support - Pure Replay */
+        case TARGET_NR_bind:
+        case TARGET_NR_listen:
+        case TARGET_NR_setsockopt:
+            /* These typically check inputs or set state but don't return data in buffers (mostly).
+             * We just return the recorded retval to simulate success.
+             */
+            RR_VERBOSE("PURE_REPLAY: Network setup syscall %d, mocking success with ret=%ld", num, (long)record->retval);
+            return record->retval;
+
+#ifdef TARGET_NR_gettimeofday
+        case TARGET_NR_gettimeofday: {
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0);
+            if (aux && aux->data && aux->size > 0) {
+                if (cpu_memory_rw_debug(env_cpu(env), args[0], aux->data, aux->size, 1) == 0) {
+                    RR_VERBOSE("PURE_REPLAY: Restored timeval for gettimeofday()");
+                    return record->retval;
+                }
+            }
+            break;
+        }
+#endif
+
+#ifdef TARGET_NR_clock_gettime
+        case TARGET_NR_clock_gettime: {
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
+            if (aux && aux->data && aux->size > 0) {
+                if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
+                    RR_VERBOSE("PURE_REPLAY: Restored timespec for clock_gettime()");
+                    return record->retval;
+                }
+            }
+            break;
+        }
+#endif
+
+        case TARGET_NR_accept:
+        case TARGET_NR_accept4:
+        case TARGET_NR_getsockname:
+        case TARGET_NR_getpeername: {
+             /* These return a sockaddr in the second argument (args[1]) */
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
+            if (aux && aux->data && aux->size > 0) {
+                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
+                     RR_VERBOSE("PURE_REPLAY: Restored %u bytes sockaddr for syscall %d", aux->size, num);
+                 } else {
+                     RR_ERROR("PURE_REPLAY: Failed to write sockaddr for syscall %d", num);
+                 }
+            }
+            return record->retval;
+        }
+
         default:
             /* Other syscalls not yet supported in Pure Replay */
             RR_VERBOSE("PURE_REPLAY: Syscall %d not supported in pure mode", num);
@@ -221,6 +275,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
  */
 bool rr_replay_pure_supported(int syscall_nr)
 {
+    // RR_VERBOSE("PURE_REPLAY_SUPPORT: checking syscall %d\n", syscall_nr);
     switch (syscall_nr) {
         case TARGET_NR_brk:
             return true;
@@ -248,6 +303,20 @@ bool rr_replay_pure_supported(int syscall_nr)
         case TARGET_NR_sendto:
 #endif
         case TARGET_NR_ioctl: /* Task2: ioctl Pure Replay */
+        /* Network Syscalls */
+        case TARGET_NR_bind:
+        case TARGET_NR_listen:
+        case TARGET_NR_setsockopt:
+        case TARGET_NR_accept:
+        case TARGET_NR_accept4:
+        case TARGET_NR_getsockname:
+        case TARGET_NR_getpeername:
+#ifdef TARGET_NR_gettimeofday
+        case TARGET_NR_gettimeofday:
+#endif
+#ifdef TARGET_NR_clock_gettime
+        case TARGET_NR_clock_gettime:
+#endif
             return true;
         default:
             return false;

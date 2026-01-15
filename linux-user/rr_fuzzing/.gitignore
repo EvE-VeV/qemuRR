@@ -25,7 +25,7 @@ compare/
 tests/dataset/*
 __MACOSX/
 crash/*
-
+tests/realworld/
 
 # 文档归档（旧文档）
 docs/old-archive/
