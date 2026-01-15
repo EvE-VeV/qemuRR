@@ -15,7 +15,7 @@ import random
 import hashlib
 import multiprocessing as mp
 from pathlib import Path
-from typing import List, Set, Optional, Any
+from typing import List, Set, Optional, Any, Dict
 from dataclasses import dataclass
 
 # Coverage bitmap size (64KB standard)
@@ -71,35 +71,44 @@ class SharedCoverage:
     _revision = None # Global revision counter (mp.Value)
 
     @classmethod
-    def _ensure_shared_resources(cls):
-        """Ensure shared resources are initialized (only once)"""
-        if cls._shared_array is None:
-            cls._shared_array = mp.Array('B', COVERAGE_MAP_SIZE)  # unsigned char array
-            cls._lock = mp.Lock()
-            cls._revision = mp.Value('L', 0) # Unsigned long revision counter
+    def _create_shared_resources(cls):
+        """Create shared resources (should be called in parent process)"""
+        return {
+            'array': mp.Array('B', COVERAGE_MAP_SIZE),
+            'lock': mp.Lock(),
+            'revision': mp.Value('L', 0)
+        }
 
-    def __init__(self, worker_id: int = 0):
+    def __init__(self, worker_id: int = 0, shared_objects: Optional[Dict] = None):
         """
         Initialize shared coverage
 
         Args:
             worker_id: Worker ID
+            shared_objects: Optional dict containing 'array', 'lock', 'revision'
         """
-        # Ensure shared resources exist
-        SharedCoverage._ensure_shared_resources()
+        if shared_objects:
+            self.shared_array = shared_objects['array']
+            self.lock = shared_objects['lock']
+            self.revision = shared_objects['revision']
+        else:
+            # Fallback for solo/legacy mode
+            if SharedCoverage._shared_array is None:
+                res = SharedCoverage._create_shared_resources()
+                SharedCoverage._shared_array = res['array']
+                SharedCoverage._lock = res['lock']
+                SharedCoverage._revision = res['revision']
+            
+            self.shared_array = SharedCoverage._shared_array
+            self.lock = SharedCoverage._lock
+            self.revision = SharedCoverage._revision
 
         self.worker_id = worker_id
-
-        # Reference class-level shared resources
-        self.shared_array = SharedCoverage._shared_array
-        self.lock = SharedCoverage._lock
-        self.revision = SharedCoverage._revision
-
         # Local copy (reduce lock contention, fast query)
         self.local_bitmap = bytearray(COVERAGE_MAP_SIZE)
         self.local_revision = 0 # Last synced revision
 
-        print(f"[SharedCoverage] Worker {worker_id} initialized with mp.Array and revision counter")
+        print(f"[SharedCoverage] Worker {worker_id} initialized (Shared Mode: {shared_objects is not None})")
     
     def sync_coverage(self) -> int:
         """
@@ -226,7 +235,8 @@ class SharedCoverage:
         return new_edges
     
     def get_coverage_count(self) -> int:
-        """Get current coverage count"""
+        """Get current coverage count (performs sync first)"""
+        self.sync_coverage()
         return sum(1 for b in self.local_bitmap if b > 0)
     
     @classmethod

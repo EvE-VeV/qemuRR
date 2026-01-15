@@ -131,7 +131,8 @@ class FuzzMaster:
         self.worker_stats: Dict[int, WorkerStats] = {}
 
         # ✅ Shared resources - use SharedCoverage for process-safe sync
-        self.shared_coverage = SharedCoverage(worker_id=0)  # Master uses worker_id=0
+        self.shared_objects = SharedCoverage._create_shared_resources()
+        self.shared_coverage = SharedCoverage(worker_id=0, shared_objects=self.shared_objects)  # Master uses worker_id=0
         self.global_trace_count = 0
         self.global_crash_count = 0
         
@@ -209,7 +210,7 @@ class FuzzMaster:
         )
     
     @staticmethod
-    def _worker_main(config: WorkerConfig, iterations_per_sync: int = 100):
+    def _worker_main(config: WorkerConfig, shared_objects: Dict, iterations_per_sync: int = 100):
         """
         Worker main function (runs in separate process)
         
@@ -238,8 +239,8 @@ class FuzzMaster:
         print(f"[Worker{worker_id}] Starting...")
 
         try:
-            # ✅ Create SharedCoverage (all workers share one multiprocessing.Array)
-            shared_coverage = SharedCoverage(worker_id=worker_id)
+            # ✅ Create SharedCoverage (all workers share the passed objects)
+            shared_coverage = SharedCoverage(worker_id=worker_id, shared_objects=shared_objects)
 
             # Create mutator
             if config.mutator_type == "smart":
@@ -376,23 +377,35 @@ class FuzzMaster:
                     except:
                         pass
         
-        # Sync coverage (merge into global)
+        # Sync coverage (merge into global) with file locking
+        import fcntl
         coverage_file = config.sync_dir / 'coverage' / 'global_bitmap.bin'
         try:
-            # Read global coverage
-            with open(coverage_file, 'rb') as f:
-                global_cov = bytearray(f.read())
-            
-            # Read worker's coverage
-            worker_cov = fuzzing_core.coverage_tracker.global_bitmap
-            
-            # Merge (bitwise OR)
-            for i in range(len(global_cov)):
-                global_cov[i] |= worker_cov[i]
-            
-            # Write back
-            with open(coverage_file, 'wb') as f:
-                f.write(global_cov)
+            # Open file and acquire exclusive lock
+            with open(coverage_file, 'r+b') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    # Read global coverage
+                    global_cov = bytearray(f.read())
+                    
+                    # Read worker's coverage
+                    worker_cov = fuzzing_core.coverage_tracker.global_bitmap
+                    
+                    # Merge (bitwise OR)
+                    changed = False
+                    for i in range(len(global_cov)):
+                        if worker_cov[i] > global_cov[i]:
+                            global_cov[i] = worker_cov[i]
+                            changed = True
+                    
+                    # Write back only if changed
+                    if changed:
+                        f.seek(0)
+                        f.write(global_cov)
+                        f.flush()
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as e:
             print(f"[Worker{worker_id}] Coverage sync failed: {e}")
     def _worker_update_stats(config: WorkerConfig, fuzzing_core: FuzzingCore):
@@ -422,7 +435,6 @@ class FuzzMaster:
         """Start all worker processes"""
         print(f"\n[FuzzMaster] Starting {self.num_workers} workers...")
         # Ensure SharedCoverage is initialized in parent process (for true sharing)
-        SharedCoverage._ensure_shared_resources()
 
         
         for i in range(self.num_workers):
@@ -433,7 +445,7 @@ class FuzzMaster:
         # Ensure SharedCoverage is initialized in parent process (for true sharing)
             worker = mp.Process(
                 target=FuzzMaster._worker_main,
-                args=(config, 10),  # Sync every 10 iterations
+                args=(config, self.shared_objects, 10),  # Pass shared_objects, Sync every 10 iterations
                 name=f"Worker{i}"
             )
             worker.daemon = False
@@ -467,11 +479,12 @@ class FuzzMaster:
         self._collect_statistics()
         
         # Aggregate
-        total_execs = sum(w.execs for w in self.worker_stats.values())
-        total_paths = sum(w.paths_found for w in self.worker_stats.values())
-        total_crashes = sum(w.crashes_found for w in self.worker_stats.values())
-        total_timeouts = sum(w.timeouts for w in self.worker_stats.values())
-        avg_speed = sum(w.exec_speed for w in self.worker_stats.values())
+        stats_list = [w for w in self.worker_stats.values() if w]
+        total_execs = sum(w.execs for w in stats_list)
+        total_paths = sum(w.paths_found for w in stats_list)
+        total_crashes = sum(w.crashes_found for w in stats_list)
+        total_timeouts = sum(w.timeouts for w in stats_list)
+        avg_speed = sum(w.exec_speed for w in stats_list)
         
         # Read global coverage from shared memory (real-time)
         try:
@@ -502,8 +515,18 @@ class FuzzMaster:
         print(f"")
         print(f"Per-Worker Stats:")
         for i in range(self.num_workers):
-            w = self.worker_stats[i]
-            alive = "✓" if self.workers[i].is_alive() else "✗"
+            w = self.worker_stats.get(i)
+            if not w:
+                print(f"  Worker{i} [?]: No statistics yet")
+                continue
+                
+            is_alive = False
+            try:
+                is_alive = i < len(self.workers) and self.workers[i].is_alive()
+            except:
+                pass
+                
+            alive = "✓" if is_alive else "✗"
             print(f"  Worker{i} [{alive}]: {w.execs:6d} execs, "
                   f"{w.paths_found:3d} paths, {w.crashes_found:3d} crashes, "
                   f"{w.exec_speed:5.1f} exec/s")
@@ -519,7 +542,7 @@ class FuzzMaster:
                 config = self.worker_configs[i]
                 new_worker = mp.Process(
                     target=FuzzMaster._worker_main,
-                    args=(config,),
+                    args=(config, self.shared_objects),
                     name=f"Worker{i}"
                 )
                 new_worker.daemon = False

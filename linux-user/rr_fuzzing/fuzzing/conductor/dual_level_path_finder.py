@@ -657,9 +657,6 @@ class DualLevelPathFinder:
                                 
                     last_syscall_idx = syscall_idx
             
-            # Also update bb_to_syscall map from trace if needed
-            # (Optional: might not be needed if we trust the trace's syscall_idx)
-                        
             return mapped_count
             
         except Exception as e:
@@ -667,6 +664,21 @@ class DualLevelPathFinder:
             import traceback
             traceback.print_exc()
             return 0
+
+    def get_covered_bb_addresses(self) -> Set[int]:
+        """
+        Get all BB addresses belonging to covered syscall nodes.
+        This provides a precise alternative to coverage bitmap bit-extraction.
+        """
+        covered = set()
+        for block in self.syscall_blocks.values():
+            if block.is_covered:
+                for addr in block.bb_addrs:
+                    if isinstance(addr, str):
+                        try: addr = int(addr, 16)
+                        except: continue
+                    covered.add(addr)
+        return covered
 
     def find_uncovered_branches(self, covered_bbs: Set[int]) -> List[Dict[str, Any]]:
         """

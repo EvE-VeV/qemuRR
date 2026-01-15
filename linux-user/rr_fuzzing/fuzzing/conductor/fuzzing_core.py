@@ -558,22 +558,23 @@ class FuzzingCore:
         """
         covered = set()
         
-        # Each non-zero position in the Coverage bitmap represents an edge
-        # Edge ID = (prev_block << 16) | curr_block (simplified)
-        # We extract the curr_block part of all covered edges
+        # Strategy A: Use PathFinder's precise mapping (High Accuracy)
+        if self.path_finder and hasattr(self.path_finder, 'get_covered_bb_addresses'):
+            covered = self.path_finder.get_covered_bb_addresses()
+            if covered:
+                alog(f"[FuzzingCore] _extract_covered_blocks: Using PathFinder ({len(covered)} BBs)", "DEBUG")
+                return covered
+
+        # Strategy B: Fallback to bitmap bits (Low Accuracy, Legacy)
         bits_set = 0
         for i, val in enumerate(self.coverage_tracker.global_bitmap):
             if val > 0:
                 bits_set += 1
-                # Simplified: use bitmap index as block ID
-                # Should actually map from edge to block
-                covered.add(i & 0xFFFF)  # Extract lower 16 bits as block ID
+                # Heuristic: use bitmap index as block ID (very inaccurate)
+                covered.add(i & 0xFFFF)
         
         if bits_set > 0:
-            alog(f"[FuzzingCore] _extract_covered_blocks: bits_set={bits_set}, unique_ids={len(covered)}", "DEBUG")
-            if len(covered) > 0:
-                sample = list(covered)[:5]
-                alog(f"[FuzzingCore] _extract_covered_blocks sample IDs: {sample}", "DEBUG")
+            alog(f"[FuzzingCore] _extract_covered_blocks: Fallback mode, bits={bits_set}", "DEBUG")
         
         return covered
 
