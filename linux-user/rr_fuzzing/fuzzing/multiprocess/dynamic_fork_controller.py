@@ -901,10 +901,23 @@ class DynamicForkController:
         # Return list of indices
         result = [item['index'] for item in selected]
 
+        # ✅ CRITICAL FIX: Validate fork points are within trace bounds
+        # If fork_point exceeds syscall count, QEMU will exit immediately
+        total_syscalls = len(analyzer.syscalls)
+        validated_result = []
+        for idx in result:
+            if idx < total_syscalls:
+                validated_result.append(idx)
+            else:
+                alog(f"⚠️ Skipping invalid fork_point {idx} (trace only has {total_syscalls} syscalls)", "DFC", "WARN")
+        
+        result = validated_result
+
         if result:
             print(f"[DynamicForkController] ✅ Selected {len(result)}/{len(io_candidates)} IO syscalls as fork points:")
             for item in selected:
-                print(f"  - syscall[{item['index']}] {item['name']}: retval={item['retval']}, priority={item['priority']:.0f}")
+                if item['index'] in result:  # Only print validated items
+                    print(f"  - syscall[{item['index']}] {item['name']}: retval={item['retval']}, priority={item['priority']:.0f}")
 
         return result
 

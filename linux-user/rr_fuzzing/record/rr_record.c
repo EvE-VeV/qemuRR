@@ -8,6 +8,7 @@
 #include "../core/rr_framework.h"
 #include "../core/rr_bb_trace.h"
 #include "rr_aux_data.h"
+#include "../utils/rr_syscall_dispatch.h"
 #include "../core/rr_constants.h"
 #include <fcntl.h>
 #include <sys/utsname.h>
@@ -16,6 +17,8 @@
 #include <time.h>
 
 static FILE *g_trace_file = NULL;
+/* Global written counter to ensure valid 0-based indexing on file write */
+static uint32_t g_written_count = 0;
 
 static rr_aux_data_t *record_aux_scalar(uint8_t mask, const abi_long *value)
 {
@@ -145,14 +148,20 @@ int rr_start_recording(const char *trace_file)
         return -1;
     }
 
-    /* Write file header */
-    uint32_t magic = 0x52525254; // "RRTR"
-    uint32_t version = 1;
+    if (g_rr_framework) {
+        g_rr_framework->trace_length = 0;
+    }
+    g_written_count = 0;
+
+    /* Write file header - Always Little Endian */
+    uint32_t magic = cpu_to_le32(0x52525254); // "RRTR"
+    uint32_t version = cpu_to_le32(1);
     uint32_t placeholder_count = 0; // Placeholder, updated at end
-    RR_VERBOSE("Writing trace file header: magic=0x%x, version=%u", magic, version);
+    RR_VERBOSE("Writing trace file header: magic=0x%x, version=%u", 0x52525254, 1);
     fwrite(&magic, sizeof(magic), 1, g_trace_file);
     fwrite(&version, sizeof(version), 1, g_trace_file);
     fwrite(&placeholder_count, sizeof(placeholder_count), 1, g_trace_file);
+
 
     /* Initialize BB trace */
     if (rr_bb_trace_init(trace_file) < 0) {
@@ -160,10 +169,10 @@ int rr_start_recording(const char *trace_file)
     } else {
         RR_INFO("BB trace initialized successfully");
     }
-
     RR_INFO("Recording started successfully to: %s", trace_file);
     return 0;
 }
+
 
 /**
  * Stop recording
@@ -180,12 +189,13 @@ void rr_stop_recording(void)
         fseek(g_trace_file, 0, SEEK_END);
         long file_size = ftell(g_trace_file);
 
-        /* Write trace length to file header */
+        /* Write trace length to file header - Always Little Endian */
         uint32_t record_count = g_rr_framework ? g_rr_framework->trace_length : 0;
+        uint32_t le_record_count = cpu_to_le32(record_count);
         RR_VERBOSE("STOP_RECORDING: Updating header with record_count=%u, file_size=%ld", record_count, file_size);
 
         fseek(g_trace_file, sizeof(uint32_t) * 2, SEEK_SET);  // 跳过magic和version
-        size_t written = fwrite(&record_count, sizeof(record_count), 1, g_trace_file);
+        size_t written = fwrite(&le_record_count, sizeof(le_record_count), 1, g_trace_file);
         if (written != 1) {
             RR_ERROR("STOP_RECORDING: Failed to write record count to header");
         } else {
@@ -1477,6 +1487,9 @@ static void capture_syscall_args(CPUArchState *env, int syscall_nr,
  */
 int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long ret)
 {
+    if (g_rr_config.mode != RR_MODE_RECORD || !g_trace_file) {
+        return 0;
+    }
     RR_VERBOSE("RECORD_SYSCALL: Called for syscall %d, ret=%ld", num, (long)ret);
 
     /* 🔥 Fix: Do not skip any syscalls to ensure record/replay consistency */
@@ -1492,10 +1505,20 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
 
     /* Create record */
     syscall_record_t *record = g_malloc0(sizeof(syscall_record_t));
-    record->index = g_rr_framework->trace_length++;
+    
+    /* Use global written counter to guarantee 0,1,2... in file */
+    record->index = g_written_count++;
+
+    g_rr_framework->trace_length = g_written_count; // Sync back for consistency
+    
     record->syscall_nr = num;
-    memcpy(record->args, args, sizeof(abi_long) * 8);
+
+    for (int i = 0; i < 8; i++) {
+        record->args[i] = (uint64_t)args[i];
+    }
     record->retval = ret;
+
+
 
     RR_VERBOSE("RECORD_SYSCALL: Recording index=%u, syscall=%d, ret=%ld",
             record->index, record->syscall_nr, (long)record->retval);
@@ -1547,6 +1570,7 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     uint32_t idx = record->index;
     int32_t sys = (int32_t)record->syscall_nr;
 
+    /* Write index and syscall_nr (8 bytes total) */
     buffer[0] = (idx) & 0xFF;
     buffer[1] = (idx >> 8) & 0xFF;
     buffer[2] = (idx >> 16) & 0xFF;
@@ -1557,23 +1581,32 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     buffer[6] = (sys >> 16) & 0xFF;
     buffer[7] = (sys >> 24) & 0xFF;
 
-    
     if (fwrite(buffer, 8, 1, g_trace_file) != 1) {
         RR_ERROR("Failed to write record header");
         return -1;
     }
 
-    /* 🔥 Fix: Reduce frequent fflush; refresh every 100 records */
+    /* 🔥 Fix: standard fflush timing */
     if (g_rr_framework->trace_length % 100 == 0) {
         fflush(g_trace_file);
     }
 
-    if (fwrite(record->args, sizeof(abi_long) * 8, 1, g_trace_file) != 1 ||
-        fwrite(&record->retval, sizeof(abi_long), 1, g_trace_file) != 1 ||
-        fwrite(record->arg_size, sizeof(size_t) * 8, 1, g_trace_file) != 1 ||
+    /* Fixed-width fields for universality - ALWAYS Little Endian */
+    uint64_t fixed_args[8];
+    for (int i = 0; i < 8; i++) fixed_args[i] = cpu_to_le64((uint64_t)record->args[i]);
+    int64_t fixed_retval = (int64_t)cpu_to_le64((uint64_t)record->retval);
+    uint64_t fixed_arg_sizes[8];
+    for (int i = 0; i < 8; i++) fixed_arg_sizes[i] = cpu_to_le64((uint64_t)record->arg_size[i]);
+
+    int32_t le_created_fd = (int32_t)cpu_to_le32((uint32_t)record->created_fd);
+
+    if (fwrite(fixed_args, 8, 8, g_trace_file) != 8 ||
+        fwrite(&fixed_retval, 8, 1, g_trace_file) != 1 ||
+        fwrite(fixed_arg_sizes, 8, 8, g_trace_file) != 8 ||
         fwrite(&record->creates_fd, sizeof(bool), 1, g_trace_file) != 1 ||
         fwrite(&record->uses_fd, sizeof(bool), 1, g_trace_file) != 1 ||
-        fwrite(&record->created_fd, sizeof(int32_t), 1, g_trace_file) != 1) {
+        fwrite(&le_created_fd, sizeof(int32_t), 1, g_trace_file) != 1) {
+
         RR_ERROR("RECORD_SYSCALL: Failed to write syscall record fields");
         return -1;
     }
@@ -1582,27 +1615,32 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     int arg_count = 0;
     for (int i = 0; i < RR_MAX_SYSCALL_ARGS; i++) {
         if (record->arg_data[i] && record->arg_size[i] > 0) {
-            RR_VERBOSE("RECORD_SYSCALL: Writing arg %d data (size=%zu)", i, record->arg_size[i]);
-            fwrite(&i, sizeof(int), 1, g_trace_file);
-            fwrite(&record->arg_size[i], sizeof(size_t), 1, g_trace_file);
+            RR_VERBOSE("RECORD_SYSCALL: Writing arg %d data (size=%lu)", i, (unsigned long)record->arg_size[i]);
+            int32_t le_arg_idx = (int32_t)cpu_to_le32((uint32_t)i);
+            uint64_t le_arg_size = cpu_to_le64(record->arg_size[i]);
+            fwrite(&le_arg_idx, sizeof(int32_t), 1, g_trace_file);
+            fwrite(&le_arg_size, sizeof(uint64_t), 1, g_trace_file);
+
             fwrite(record->arg_data[i], record->arg_size[i], 1, g_trace_file);
             arg_count++;
         }
     }
 
     /* Write end marker */
-    int end_marker = -1;
-    fwrite(&end_marker, sizeof(int), 1, g_trace_file);
+    int32_t end_marker = (int32_t)cpu_to_le32(0xFFFFFFFF); // -1 in LE
+    fwrite(&end_marker, sizeof(int32_t), 1, g_trace_file);
+
 
     /* Write aux_data (if any) */
     RR_VERBOSE("RECORD_SYSCALL: Before aux write - record=%p, has_aux_data=%d, aux_data=%p", 
                record, record->has_aux_data, record->aux_data);
     if (record->has_aux_data && record->aux_data) {
         /* Write aux_data marker */
-        uint32_t aux_magic = 0x41555844; // "AUXD"
+        uint32_t aux_magic = cpu_to_le32(0x41555844); // "AUXD"
         long pos_before = ftell(g_trace_file);
-        RR_VERBOSE("RECORD_SYSCALL: Writing AUXD magic 0x%08x at pos %ld", aux_magic, pos_before);
+        RR_VERBOSE("RECORD_SYSCALL: Writing AUXD magic 0x%08x at pos %ld", 0x41555844, pos_before);
         size_t written = fwrite(&aux_magic, sizeof(uint32_t), 1, g_trace_file);
+
         if (written != 1) {
             RR_ERROR("RECORD_SYSCALL: Failed to write AUXD magic!");
         }
@@ -1616,14 +1654,18 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
             aux_count++;
             curr = curr->next;
         }
-        fwrite(&aux_count, sizeof(uint32_t), 1, g_trace_file);
+        uint32_t le_aux_count = cpu_to_le32(aux_count);
+        fwrite(&le_aux_count, sizeof(uint32_t), 1, g_trace_file);
+
         
         /* Write each aux_data entry */
         curr = record->aux_data;
         while (curr) {
+            uint32_t le_size = cpu_to_le32(curr->size);
             fwrite(&curr->kind, sizeof(uint8_t), 1, g_trace_file);
             fwrite(&curr->arg_mask, sizeof(uint8_t), 1, g_trace_file);
-            fwrite(&curr->size, sizeof(uint32_t), 1, g_trace_file);
+            fwrite(&le_size, sizeof(uint32_t), 1, g_trace_file);
+
             fwrite(curr->data, curr->size, 1, g_trace_file);
             
             RR_VERBOSE("RECORD_SYSCALL: Wrote aux_data kind=%d, arg=%d, size=%u",
@@ -1641,13 +1683,16 @@ int rr_record_syscall(CPUArchState *env, int num, const abi_long *args, abi_long
     /* Always flush after writing record to ensure data integrity */
     fflush(g_trace_file);
     
-    if (num == 44) {
+#ifdef TARGET_NR_sendto
+    if (num == TARGET_NR_sendto) {
         RR_INFO("RECORDED SENDTO: index=%u, has_aux=%d", record->index, record->has_aux_data);
     }
+#endif
     RR_VERBOSE("RECORD_SYSCALL: Successfully recorded syscall %d (index=%u, args=%d, aux=%s, total_syscalls=%u)",
                num, record->index, arg_count, record->has_aux_data ? "yes" : "no", g_rr_framework->trace_length);
+    const char *name = rr_get_syscall_name_fast(num);
     RR_LOG("Recorded syscall %d: %s -> %ld", record->index,
-           (num >= 0 && num < 400) ? "syscall" : "unknown", (long)ret);
+           name ? name : "unknown", (long)ret);
 
     /* Optimization: Update header every 100 records to reduce fseek overhead */
     if (g_rr_framework->trace_length % 100 == 0) {

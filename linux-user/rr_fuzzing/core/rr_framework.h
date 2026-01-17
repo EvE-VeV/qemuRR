@@ -23,15 +23,15 @@ struct rr_aux_data;
  */
 typedef struct syscall_record {
     uint32_t index;                     // Sequence number in trace
-    int syscall_nr;                     // Syscall number
-    abi_long args[8];                   // Argument values
-    abi_long retval;                    // Return value
+    int32_t syscall_nr;                 // Syscall number (Fixed size)
+    uint64_t args[8];                   // Argument values (Fixed width for universality)
+    int64_t retval;                     // Return value (Fixed width for universality)
 
-    /* Argument data storage (Traditional method - maintained for backward compatibility) */
+    /* Argument data storage */
     uint8_t *arg_data[8];               // Data pointed to by arguments
-    size_t arg_size[8];                 // Size of each argument's data
+    uint64_t arg_size[8];               // Size of each argument's data (Fixed width)
 
-    /* EnvFuzz-style auxiliary data (New) */
+    /* EnvFuzz-style auxiliary data */
     struct rr_aux_data *aux_data;       // Auxiliary data linked list
     bool has_aux_data;                  // Whether it has auxiliary data
 
@@ -248,6 +248,9 @@ int rr_fd_mapping_add(int recorded_fd, int actual_fd);
 int rr_fd_mapping_get(int recorded_fd);
 int rr_fd_mapping_remove(int recorded_fd);
 int rr_addr_mapping_add(target_ulong recorded_addr, target_ulong actual_addr, size_t size);
+
+/* Cache consistency */
+void rr_flush_tb_cache(void);
 target_ulong rr_addr_mapping_get(target_ulong recorded_addr);
 int rr_addr_mapping_remove(target_ulong recorded_addr);
 

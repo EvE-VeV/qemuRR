@@ -35,7 +35,7 @@
  * - x86-64: currently ~450
  * - Set to 512 for future scalability
  */
-#define RR_MAX_SYSCALL_NR       512
+#define RR_MAX_SYSCALL_NR       10000
 
 /* File Descriptor Related */
 

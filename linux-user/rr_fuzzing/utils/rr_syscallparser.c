@@ -27,335 +27,1032 @@ typedef struct {
 } syscall_mapping_t;
 
 static const syscall_mapping_t g_syscall_map[] = {
-    {"read", 0},
-    {"write", 1},
-    {"open", 2},
-    {"close", 3},
-    {"stat", 4},
-    {"fstat", 5},
-    {"lstat", 6},
-    {"poll", 7},
-    {"lseek", 8},
-    {"mmap", 9},
-    {"mprotect", 10},
-    {"munmap", 11},
-    {"brk", 12},
-    {"rt_sigaction", 13},
-    {"rt_sigprocmask", 14},
-    {"rt_sigreturn", 15},
-    {"ioctl", 16},
-    {"pread64", 17},
-    {"pwrite64", 18},
-    {"readv", 19},
-    {"writev", 20},
-    {"access", 21},
-    {"pipe", 22},
-    {"select", 23},
-    {"sched_yield", 24},
-    {"mremap", 25},
-    {"msync", 26},
-    {"mincore", 27},
-    {"madvise", 28},
-    {"shmget", 29},
-    {"shmat", 30},
-    {"shmctl", 31},
-    {"dup", 32},
-    {"dup2", 33},
-    {"pause", 34},
-    {"nanosleep", 35},
-    {"getitimer", 36},
-    {"alarm", 37},
-    {"setitimer", 38},
-    {"getpid", 39},
-    {"sendfile", 40},
-    {"socket", 41},
-    {"connect", 42},
-    {"accept", 43},
-    {"sendto", 44},
-    {"recvfrom", 45},
-    {"sendmsg", 46},
-    {"recvmsg", 47},
-    {"shutdown", 48},
-    {"bind", 49},
-    {"listen", 50},
-    {"getsockname", 51},
-    {"getpeername", 52},
-    {"socketpair", 53},
-    {"setsockopt", 54},
-    {"getsockopt", 55},
-    {"clone", 56},
-    {"fork", 57},
-    {"vfork", 58},
-    {"execve", 59},
-    {"exit", 60},
-    {"wait4", 61},
-    {"kill", 62},
-    {"uname", 63},
-    {"semget", 64},
-    {"semop", 65},
-    {"semctl", 66},
-    {"shmdt", 67},
-    {"msgget", 68},
-    {"msgsnd", 69},
-    {"msgrcv", 70},
-    {"msgctl", 71},
-    {"fcntl", 72},
-    {"flock", 73},
-    {"fsync", 74},
-    {"fdatasync", 75},
-    {"truncate", 76},
-    {"ftruncate", 77},
-    {"getdents", 78},
-    {"getcwd", 79},
-    {"chdir", 80},
-    {"fchdir", 81},
-    {"rename", 82},
-    {"mkdir", 83},
-    {"rmdir", 84},
-    {"creat", 85},
-    {"link", 86},
-    {"unlink", 87},
-    {"symlink", 88},
-    {"readlink", 89},
-    {"chmod", 90},
-    {"fchmod", 91},
-    {"chown", 92},
-    {"fchown", 93},
-    {"lchown", 94},
-    {"umask", 95},
-    {"gettimeofday", 96},
-    {"getrlimit", 97},
-    {"getrusage", 98},
-    {"sysinfo", 99},
-    {"times", 100},
-    {"ptrace", 101},
-    {"getuid", 102},
-    {"syslog", 103},
-    {"getgid", 104},
-    {"setuid", 105},
-    {"setgid", 106},
-    {"geteuid", 107},
-    {"getegid", 108},
-    {"setpgid", 109},
-    {"getppid", 110},
-    {"getpgrp", 111},
-    {"setsid", 112},
-    {"setreuid", 113},
-    {"setregid", 114},
-    {"getgroups", 115},
-    {"setgroups", 116},
-    {"setresuid", 117},
-    {"getresuid", 118},
-    {"setresgid", 119},
-    {"getresgid", 120},
-    {"getpgid", 121},
-    {"setfsuid", 122},
-    {"setfsgid", 123},
-    {"getsid", 124},
-    {"capget", 125},
-    {"capset", 126},
-    {"rt_sigpending", 127},
-    {"rt_sigtimedwait", 128},
-    {"rt_sigqueueinfo", 129},
-    {"rt_sigsuspend", 130},
-    {"sigaltstack", 131},
-    {"utime", 132},
-    {"mknod", 133},
-    {"uselib", 134},
-    {"personality", 135},
-    {"ustat", 136},
-    {"statfs", 137},
-    {"fstatfs", 138},
-    {"sysfs", 139},
-    {"getpriority", 140},
-    {"setpriority", 141},
-    {"sched_setparam", 142},
-    {"sched_getparam", 143},
-    {"sched_setscheduler", 144},
-    {"sched_getscheduler", 145},
-    {"sched_get_priority_max", 146},
-    {"sched_get_priority_min", 147},
-    {"sched_rr_get_interval", 148},
-    {"mlock", 149},
-    {"munlock", 150},
-    {"mlockall", 151},
-    {"munlockall", 152},
-    {"vhangup", 153},
-    {"modify_ldt", 154},
-    {"pivot_root", 155},
-    {"_sysctl", 156},
-    {"prctl", 157},
-    {"arch_prctl", 158},
-    {"adjtimex", 159},
-    {"setrlimit", 160},
-    {"chroot", 161},
-    {"sync", 162},
-    {"acct", 163},
-    {"settimeofday", 164},
-    {"mount", 165},
-    {"umount2", 166},
-    {"swapon", 167},
-    {"swapoff", 168},
-    {"reboot", 169},
-    {"sethostname", 170},
-    {"setdomainname", 171},
-    {"iopl", 172},
-    {"ioperm", 173},
-    {"create_module", 174},
-    {"init_module", 175},
-    {"delete_module", 176},
-    {"get_kernel_syms", 177},
-    {"query_module", 178},
-    {"quotactl", 179},
-    {"nfsservctl", 180},
-    {"getpmsg", 181},
-    {"putpmsg", 182},
-    {"afs_syscall", 183},
-    {"tuxcall", 184},
-    {"security", 185},
-    {"gettid", 186},
-    {"readahead", 187},
-    {"setxattr", 188},
-    {"lsetxattr", 189},
-    {"fsetxattr", 190},
-    {"getxattr", 191},
-    {"lgetxattr", 192},
-    {"fgetxattr", 193},
-    {"listxattr", 194},
-    {"llistxattr", 195},
-    {"flistxattr", 196},
-    {"removexattr", 197},
-    {"lremovexattr", 198},
-    {"fremovexattr", 199},
-    {"tkill", 200},
-    {"time", 201},
-    {"futex", 202},
-    {"sched_setaffinity", 203},
-    {"sched_getaffinity", 204},
-    {"set_thread_area", 205},
-    {"io_setup", 206},
-    {"io_destroy", 207},
-    {"io_getevents", 208},
-    {"io_submit", 209},
-    {"io_cancel", 210},
-    {"get_thread_area", 211},
-    {"lookup_dcookie", 212},
-    {"epoll_create", 213},
-    {"epoll_ctl_old", 214},
-    {"epoll_wait_old", 215},
-    {"remap_file_pages", 216},
-    {"getdents64", 217},
-    {"set_tid_address", 218},
-    {"restart_syscall", 219},
-    {"semtimedop", 220},
-    {"fadvise64", 221},
-    {"timer_create", 222},
-    {"timer_settime", 223},
-    {"timer_gettime", 224},
-    {"timer_getoverrun", 225},
-    {"timer_delete", 226},
-    {"clock_settime", 227},
-    {"clock_gettime", 228},
-    {"clock_getres", 229},
-    {"clock_nanosleep", 230},
-    {"exit_group", 231},
-    {"epoll_wait", 232},
-    {"epoll_ctl", 233},
-    {"tgkill", 234},
-    {"utimes", 235},
-    {"vserver", 236},
-    {"mbind", 237},
-    {"set_mempolicy", 238},
-    {"get_mempolicy", 239},
-    {"mq_open", 240},
-    {"mq_unlink", 241},
-    {"mq_timedsend", 242},
-    {"mq_timedreceive", 243},
-    {"mq_notify", 244},
-    {"mq_getsetattr", 245},
-    {"kexec_load", 246},
-    {"waitid", 247},
-    {"add_key", 248},
-    {"request_key", 249},
-    {"keyctl", 250},
-    {"ioprio_set", 251},
-    {"ioprio_get", 252},
-    {"inotify_init", 253},
-    {"inotify_add_watch", 254},
-    {"inotify_rm_watch", 255},
-    {"migrate_pages", 256},
-    {"openat", 257},
-    {"mkdirat", 258},
-    {"mknodat", 259},
-    {"fchownat", 260},
-    {"futimesat", 261},
-    {"newfstatat", 262},
-    {"unlinkat", 263},
-    {"renameat", 264},
-    {"linkat", 265},
-    {"symlinkat", 266},
-    {"readlinkat", 267},
-    {"fchmodat", 268},
-    {"faccessat", 269},
-    {"pselect6", 270},
-    {"ppoll", 271},
-    {"unshare", 272},
-    {"set_robust_list", 273},
-    {"get_robust_list", 274},
-    {"splice", 275},
-    {"tee", 276},
-    {"sync_file_range", 277},
-    {"vmsplice", 278},
-    {"move_pages", 279},
-    {"utimensat", 280},
-    {"epoll_pwait", 281},
-    {"signalfd", 282},
-    {"timerfd_create", 283},
-    {"eventfd", 284},
-    {"fallocate", 285},
-    {"timerfd_settime", 286},
-    {"timerfd_gettime", 287},
-    {"accept4", 288},
-    {"signalfd4", 289},
-    {"eventfd2", 290},
-    {"epoll_create1", 291},
-    {"dup3", 292},
-    {"pipe2", 293},
-    {"inotify_init1", 294},
-    {"preadv", 295},
-    {"pwritev", 296},
-    {"rt_tgsigqueueinfo", 297},
-    {"perf_event_open", 298},
-    {"recvmmsg", 299},
-    {"fanotify_init", 300},
-    {"fanotify_mark", 301},
-    {"prlimit64", 302},
-    {"name_to_handle_at", 303},
-    {"open_by_handle_at", 304},
-    {"clock_adjtime", 305},
-    {"syncfs", 306},
-    {"sendmmsg", 307},
-    {"setns", 308},
-    {"getcpu", 309},
-    {"process_vm_readv", 310},
-    {"process_vm_writev", 311},
-    {"kcmp", 312},
-    {"finit_module", 313},
-    {"sched_setattr", 314},
-    {"sched_getattr", 315},
-    {"renameat2", 316},
-    {"seccomp", 317},
-    {"getrandom", 318},
-    {"memfd_create", 319},
-    {"kexec_file_load", 320},
-    {"bpf", 321},
-    {"execveat", 322},
-    {"userfaultfd", 323},
-    {"membarrier", 324},
-    {"mlock2", 325},
-    {"copy_file_range", 326},
-    {"preadv2", 327},
-    {"pwritev2", 328},
+#ifdef TARGET_NR_read
+    {"read", TARGET_NR_read},
+#endif
+#ifdef TARGET_NR_write
+    {"write", TARGET_NR_write},
+#endif
+#ifdef TARGET_NR_open
+    {"open", TARGET_NR_open},
+#endif
+#ifdef TARGET_NR_close
+    {"close", TARGET_NR_close},
+#endif
+#ifdef TARGET_NR_stat
+    {"stat", TARGET_NR_stat},
+#endif
+#ifdef TARGET_NR_fstat
+    {"fstat", TARGET_NR_fstat},
+#endif
+#ifdef TARGET_NR_lstat
+    {"lstat", TARGET_NR_lstat},
+#endif
+#ifdef TARGET_NR_poll
+    {"poll", TARGET_NR_poll},
+#endif
+#ifdef TARGET_NR_lseek
+    {"lseek", TARGET_NR_lseek},
+#endif
+#ifdef TARGET_NR_mmap
+    {"mmap", TARGET_NR_mmap},
+#endif
+#ifdef TARGET_NR_mprotect
+    {"mprotect", TARGET_NR_mprotect},
+#endif
+#ifdef TARGET_NR_munmap
+    {"munmap", TARGET_NR_munmap},
+#endif
+#ifdef TARGET_NR_brk
+    {"brk", TARGET_NR_brk},
+#endif
+#ifdef TARGET_NR_rt_sigaction
+    {"rt_sigaction", TARGET_NR_rt_sigaction},
+#endif
+#ifdef TARGET_NR_rt_sigprocmask
+    {"rt_sigprocmask", TARGET_NR_rt_sigprocmask},
+#endif
+#ifdef TARGET_NR_rt_sigreturn
+    {"rt_sigreturn", TARGET_NR_rt_sigreturn},
+#endif
+#ifdef TARGET_NR_ioctl
+    {"ioctl", TARGET_NR_ioctl},
+#endif
+#ifdef TARGET_NR_pread64
+    {"pread64", TARGET_NR_pread64},
+#endif
+#ifdef TARGET_NR_pwrite64
+    {"pwrite64", TARGET_NR_pwrite64},
+#endif
+#ifdef TARGET_NR_readv
+    {"readv", TARGET_NR_readv},
+#endif
+#ifdef TARGET_NR_writev
+    {"writev", TARGET_NR_writev},
+#endif
+#ifdef TARGET_NR_access
+    {"access", TARGET_NR_access},
+#endif
+#ifdef TARGET_NR_pipe
+    {"pipe", TARGET_NR_pipe},
+#endif
+#ifdef TARGET_NR_select
+    {"select", TARGET_NR_select},
+#endif
+#ifdef TARGET_NR_sched_yield
+    {"sched_yield", TARGET_NR_sched_yield},
+#endif
+#ifdef TARGET_NR_mremap
+    {"mremap", TARGET_NR_mremap},
+#endif
+#ifdef TARGET_NR_msync
+    {"msync", TARGET_NR_msync},
+#endif
+#ifdef TARGET_NR_mincore
+    {"mincore", TARGET_NR_mincore},
+#endif
+#ifdef TARGET_NR_madvise
+    {"madvise", TARGET_NR_madvise},
+#endif
+#ifdef TARGET_NR_shmget
+    {"shmget", TARGET_NR_shmget},
+#endif
+#ifdef TARGET_NR_shmat
+    {"shmat", TARGET_NR_shmat},
+#endif
+#ifdef TARGET_NR_shmctl
+    {"shmctl", TARGET_NR_shmctl},
+#endif
+#ifdef TARGET_NR_dup
+    {"dup", TARGET_NR_dup},
+#endif
+#ifdef TARGET_NR_dup2
+    {"dup2", TARGET_NR_dup2},
+#endif
+#ifdef TARGET_NR_pause
+    {"pause", TARGET_NR_pause},
+#endif
+#ifdef TARGET_NR_nanosleep
+    {"nanosleep", TARGET_NR_nanosleep},
+#endif
+#ifdef TARGET_NR_getitimer
+    {"getitimer", TARGET_NR_getitimer},
+#endif
+#ifdef TARGET_NR_alarm
+    {"alarm", TARGET_NR_alarm},
+#endif
+#ifdef TARGET_NR_setitimer
+    {"setitimer", TARGET_NR_setitimer},
+#endif
+#ifdef TARGET_NR_getpid
+    {"getpid", TARGET_NR_getpid},
+#endif
+#ifdef TARGET_NR_sendfile
+    {"sendfile", TARGET_NR_sendfile},
+#endif
+#ifdef TARGET_NR_socket
+    {"socket", TARGET_NR_socket},
+#endif
+#ifdef TARGET_NR_connect
+    {"connect", TARGET_NR_connect},
+#endif
+#ifdef TARGET_NR_accept
+    {"accept", TARGET_NR_accept},
+#endif
+#ifdef TARGET_NR_sendto
+    {"sendto", TARGET_NR_sendto},
+#endif
+#ifdef TARGET_NR_recvfrom
+    {"recvfrom", TARGET_NR_recvfrom},
+#endif
+#ifdef TARGET_NR_sendmsg
+    {"sendmsg", TARGET_NR_sendmsg},
+#endif
+#ifdef TARGET_NR_recvmsg
+    {"recvmsg", TARGET_NR_recvmsg},
+#endif
+#ifdef TARGET_NR_shutdown
+    {"shutdown", TARGET_NR_shutdown},
+#endif
+#ifdef TARGET_NR_bind
+    {"bind", TARGET_NR_bind},
+#endif
+#ifdef TARGET_NR_listen
+    {"listen", TARGET_NR_listen},
+#endif
+#ifdef TARGET_NR_getsockname
+    {"getsockname", TARGET_NR_getsockname},
+#endif
+#ifdef TARGET_NR_getpeername
+    {"getpeername", TARGET_NR_getpeername},
+#endif
+#ifdef TARGET_NR_socketpair
+    {"socketpair", TARGET_NR_socketpair},
+#endif
+#ifdef TARGET_NR_setsockopt
+    {"setsockopt", TARGET_NR_setsockopt},
+#endif
+#ifdef TARGET_NR_getsockopt
+    {"getsockopt", TARGET_NR_getsockopt},
+#endif
+#ifdef TARGET_NR_clone
+    {"clone", TARGET_NR_clone},
+#endif
+#ifdef TARGET_NR_fork
+    {"fork", TARGET_NR_fork},
+#endif
+#ifdef TARGET_NR_vfork
+    {"vfork", TARGET_NR_vfork},
+#endif
+#ifdef TARGET_NR_execve
+    {"execve", TARGET_NR_execve},
+#endif
+#ifdef TARGET_NR_exit
+    {"exit", TARGET_NR_exit},
+#endif
+#ifdef TARGET_NR_wait4
+    {"wait4", TARGET_NR_wait4},
+#endif
+#ifdef TARGET_NR_kill
+    {"kill", TARGET_NR_kill},
+#endif
+#ifdef TARGET_NR_uname
+    {"uname", TARGET_NR_uname},
+#endif
+#ifdef TARGET_NR_semget
+    {"semget", TARGET_NR_semget},
+#endif
+#ifdef TARGET_NR_semop
+    {"semop", TARGET_NR_semop},
+#endif
+#ifdef TARGET_NR_semctl
+    {"semctl", TARGET_NR_semctl},
+#endif
+#ifdef TARGET_NR_shmdt
+    {"shmdt", TARGET_NR_shmdt},
+#endif
+#ifdef TARGET_NR_msgget
+    {"msgget", TARGET_NR_msgget},
+#endif
+#ifdef TARGET_NR_msgsnd
+    {"msgsnd", TARGET_NR_msgsnd},
+#endif
+#ifdef TARGET_NR_msgrcv
+    {"msgrcv", TARGET_NR_msgrcv},
+#endif
+#ifdef TARGET_NR_msgctl
+    {"msgctl", TARGET_NR_msgctl},
+#endif
+#ifdef TARGET_NR_fcntl
+    {"fcntl", TARGET_NR_fcntl},
+#endif
+#ifdef TARGET_NR_flock
+    {"flock", TARGET_NR_flock},
+#endif
+#ifdef TARGET_NR_fsync
+    {"fsync", TARGET_NR_fsync},
+#endif
+#ifdef TARGET_NR_fdatasync
+    {"fdatasync", TARGET_NR_fdatasync},
+#endif
+#ifdef TARGET_NR_truncate
+    {"truncate", TARGET_NR_truncate},
+#endif
+#ifdef TARGET_NR_ftruncate
+    {"ftruncate", TARGET_NR_ftruncate},
+#endif
+#ifdef TARGET_NR_getdents
+    {"getdents", TARGET_NR_getdents},
+#endif
+#ifdef TARGET_NR_getcwd
+    {"getcwd", TARGET_NR_getcwd},
+#endif
+#ifdef TARGET_NR_chdir
+    {"chdir", TARGET_NR_chdir},
+#endif
+#ifdef TARGET_NR_fchdir
+    {"fchdir", TARGET_NR_fchdir},
+#endif
+#ifdef TARGET_NR_rename
+    {"rename", TARGET_NR_rename},
+#endif
+#ifdef TARGET_NR_mkdir
+    {"mkdir", TARGET_NR_mkdir},
+#endif
+#ifdef TARGET_NR_rmdir
+    {"rmdir", TARGET_NR_rmdir},
+#endif
+#ifdef TARGET_NR_creat
+    {"creat", TARGET_NR_creat},
+#endif
+#ifdef TARGET_NR_link
+    {"link", TARGET_NR_link},
+#endif
+#ifdef TARGET_NR_unlink
+    {"unlink", TARGET_NR_unlink},
+#endif
+#ifdef TARGET_NR_symlink
+    {"symlink", TARGET_NR_symlink},
+#endif
+#ifdef TARGET_NR_readlink
+    {"readlink", TARGET_NR_readlink},
+#endif
+#ifdef TARGET_NR_openat
+    {"openat", TARGET_NR_openat},
+#endif
+#ifdef TARGET_NR_faccessat
+    {"faccessat", TARGET_NR_faccessat},
+#endif
+#ifdef TARGET_NR_faccessat2
+    {"faccessat2", TARGET_NR_faccessat2},
+#endif
+#ifdef TARGET_NR_renameat
+    {"renameat", TARGET_NR_renameat},
+#endif
+#ifdef TARGET_NR_renameat2
+    {"renameat2", TARGET_NR_renameat2},
+#endif
+#ifdef TARGET_NR_unlinkat
+    {"unlinkat", TARGET_NR_unlinkat},
+#endif
+#ifdef TARGET_NR_mkdirat
+    {"mkdirat", TARGET_NR_mkdirat},
+#endif
+#ifdef TARGET_NR_readlinkat
+    {"readlinkat", TARGET_NR_readlinkat},
+#endif
+#ifdef TARGET_NR_symlinkat
+    {"symlinkat", TARGET_NR_symlinkat},
+#endif
+#ifdef TARGET_NR_chmod
+    {"chmod", TARGET_NR_chmod},
+#endif
+#ifdef TARGET_NR_fchmod
+    {"fchmod", TARGET_NR_fchmod},
+#endif
+#ifdef TARGET_NR_chown
+    {"chown", TARGET_NR_chown},
+#endif
+#ifdef TARGET_NR_fchown
+    {"fchown", TARGET_NR_fchown},
+#endif
+#ifdef TARGET_NR_lchown
+    {"lchown", TARGET_NR_lchown},
+#endif
+#ifdef TARGET_NR_umask
+    {"umask", TARGET_NR_umask},
+#endif
+#ifdef TARGET_NR_gettimeofday
+    {"gettimeofday", TARGET_NR_gettimeofday},
+#endif
+#ifdef TARGET_NR_getrlimit
+    {"getrlimit", TARGET_NR_getrlimit},
+#endif
+#ifdef TARGET_NR_getrusage
+    {"getrusage", TARGET_NR_getrusage},
+#endif
+#ifdef TARGET_NR_sysinfo
+    {"sysinfo", TARGET_NR_sysinfo},
+#endif
+#ifdef TARGET_NR_times
+    {"times", TARGET_NR_times},
+#endif
+#ifdef TARGET_NR_ptrace
+    {"ptrace", TARGET_NR_ptrace},
+#endif
+#ifdef TARGET_NR_getuid
+    {"getuid", TARGET_NR_getuid},
+#endif
+#ifdef TARGET_NR_syslog
+    {"syslog", TARGET_NR_syslog},
+#endif
+#ifdef TARGET_NR_getgid
+    {"getgid", TARGET_NR_getgid},
+#endif
+#ifdef TARGET_NR_setuid
+    {"setuid", TARGET_NR_setuid},
+#endif
+#ifdef TARGET_NR_setgid
+    {"setgid", TARGET_NR_setgid},
+#endif
+#ifdef TARGET_NR_geteuid
+    {"geteuid", TARGET_NR_geteuid},
+#endif
+#ifdef TARGET_NR_getegid
+    {"getegid", TARGET_NR_getegid},
+#endif
+#ifdef TARGET_NR_setpgid
+    {"setpgid", TARGET_NR_setpgid},
+#endif
+#ifdef TARGET_NR_getppid
+    {"getppid", TARGET_NR_getppid},
+#endif
+#ifdef TARGET_NR_getpgrp
+    {"getpgrp", TARGET_NR_getpgrp},
+#endif
+#ifdef TARGET_NR_setsid
+    {"setsid", TARGET_NR_setsid},
+#endif
+#ifdef TARGET_NR_setreuid
+    {"setreuid", TARGET_NR_setreuid},
+#endif
+#ifdef TARGET_NR_setregid
+    {"setregid", TARGET_NR_setregid},
+#endif
+#ifdef TARGET_NR_getgroups
+    {"getgroups", TARGET_NR_getgroups},
+#endif
+#ifdef TARGET_NR_setgroups
+    {"setgroups", TARGET_NR_setgroups},
+#endif
+#ifdef TARGET_NR_setresuid
+    {"setresuid", TARGET_NR_setresuid},
+#endif
+#ifdef TARGET_NR_getresuid
+    {"getresuid", TARGET_NR_getresuid},
+#endif
+#ifdef TARGET_NR_setresgid
+    {"setresgid", TARGET_NR_setresgid},
+#endif
+#ifdef TARGET_NR_getresgid
+    {"getresgid", TARGET_NR_getresgid},
+#endif
+#ifdef TARGET_NR_getpgid
+    {"getpgid", TARGET_NR_getpgid},
+#endif
+#ifdef TARGET_NR_setfsuid
+    {"setfsuid", TARGET_NR_setfsuid},
+#endif
+#ifdef TARGET_NR_setfsgid
+    {"setfsgid", TARGET_NR_setfsgid},
+#endif
+#ifdef TARGET_NR_getsid
+    {"getsid", TARGET_NR_getsid},
+#endif
+#ifdef TARGET_NR_capget
+    {"capget", TARGET_NR_capget},
+#endif
+#ifdef TARGET_NR_capset
+    {"capset", TARGET_NR_capset},
+#endif
+#ifdef TARGET_NR_rt_sigpending
+    {"rt_sigpending", TARGET_NR_rt_sigpending},
+#endif
+#ifdef TARGET_NR_rt_sigtimedwait
+    {"rt_sigtimedwait", TARGET_NR_rt_sigtimedwait},
+#endif
+#ifdef TARGET_NR_rt_sigqueueinfo
+    {"rt_sigqueueinfo", TARGET_NR_rt_sigqueueinfo},
+#endif
+#ifdef TARGET_NR_rt_sigsuspend
+    {"rt_sigsuspend", TARGET_NR_rt_sigsuspend},
+#endif
+#ifdef TARGET_NR_sigaltstack
+    {"sigaltstack", TARGET_NR_sigaltstack},
+#endif
+#ifdef TARGET_NR_utime
+    {"utime", TARGET_NR_utime},
+#endif
+#ifdef TARGET_NR_mknod
+    {"mknod", TARGET_NR_mknod},
+#endif
+#ifdef TARGET_NR_uselib
+    {"uselib", TARGET_NR_uselib},
+#endif
+#ifdef TARGET_NR_personality
+    {"personality", TARGET_NR_personality},
+#endif
+#ifdef TARGET_NR_ustat
+    {"ustat", TARGET_NR_ustat},
+#endif
+#ifdef TARGET_NR_statfs
+    {"statfs", TARGET_NR_statfs},
+#endif
+#ifdef TARGET_NR_statx
+    {"statx", TARGET_NR_statx},
+#endif
+#ifdef TARGET_NR_epoll_create
+    {"epoll_create", TARGET_NR_epoll_create},
+#endif
+#ifdef TARGET_NR_epoll_create1
+    {"epoll_create1", TARGET_NR_epoll_create1},
+#endif
+#ifdef TARGET_NR_epoll_ctl
+    {"epoll_ctl", TARGET_NR_epoll_ctl},
+#endif
+#ifdef TARGET_NR_epoll_wait
+    {"epoll_wait", TARGET_NR_epoll_wait},
+#endif
+#ifdef TARGET_NR_epoll_pwait
+    {"epoll_pwait", TARGET_NR_epoll_pwait},
+#endif
+#ifdef TARGET_NR_fstatfs
+    {"fstatfs", TARGET_NR_fstatfs},
+#endif
+#ifdef TARGET_NR_sysfs
+    {"sysfs", TARGET_NR_sysfs},
+#endif
+#ifdef TARGET_NR_getpriority
+    {"getpriority", TARGET_NR_getpriority},
+#endif
+#ifdef TARGET_NR_setpriority
+    {"setpriority", TARGET_NR_setpriority},
+#endif
+#ifdef TARGET_NR_sched_setparam
+    {"sched_setparam", TARGET_NR_sched_setparam},
+#endif
+#ifdef TARGET_NR_sched_getparam
+    {"sched_getparam", TARGET_NR_sched_getparam},
+#endif
+#ifdef TARGET_NR_sched_setscheduler
+    {"sched_setscheduler", TARGET_NR_sched_setscheduler},
+#endif
+#ifdef TARGET_NR_sched_getscheduler
+    {"sched_getscheduler", TARGET_NR_sched_getscheduler},
+#endif
+#ifdef TARGET_NR_sched_get_priority_max
+    {"sched_get_priority_max", TARGET_NR_sched_get_priority_max},
+#endif
+#ifdef TARGET_NR_sched_get_priority_min
+    {"sched_get_priority_min", TARGET_NR_sched_get_priority_min},
+#endif
+#ifdef TARGET_NR_sched_rr_get_interval
+    {"sched_rr_get_interval", TARGET_NR_sched_rr_get_interval},
+#endif
+#ifdef TARGET_NR_mlock
+    {"mlock", TARGET_NR_mlock},
+#endif
+#ifdef TARGET_NR_munlock
+    {"munlock", TARGET_NR_munlock},
+#endif
+#ifdef TARGET_NR_mlockall
+    {"mlockall", TARGET_NR_mlockall},
+#endif
+#ifdef TARGET_NR_munlockall
+    {"munlockall", TARGET_NR_munlockall},
+#endif
+#ifdef TARGET_NR_vhangup
+    {"vhangup", TARGET_NR_vhangup},
+#endif
+#ifdef TARGET_NR_modify_ldt
+    {"modify_ldt", TARGET_NR_modify_ldt},
+#endif
+#ifdef TARGET_NR_pivot_root
+    {"pivot_root", TARGET_NR_pivot_root},
+#endif
+#ifdef TARGET_NR__sysctl
+    {"_sysctl", TARGET_NR__sysctl},
+#endif
+#ifdef TARGET_NR_prctl
+    {"prctl", TARGET_NR_prctl},
+#endif
+#ifdef TARGET_NR_arch_prctl
+    {"arch_prctl", TARGET_NR_arch_prctl},
+#endif
+#ifdef TARGET_NR_adjtimex
+    {"adjtimex", TARGET_NR_adjtimex},
+#endif
+#ifdef TARGET_NR_setrlimit
+    {"setrlimit", TARGET_NR_setrlimit},
+#endif
+#ifdef TARGET_NR_chroot
+    {"chroot", TARGET_NR_chroot},
+#endif
+#ifdef TARGET_NR_sync
+    {"sync", TARGET_NR_sync},
+#endif
+#ifdef TARGET_NR_acct
+    {"acct", TARGET_NR_acct},
+#endif
+#ifdef TARGET_NR_settimeofday
+    {"settimeofday", TARGET_NR_settimeofday},
+#endif
+#ifdef TARGET_NR_mount
+    {"mount", TARGET_NR_mount},
+#endif
+#ifdef TARGET_NR_umount2
+    {"umount2", TARGET_NR_umount2},
+#endif
+#ifdef TARGET_NR_swapon
+    {"swapon", TARGET_NR_swapon},
+#endif
+#ifdef TARGET_NR_swapoff
+    {"swapoff", TARGET_NR_swapoff},
+#endif
+#ifdef TARGET_NR_reboot
+    {"reboot", TARGET_NR_reboot},
+#endif
+#ifdef TARGET_NR_sethostname
+    {"sethostname", TARGET_NR_sethostname},
+#endif
+#ifdef TARGET_NR_setdomainname
+    {"setdomainname", TARGET_NR_setdomainname},
+#endif
+#ifdef TARGET_NR_iopl
+    {"iopl", TARGET_NR_iopl},
+#endif
+#ifdef TARGET_NR_ioperm
+    {"ioperm", TARGET_NR_ioperm},
+#endif
+#ifdef TARGET_NR_create_module
+    {"create_module", TARGET_NR_create_module},
+#endif
+#ifdef TARGET_NR_init_module
+    {"init_module", TARGET_NR_init_module},
+#endif
+#ifdef TARGET_NR_delete_module
+    {"delete_module", TARGET_NR_delete_module},
+#endif
+#ifdef TARGET_NR_get_kernel_syms
+    {"get_kernel_syms", TARGET_NR_get_kernel_syms},
+#endif
+#ifdef TARGET_NR_query_module
+    {"query_module", TARGET_NR_query_module},
+#endif
+#ifdef TARGET_NR_quotactl
+    {"quotactl", TARGET_NR_quotactl},
+#endif
+#ifdef TARGET_NR_nfsservctl
+    {"nfsservctl", TARGET_NR_nfsservctl},
+#endif
+#ifdef TARGET_NR_getpmsg
+    {"getpmsg", TARGET_NR_getpmsg},
+#endif
+#ifdef TARGET_NR_putpmsg
+    {"putpmsg", TARGET_NR_putpmsg},
+#endif
+#ifdef TARGET_NR_afs_syscall
+    {"afs_syscall", TARGET_NR_afs_syscall},
+#endif
+#ifdef TARGET_NR_tuxcall
+    {"tuxcall", TARGET_NR_tuxcall},
+#endif
+#ifdef TARGET_NR_security
+    {"security", TARGET_NR_security},
+#endif
+#ifdef TARGET_NR_gettid
+    {"gettid", TARGET_NR_gettid},
+#endif
+#ifdef TARGET_NR_readahead
+    {"readahead", TARGET_NR_readahead},
+#endif
+#ifdef TARGET_NR_setxattr
+    {"setxattr", TARGET_NR_setxattr},
+#endif
+#ifdef TARGET_NR_lsetxattr
+    {"lsetxattr", TARGET_NR_lsetxattr},
+#endif
+#ifdef TARGET_NR_fsetxattr
+    {"fsetxattr", TARGET_NR_fsetxattr},
+#endif
+#ifdef TARGET_NR_getxattr
+    {"getxattr", TARGET_NR_getxattr},
+#endif
+#ifdef TARGET_NR_lgetxattr
+    {"lgetxattr", TARGET_NR_lgetxattr},
+#endif
+#ifdef TARGET_NR_fgetxattr
+    {"fgetxattr", TARGET_NR_fgetxattr},
+#endif
+#ifdef TARGET_NR_listxattr
+    {"listxattr", TARGET_NR_listxattr},
+#endif
+#ifdef TARGET_NR_llistxattr
+    {"llistxattr", TARGET_NR_llistxattr},
+#endif
+#ifdef TARGET_NR_flistxattr
+    {"flistxattr", TARGET_NR_flistxattr},
+#endif
+#ifdef TARGET_NR_removexattr
+    {"removexattr", TARGET_NR_removexattr},
+#endif
+#ifdef TARGET_NR_lremovexattr
+    {"lremovexattr", TARGET_NR_lremovexattr},
+#endif
+#ifdef TARGET_NR_fremovexattr
+    {"fremovexattr", TARGET_NR_fremovexattr},
+#endif
+#ifdef TARGET_NR_tkill
+    {"tkill", TARGET_NR_tkill},
+#endif
+#ifdef TARGET_NR_time
+    {"time", TARGET_NR_time},
+#endif
+#ifdef TARGET_NR_futex
+    {"futex", TARGET_NR_futex},
+#endif
+#ifdef TARGET_NR_sched_setaffinity
+    {"sched_setaffinity", TARGET_NR_sched_setaffinity},
+#endif
+#ifdef TARGET_NR_sched_getaffinity
+    {"sched_getaffinity", TARGET_NR_sched_getaffinity},
+#endif
+#ifdef TARGET_NR_set_thread_area
+    {"set_thread_area", TARGET_NR_set_thread_area},
+#endif
+#ifdef TARGET_NR_io_setup
+    {"io_setup", TARGET_NR_io_setup},
+#endif
+#ifdef TARGET_NR_io_destroy
+    {"io_destroy", TARGET_NR_io_destroy},
+#endif
+#ifdef TARGET_NR_io_getevents
+    {"io_getevents", TARGET_NR_io_getevents},
+#endif
+#ifdef TARGET_NR_io_submit
+    {"io_submit", TARGET_NR_io_submit},
+#endif
+#ifdef TARGET_NR_io_cancel
+    {"io_cancel", TARGET_NR_io_cancel},
+#endif
+#ifdef TARGET_NR_get_thread_area
+    {"get_thread_area", TARGET_NR_get_thread_area},
+#endif
+#ifdef TARGET_NR_lookup_dcookie
+    {"lookup_dcookie", TARGET_NR_lookup_dcookie},
+#endif
+#ifdef TARGET_NR_epoll_create
+    {"epoll_create", TARGET_NR_epoll_create},
+#endif
+#ifdef TARGET_NR_remap_file_pages
+    {"remap_file_pages", TARGET_NR_remap_file_pages},
+#endif
+#ifdef TARGET_NR_getdents64
+    {"getdents64", TARGET_NR_getdents64},
+#endif
+#ifdef TARGET_NR_set_tid_address
+    {"set_tid_address", TARGET_NR_set_tid_address},
+#endif
+#ifdef TARGET_NR_restart_syscall
+    {"restart_syscall", TARGET_NR_restart_syscall},
+#endif
+#ifdef TARGET_NR_semtimedop
+    {"semtimedop", TARGET_NR_semtimedop},
+#endif
+#ifdef TARGET_NR_fadvise64
+    {"fadvise64", TARGET_NR_fadvise64},
+#endif
+#ifdef TARGET_NR_timer_create
+    {"timer_create", TARGET_NR_timer_create},
+#endif
+#ifdef TARGET_NR_timer_settime
+    {"timer_settime", TARGET_NR_timer_settime},
+#endif
+#ifdef TARGET_NR_timer_gettime
+    {"timer_gettime", TARGET_NR_timer_gettime},
+#endif
+#ifdef TARGET_NR_timer_getoverrun
+    {"timer_getoverrun", TARGET_NR_timer_getoverrun},
+#endif
+#ifdef TARGET_NR_timer_delete
+    {"timer_delete", TARGET_NR_timer_delete},
+#endif
+#ifdef TARGET_NR_clock_settime
+    {"clock_settime", TARGET_NR_clock_settime},
+#endif
+#ifdef TARGET_NR_clock_gettime
+    {"clock_gettime", TARGET_NR_clock_gettime},
+#endif
+#ifdef TARGET_NR_clock_getres
+    {"clock_getres", TARGET_NR_clock_getres},
+#endif
+#ifdef TARGET_NR_clock_nanosleep
+    {"clock_nanosleep", TARGET_NR_clock_nanosleep},
+#endif
+#ifdef TARGET_NR_exit_group
+    {"exit_group", TARGET_NR_exit_group},
+#endif
+#ifdef TARGET_NR_epoll_wait
+    {"epoll_wait", TARGET_NR_epoll_wait},
+#endif
+#ifdef TARGET_NR_epoll_ctl
+    {"epoll_ctl", TARGET_NR_epoll_ctl},
+#endif
+#ifdef TARGET_NR_tgkill
+    {"tgkill", TARGET_NR_tgkill},
+#endif
+#ifdef TARGET_NR_utimes
+    {"utimes", TARGET_NR_utimes},
+#endif
+#ifdef TARGET_NR_vserver
+    {"vserver", TARGET_NR_vserver},
+#endif
+#ifdef TARGET_NR_mbind
+    {"mbind", TARGET_NR_mbind},
+#endif
+#ifdef TARGET_NR_set_mempolicy
+    {"set_mempolicy", TARGET_NR_set_mempolicy},
+#endif
+#ifdef TARGET_NR_get_mempolicy
+    {"get_mempolicy", TARGET_NR_get_mempolicy},
+#endif
+#ifdef TARGET_NR_mq_open
+    {"mq_open", TARGET_NR_mq_open},
+#endif
+#ifdef TARGET_NR_mq_unlink
+    {"mq_unlink", TARGET_NR_mq_unlink},
+#endif
+#ifdef TARGET_NR_mq_timedsend
+    {"mq_timedsend", TARGET_NR_mq_timedsend},
+#endif
+#ifdef TARGET_NR_mq_timedreceive
+    {"mq_timedreceive", TARGET_NR_mq_timedreceive},
+#endif
+#ifdef TARGET_NR_mq_notify
+    {"mq_notify", TARGET_NR_mq_notify},
+#endif
+#ifdef TARGET_NR_mq_getsetattr
+    {"mq_getsetattr", TARGET_NR_mq_getsetattr},
+#endif
+#ifdef TARGET_NR_kexec_load
+    {"kexec_load", TARGET_NR_kexec_load},
+#endif
+#ifdef TARGET_NR_waitid
+    {"waitid", TARGET_NR_waitid},
+#endif
+#ifdef TARGET_NR_add_key
+    {"add_key", TARGET_NR_add_key},
+#endif
+#ifdef TARGET_NR_request_key
+    {"request_key", TARGET_NR_request_key},
+#endif
+#ifdef TARGET_NR_keyctl
+    {"keyctl", TARGET_NR_keyctl},
+#endif
+#ifdef TARGET_NR_ioprio_set
+    {"ioprio_set", TARGET_NR_ioprio_set},
+#endif
+#ifdef TARGET_NR_ioprio_get
+    {"ioprio_get", TARGET_NR_ioprio_get},
+#endif
+#ifdef TARGET_NR_inotify_init
+    {"inotify_init", TARGET_NR_inotify_init},
+#endif
+#ifdef TARGET_NR_inotify_add_watch
+    {"inotify_add_watch", TARGET_NR_inotify_add_watch},
+#endif
+#ifdef TARGET_NR_inotify_rm_watch
+    {"inotify_rm_watch", TARGET_NR_inotify_rm_watch},
+#endif
+#ifdef TARGET_NR_migrate_pages
+    {"migrate_pages", TARGET_NR_migrate_pages},
+#endif
+#ifdef TARGET_NR_openat
+    {"openat", TARGET_NR_openat},
+#endif
+#ifdef TARGET_NR_mkdirat
+    {"mkdirat", TARGET_NR_mkdirat},
+#endif
+#ifdef TARGET_NR_mknodat
+    {"mknodat", TARGET_NR_mknodat},
+#endif
+#ifdef TARGET_NR_fchownat
+    {"fchownat", TARGET_NR_fchownat},
+#endif
+#ifdef TARGET_NR_futimesat
+    {"futimesat", TARGET_NR_futimesat},
+#endif
+#ifdef TARGET_NR_newfstatat
+    {"newfstatat", TARGET_NR_newfstatat},
+#endif
+#ifdef TARGET_NR_unlinkat
+    {"unlinkat", TARGET_NR_unlinkat},
+#endif
+#ifdef TARGET_NR_renameat
+    {"renameat", TARGET_NR_renameat},
+#endif
+#ifdef TARGET_NR_linkat
+    {"linkat", TARGET_NR_linkat},
+#endif
+#ifdef TARGET_NR_symlinkat
+    {"symlinkat", TARGET_NR_symlinkat},
+#endif
+#ifdef TARGET_NR_readlinkat
+    {"readlinkat", TARGET_NR_readlinkat},
+#endif
+#ifdef TARGET_NR_fchmodat
+    {"fchmodat", TARGET_NR_fchmodat},
+#endif
+#ifdef TARGET_NR_faccessat
+    {"faccessat", TARGET_NR_faccessat},
+#endif
+#ifdef TARGET_NR_pselect6
+    {"pselect6", TARGET_NR_pselect6},
+#endif
+#ifdef TARGET_NR_ppoll
+    {"ppoll", TARGET_NR_ppoll},
+#endif
+#ifdef TARGET_NR_unshare
+    {"unshare", TARGET_NR_unshare},
+#endif
+#ifdef TARGET_NR_set_robust_list
+    {"set_robust_list", TARGET_NR_set_robust_list},
+#endif
+#ifdef TARGET_NR_get_robust_list
+    {"get_robust_list", TARGET_NR_get_robust_list},
+#endif
+#ifdef TARGET_NR_splice
+    {"splice", TARGET_NR_splice},
+#endif
+#ifdef TARGET_NR_tee
+    {"tee", TARGET_NR_tee},
+#endif
+#ifdef TARGET_NR_sync_file_range
+    {"sync_file_range", TARGET_NR_sync_file_range},
+#endif
+#ifdef TARGET_NR_vmsplice
+    {"vmsplice", TARGET_NR_vmsplice},
+#endif
+#ifdef TARGET_NR_move_pages
+    {"move_pages", TARGET_NR_move_pages},
+#endif
+#ifdef TARGET_NR_utimensat
+    {"utimensat", TARGET_NR_utimensat},
+#endif
+#ifdef TARGET_NR_epoll_pwait
+    {"epoll_pwait", TARGET_NR_epoll_pwait},
+#endif
+#ifdef TARGET_NR_signalfd
+    {"signalfd", TARGET_NR_signalfd},
+#endif
+#ifdef TARGET_NR_timerfd_create
+    {"timerfd_create", TARGET_NR_timerfd_create},
+#endif
+#ifdef TARGET_NR_eventfd
+    {"eventfd", TARGET_NR_eventfd},
+#endif
+#ifdef TARGET_NR_fallocate
+    {"fallocate", TARGET_NR_fallocate},
+#endif
+#ifdef TARGET_NR_timerfd_settime
+    {"timerfd_settime", TARGET_NR_timerfd_settime},
+#endif
+#ifdef TARGET_NR_timerfd_gettime
+    {"timerfd_gettime", TARGET_NR_timerfd_gettime},
+#endif
+#ifdef TARGET_NR_accept4
+    {"accept4", TARGET_NR_accept4},
+#endif
+#ifdef TARGET_NR_signalfd4
+    {"signalfd4", TARGET_NR_signalfd4},
+#endif
+#ifdef TARGET_NR_eventfd2
+    {"eventfd2", TARGET_NR_eventfd2},
+#endif
+#ifdef TARGET_NR_epoll_create1
+    {"epoll_create1", TARGET_NR_epoll_create1},
+#endif
+#ifdef TARGET_NR_dup3
+    {"dup3", TARGET_NR_dup3},
+#endif
+#ifdef TARGET_NR_pipe2
+    {"pipe2", TARGET_NR_pipe2},
+#endif
+#ifdef TARGET_NR_inotify_init1
+    {"inotify_init1", TARGET_NR_inotify_init1},
+#endif
+#ifdef TARGET_NR_preadv
+    {"preadv", TARGET_NR_preadv},
+#endif
+#ifdef TARGET_NR_pwritev
+    {"pwritev", TARGET_NR_pwritev},
+#endif
+#ifdef TARGET_NR_rt_tgsigqueueinfo
+    {"rt_tgsigqueueinfo", TARGET_NR_rt_tgsigqueueinfo},
+#endif
+#ifdef TARGET_NR_perf_event_open
+    {"perf_event_open", TARGET_NR_perf_event_open},
+#endif
+#ifdef TARGET_NR_recvmmsg
+    {"recvmmsg", TARGET_NR_recvmmsg},
+#endif
+#ifdef TARGET_NR_fanotify_init
+    {"fanotify_init", TARGET_NR_fanotify_init},
+#endif
+#ifdef TARGET_NR_fanotify_mark
+    {"fanotify_mark", TARGET_NR_fanotify_mark},
+#endif
+#ifdef TARGET_NR_prlimit64
+    {"prlimit64", TARGET_NR_prlimit64},
+#endif
+#ifdef TARGET_NR_name_to_handle_at
+    {"name_to_handle_at", TARGET_NR_name_to_handle_at},
+#endif
+#ifdef TARGET_NR_open_by_handle_at
+    {"open_by_handle_at", TARGET_NR_open_by_handle_at},
+#endif
+#ifdef TARGET_NR_clock_adjtime
+    {"clock_adjtime", TARGET_NR_clock_adjtime},
+#endif
+#ifdef TARGET_NR_syncfs
+    {"syncfs", TARGET_NR_syncfs},
+#endif
+#ifdef TARGET_NR_sendmmsg
+    {"sendmmsg", TARGET_NR_sendmmsg},
+#endif
+#ifdef TARGET_NR_setns
+    {"setns", TARGET_NR_setns},
+#endif
+#ifdef TARGET_NR_getcpu
+    {"getcpu", TARGET_NR_getcpu},
+#endif
+#ifdef TARGET_NR_process_vm_readv
+    {"process_vm_readv", TARGET_NR_process_vm_readv},
+#endif
+#ifdef TARGET_NR_process_vm_writev
+    {"process_vm_writev", TARGET_NR_process_vm_writev},
+#endif
+#ifdef TARGET_NR_kcmp
+    {"kcmp", TARGET_NR_kcmp},
+#endif
+#ifdef TARGET_NR_finit_module
+    {"finit_module", TARGET_NR_finit_module},
+#endif
+#ifdef TARGET_NR_sched_setattr
+    {"sched_setattr", TARGET_NR_sched_setattr},
+#endif
+#ifdef TARGET_NR_sched_getattr
+    {"sched_getattr", TARGET_NR_sched_getattr},
+#endif
+#ifdef TARGET_NR_renameat2
+    {"renameat2", TARGET_NR_renameat2},
+#endif
+#ifdef TARGET_NR_seccomp
+    {"seccomp", TARGET_NR_seccomp},
+#endif
+#ifdef TARGET_NR_getrandom
+    {"getrandom", TARGET_NR_getrandom},
+#endif
+#ifdef TARGET_NR_memfd_create
+    {"memfd_create", TARGET_NR_memfd_create},
+#endif
+#ifdef TARGET_NR_kexec_file_load
+    {"kexec_file_load", TARGET_NR_kexec_file_load},
+#endif
+#ifdef TARGET_NR_bpf
+    {"bpf", TARGET_NR_bpf},
+#endif
+#ifdef TARGET_NR_execveat
+    {"execveat", TARGET_NR_execveat},
+#endif
+#ifdef TARGET_NR_userfaultfd
+    {"userfaultfd", TARGET_NR_userfaultfd},
+#endif
+#ifdef TARGET_NR_membarrier
+    {"membarrier", TARGET_NR_membarrier},
+#endif
+#ifdef TARGET_NR_mlock2
+    {"mlock2", TARGET_NR_mlock2},
+#endif
+#ifdef TARGET_NR_copy_file_range
+    {"copy_file_range", TARGET_NR_copy_file_range},
+#endif
+#ifdef TARGET_NR_preadv2
+    {"preadv2", TARGET_NR_preadv2},
+#endif
+#ifdef TARGET_NR_pwritev2
+    {"pwritev2", TARGET_NR_pwritev2},
+#endif
     {NULL, -1}  /* End marker */
 };
 

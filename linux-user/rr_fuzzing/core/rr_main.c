@@ -2,23 +2,43 @@
  * RR-Fuzz Main Module - Framework initialization and core logic
  */
 
-/* Ensure RR_DEBUG is defined */
-#ifndef RR_DEBUG
-#define RR_DEBUG 1
-#endif
-
+#include "qemu/osdep.h"
+#include "cpu.h"
+#include "../../qemu.h"
+#include "../../user-internals.h"
 #include "rr_framework.h"
 #include "rr_bb_trace.h"
 #include "../replay/rr_replay_strace.h"
 #include "../record/rr_aux_data.h"
 #include "../utils/rr_dynamic_trace.h"
 #include "../fuzzing/qemu_integration/rr_coverage.h"
-#include "../utils/rr_syscall_tree.h"  // Syscall tree tracking
+#include "../utils/rr_syscall_dispatch.h"
+#include "../utils/rr_syscall_tree.h"
 #include "rr_constants.h"
 #include "qemu/error-report.h"
 #include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
+
+
+/* rr_flush_tb_cache is now correctly leveraging header definitions */
+void rr_flush_tb_cache(void)
+
+{
+    if (thread_cpu) {
+        RR_INFO("Flushing TB cache to apply new configuration...");
+        queue_tb_flush(thread_cpu);
+    } else {
+        RR_WARN("Cannot flush TB cache: thread_cpu is NULL");
+    }
+}
+
+
+/* Ensure RR_DEBUG is defined */
+#ifndef RR_DEBUG
+#define RR_DEBUG 1
+#endif
+
 
 /* Global framework state */
 rr_framework_t *g_rr_framework = NULL;
@@ -51,46 +71,23 @@ target_ulong g_pending_mmap_length = 0;
  * @see rr_syscall_post_hook() primarily uses this function for log output.
  */
 static const char* get_syscall_name(int syscall_nr) {
+    const char *name = rr_get_syscall_name_fast(syscall_nr);
+    if (name) return name;
+
+    /* Fallback for common numbers if dispatcher not fully initialized or missing */
     switch (syscall_nr) {
-        case 0: return "read";
-        case 1: return "write";
-        case 2: return "open";
-        case 3: return "close";
-        case 4: return "stat";
-        case 5: return "fstat";
-        case 6: return "lstat";
-        case 7: return "poll";
-        case 8: return "lseek";
-        case 9: return "mmap";
-        case 10: return "mprotect";
-        case 11: return "munmap";
-        case 12: return "brk";
-        case 13: return "rt_sigaction";
-        case 14: return "rt_sigprocmask";
-        case 15: return "rt_sigreturn";
-        case 16: return "ioctl";
-        case 17: return "pread64";
-        case 18: return "pwrite64";
-        case 19: return "readv";
-        case 20: return "writev";
-        case 21: return "access";
-        case 22: return "pipe";
-        case 23: return "select";
-        case 39: return "getpid";
-        case 63: return "uname";
-        case 102: return "getuid";
-        case 104: return "getgid";
-        case 137: return "statfs";
-        case 158: return "arch_prctl";
-        case 217: return "getdents64";
-        case 218: return "set_tid_address";
-        case 231: return "exit_group";
-        case 257: return "openat";
-        case 262: return "newfstatat";
-        case 273: return "set_robust_list";
-        case 302: return "prlimit64";
-        case 318: return "getrandom";
-        case 334: return "rseq";
+#ifdef TARGET_NR_read
+        case TARGET_NR_read: return "read";
+#endif
+#ifdef TARGET_NR_write
+        case TARGET_NR_write: return "write";
+#endif
+#ifdef TARGET_NR_exit_group
+        case TARGET_NR_exit_group: return "exit_group";
+#endif
+#ifdef TARGET_NR_exit
+        case TARGET_NR_exit: return "exit";
+#endif
         default: return "unknown";
     }
 }
@@ -774,9 +771,20 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
     }
 
     /* Syscall entry hint for debugging */
-    const char* syscall_name = get_syscall_name(num);
+    // const char* syscall_name = get_syscall_name(num);
+
     
-    if (num == 231 || num == 60) {
+    if (
+#ifdef TARGET_NR_exit_group
+        num == TARGET_NR_exit_group
+#endif
+#if defined(TARGET_NR_exit_group) && defined(TARGET_NR_exit)
+        ||
+#endif
+#ifdef TARGET_NR_exit
+        num == TARGET_NR_exit
+#endif
+    ) {
         /* RR_INFO("=== EXIT SYSCALL DETECTED: %s (%d) ===", syscall_name, num); */
         if (g_rr_framework->mode == RR_MODE_RECORD) {
             abi_long args[8] = {
@@ -1102,11 +1110,13 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                     }
                     break;
 
+#ifdef TARGET_NR_close
                 case TARGET_NR_close:
                     if (ret == 0) {
                         rr_fd_mapping_remove((int)record->args[0]);
                     }
                     break;
+#endif
 
 #ifdef TARGET_NR_pipe
                 case TARGET_NR_pipe:
@@ -1145,14 +1155,16 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                     }
                     break;
 
+#ifdef TARGET_NR_munmap
                 case TARGET_NR_munmap:
                     if (ret == 0) {
                         rr_addr_mapping_remove((target_ulong)record->args[0]);
                     }
                     break;
+#endif
 
-                case TARGET_NR_mremap:
 #ifdef TARGET_NR_mremap
+                case TARGET_NR_mremap:
                     if (ret != (abi_long)-1) {
                         rr_addr_mapping_remove((target_ulong)record->args[0]);
                         rr_handle_mmap_post((target_ulong)record->args[0], (target_ulong)ret);
@@ -1160,6 +1172,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                     break;
 #endif
 
+#ifdef TARGET_NR_brk
                 case TARGET_NR_brk:
                     if (ret != (abi_long)-1 && record->has_aux_data) {
                         rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0);
@@ -1170,6 +1183,7 @@ void rr_syscall_post_hook(CPUArchState *env, int num, abi_long ret,
                         }
                     }
                     break;
+#endif
 
                 default:
                     break;

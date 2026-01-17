@@ -275,7 +275,7 @@ class FuzzingCore:
         # Layer 2: Core Components
         self.mutator = mutator if mutator else BaseMutator()
         # ✅ Multi-process: Pass shared_coverage to CoverageTracker
-        self.coverage_tracker = CoverageTracker(output_dir, shared_coverage=shared_coverage)
+        self.coverage_tracker = CoverageTracker(shared_coverage=shared_coverage)
         alog("CoverageTracker initialized", "CORE", "DEBUG")
 
 
@@ -285,7 +285,6 @@ class FuzzingCore:
             alog("🚀 Using Process Persistence (Fork Server Mode)", "CORE", "INFO")
         else:
             alog("🚀 Using Fresh Execution Mode (One process per task)", "CORE", "INFO")
-            
         self.execution_engine = QEMUExecutor(
             qemu_path, 
             target_binary, 
@@ -293,6 +292,7 @@ class FuzzingCore:
             persistent_mode=use_fork_server,
             log_file=os.path.join(output_dir, "qemu_debug.log")
         )
+        alog(f"Execution engine initialized. SHM_ENV={self.execution_engine._coverage_env_value}", "CORE", "INFO")
 
 
         self.crash_detector = CrashDetector(output_dir)

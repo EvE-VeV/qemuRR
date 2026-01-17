@@ -4,12 +4,21 @@ AFL Enhanced Mutator - AFL风格的系统化变异
 在现有SmartMutator基础上添加AFL核心思想
 """
 
+import os
 import struct
 import random
 from typing import List, Dict, Any, Optional, Tuple
-from .mutator import SmartMutator
-from .instruction import FuzzInstruction
-from .constants import *
+try:
+    from .mutator import SmartMutator
+    from .instruction import FuzzInstruction
+    from .constants import *
+except ImportError:
+    # Standalone/Test mode
+    from mutator import SmartMutator
+    from instruction import FuzzInstruction
+    from constants import *
+import subprocess
+import re
 
 class AFLStage:
     """AFL变异阶段枚举"""
@@ -84,6 +93,10 @@ class AFLEnhancedMutator(SmartMutator):
         # 当前种子数据缓存
         self.current_seed_data = None
         self.current_target_index = None
+
+        # 字典数据
+        self.dictionary = []
+        self._extract_dictionary_tokens(target_binary)
 
         print("[AFLMutator] ✅ Initialized with AFL-style systematic exploration")
 
@@ -176,6 +189,8 @@ class AFLEnhancedMutator(SmartMutator):
         elif self.current_stage == AFLStage.HAVOC:
             # Havoc阶段：使用现有的智能变异策略
             afl_instructions = super().build_instructions(iteration, fork_point)
+        elif self.current_stage == AFLStage.EXTRAS_AO:
+             afl_instructions = self._generate_extras_ao_instructions(target_candidate)
 
         # 推进阶段
         self._advance_afl_stage()
@@ -578,3 +593,103 @@ class AFLEnhancedMutator(SmartMutator):
     def build_instructions(self, iteration: int, fork_point: Optional[int] = None) -> List[FuzzInstruction]:
         """覆盖父类方法，使用AFL增强版本"""
         return self.build_instructions_afl_enhanced(iteration, fork_point)
+
+    def _extract_dictionary_tokens(self, target_binary):
+        """从目标二进制提取字典Token"""
+        if not target_binary or not os.path.exists(target_binary):
+            print("[AFLMutator] ⚠️ Target binary not provided or not found, skipping dictionary extraction")
+            return
+
+        try:
+            print(f"[AFLMutator] 📖 Extracting dictionary tokens from {target_binary}...")
+            # 使用 strings 命令提取
+            result = subprocess.run(['strings', target_binary], capture_output=True, text=True, check=True)
+            strings = result.stdout.splitlines()
+
+            # 过滤和处理
+            count = 0
+            for s in strings:
+                s = s.strip()
+                # 保留长度在 3 到 32 之间的字符串
+                if 3 <= len(s) <= 32:
+                    # 转为 bytes
+                    try:
+                        token = s.encode('utf-8')
+                        if token not in self.dictionary:
+                            self.dictionary.append(token)
+                            count += 1
+                    except:
+                        pass
+            
+            # 对常用的Magic Bytes进行硬编码补充
+            common_magics = [
+                b"HTTP/1.1", b"GET", b"POST", b"Host:", b"User-Agent:", 
+                b"Content-Length:", b"Content-Type:", b"Connection:",
+                b"admin", b"password", b"root", b"123456",
+                b"soap:Envelope", b"urn:schemas", 
+                b"ABC", b"XYZ", b"MAGIC" # 测试用例常见
+            ]
+            
+            for m in common_magics:
+                if m not in self.dictionary:
+                    self.dictionary.append(m)
+                    count += 1
+
+            print(f"[AFLMutator] ✅ Extracted {count} tokens. Total dictionary size: {len(self.dictionary)}")
+            
+            # 限制字典大小，随机保留 200 个，加上最新的 50 个
+            if len(self.dictionary) > 500:
+                 import random
+                 self.dictionary = random.sample(self.dictionary, 500)
+                 print(f"[AFLMutator] ✂️ Dictionary truncated to 500 items")
+
+        except Exception as e:
+             print(f"[AFLMutator] ❌ Failed to extract dictionary: {e}")
+
+    def _generate_extras_ao_instructions(self, target_candidate) -> List[FuzzInstruction]:
+        """生成自动字典(Extras Auto)变异指令"""
+        instructions = []
+        if not self.dictionary:
+            return []
+            
+        seed_data = self.current_seed_data
+        if not seed_data or len(seed_data) == 0:
+            return []
+            
+        # 尝试生成 5-10 个字典变异
+        num_mutations = random.randint(5, 10)
+        
+        for _ in range(num_mutations):
+            token = random.choice(self.dictionary)
+            
+            # 策略1: 覆盖 (Overwrite)
+            # 随机选择位置插入 Token
+            if len(seed_data) >= len(token):
+                pos = random.randint(0, len(seed_data) - len(token))
+                
+                new_data = bytearray(seed_data)
+                # 复杂的 Overwrite
+                for k in range(len(token)):
+                    new_data[pos + k] = token[k]
+                
+                instruction = FuzzInstruction(
+                    syscall_index=target_candidate.index,
+                    cmd=FUZZ_CMD_REPLACE_BUFFER, # 使用 REPLACE_BUFFER 携带完整 payload
+                    arg_index=1,
+                    data=bytes(new_data)
+                )
+                instructions.append(instruction)
+            
+            # 策略2: 插入 (Insert) - 这里简化为替换整个Buffer为 "Token" 或者 "Prefix + Token + Suffix"
+            # 由于目前指令集限制，主要使用 REPLACE_BUFFER
+            if random.random() < 0.3:
+                 instruction = FuzzInstruction(
+                    syscall_index=target_candidate.index,
+                    cmd=FUZZ_CMD_REPLACE_BUFFER,
+                    arg_index=1,
+                    data=token # 直接把Token作为内容
+                )
+                 instructions.append(instruction)
+        
+        print(f"[AFLMutator] 📖 Generated {len(instructions)} dictionary mutations (EXTRAS_AO)")
+        return instructions

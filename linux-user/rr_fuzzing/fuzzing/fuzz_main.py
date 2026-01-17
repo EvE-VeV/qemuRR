@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--args", default="", help="Target binary arguments")
     parser.add_argument("--tree", action="store_true", help="Enable Syscall Tree visualization (default: False)")
     parser.add_argument("--persistence", action="store_true", help="Enable unified session persistence (Auto Save/Resume)")
+    parser.add_argument("--word-size", type=int, default=0, help="Word size (32 or 64, 0 for auto)")
+    parser.add_argument("--endian", default="auto", choices=["auto", "little", "big"], help="Endianness")
     
     args = parser.parse_args()
     
@@ -30,7 +32,12 @@ def main():
     try:
         # Initialize Core
         # Note: SmartMutator requires trace_file and target_binary
-        mutator = SmartMutator(args.trace, target_binary=args.target)
+        mutator = SmartMutator(
+            args.trace, 
+            target_binary=args.target,
+            word_size=args.word_size,
+            endian=args.endian
+        )
         
         fuzzing_core = FuzzingCore(
             qemu_path=args.qemu,

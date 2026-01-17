@@ -8,6 +8,7 @@ We resolved several critical stability and correctness issues to reach this stat
 
 ### Core Correctness
 *   **Trace Overwrite Fix**: Resolved a race condition where `QEMUExecutor` overwrote valid seed traces with zeroed files. Implemented `RR_BB_TRACE_FILE` env var support.
+*   **Arch Compatibility (v8.0)**: Refactored C-side syscall dispatch to use `TARGET_NR_xxx` macros and increased table size to 10k. Fixed MIPS "0 edges" bug.
 *   **PathFinder Logic**: Fixed "0 matched BBs" stagnation by correctly populating `bb_to_syscall` map and implementing an "Exploration Mode" fallback for saturated graphs.
 *   **Syscall Mapping**: Expanded x86_64 mapping to include crucial IO syscalls (`pread64`, `pwrite64`, etc.), enabling correct fork point detection for `who` and `ls`.
 
@@ -73,3 +74,11 @@ Tested against the actual vulnerable binaries from the LAVA corpus (LAVA-M sourc
 | `uniq` | LAVA-M | 2,000 | 483 | 🔺 +145% |
 | `md5sum` | LAVA-M | 2,000 | 457 | 🔺 +133% |
 | `base64` | LAVA-M | 2,000 | 428 | 🔺 +199% |
+
+### 2.5 MIPS Target Validation (v8.0 Milestone)
+Verified systemic cross-architecture fixes on MIPS (32-bit LE) binaries.
+
+| Target | Architecture | Mode | Edges | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| `busybox ls` | **MIPS (LE)** | Record/Replay | **355+** | ✅ **Fixed (was 0)** |
+| `busybox find`| **MIPS (LE)** | Record/Replay | **268+** | ✅ Success |

@@ -75,19 +75,24 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 
     /* Restore from AUX data based on syscall type */
     switch (num) {
+#ifdef TARGET_NR_brk
         case TARGET_NR_brk:
+#endif
 #if defined(TARGET_NR_mmap)
         case TARGET_NR_mmap:
 #endif
 #if defined(TARGET_NR_mmap2)
         case TARGET_NR_mmap2:
 #endif
+#if defined(TARGET_NR_brk) || defined(TARGET_NR_mmap) || defined(TARGET_NR_mmap2)
         {
             /* brk/mmap require real execution to maintain QEMU internal state; fallback directly */
             RR_VERBOSE("PURE_REPLAY: Syscall %d requires hybrid path, fallback", num);
             return -1;
         }
+#endif
 
+#ifdef TARGET_NR_read
         case TARGET_NR_read: {
             /* Restore read data from aux_data */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1); /* arg[1] is the buffer */
@@ -102,13 +107,21 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
             }
             break;
         }
+#endif
 
+#ifdef TARGET_NR_write
         case TARGET_NR_write:
-        case TARGET_NR_writev: {
+#endif
+#ifdef TARGET_NR_writev
+        case TARGET_NR_writev:
+#endif
+#if defined(TARGET_NR_write) || defined(TARGET_NR_writev)
+        {
             /* Output syscalls not supported in Pure Replay; must execute to maintain I/O state */
             RR_VERBOSE("PURE_REPLAY: Output syscall write/writev, falling back to real execution");
             return -1; /* Let hybrid mode execute real syscall */
         }
+#endif
 
 #ifdef TARGET_NR_getrandom
         case TARGET_NR_getrandom:
@@ -186,6 +199,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
             return -1;
 #endif
 
+#ifdef TARGET_NR_ioctl
         case TARGET_NR_ioctl: {
             /* ioctl Pure Replay - Restore output buffer from AUX data */
             rr_aux_data_t *aux = rr_aux_find(record->aux_data, 2); /* arg[2] is the buffer */
@@ -200,10 +214,11 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
                 }
             } else {
                 /* No captured output data, might be an unsupported ioctl command */
-                RR_VERBOSE("PURE_REPLAY: No ioctl output data, fallback to hybrid");
+                RR_VERBOSE("PURE_REPLAY: No IOCTL_OUTPUT aux_data for ioctl cmd=0x%lx", (unsigned long)args[1]);
             }
             break;
         }
+#endif
 
 
 

@@ -70,9 +70,9 @@ class SyscallRecord:
     
     @staticmethod
     def _nr_to_name(nr: int) -> str:
-        """Convert syscall number to name (x86_64)"""
-        # Common syscall mappings (x86_64)
-        syscall_map = {
+        """Convert syscall number to name (multi-architecture)"""
+        # x86_64 syscall mappings
+        x86_64_map = {
             0: 'read',
             1: 'write',
             2: 'open',
@@ -140,7 +140,103 @@ class SyscallRecord:
             273: 'set_robust_list',
             318: 'getrandom',
         }
-        return syscall_map.get(nr, f'syscall_{nr}')
+        
+        # ✅ MIPS syscall mappings (offset by 4000)
+        # Reference: https://github.com/torvalds/linux/blob/master/arch/mips/include/uapi/asm/unistd.h
+        mips_map = {
+            4000: 'syscall',     # sys_syscall
+            4001: 'exit',
+            4002: 'fork',
+            4003: 'read',
+            4004: 'write',
+            4005: 'open',
+            4006: 'close',
+            4007: 'waitpid',
+            4008: 'creat',
+            4009: 'link',
+            4010: 'unlink',
+            4011: 'execve',
+            4012: 'chdir',
+            4013: 'time',
+            4014: 'mknod',
+            4015: 'chmod',
+            4016: 'lchown',
+            4019: 'lseek',
+            4020: 'getpid',
+            4021: 'mount',
+            4022: 'umount',
+            4023: 'setuid',
+            4024: 'getuid',
+            4033: 'access',
+            4041: 'dup',
+            4042: 'pipe',
+            4045: 'brk',
+            4047: 'getgid',
+            4049: 'geteuid',
+            4050: 'getegid',
+            4054: 'ioctl',
+            4055: 'fcntl',
+            4063: 'dup2',
+            4064: 'getppid',
+            4076: 'brk',      # dup of 4045, different ABI
+            4090: 'mmap',
+            4091: 'munmap',
+            4106: 'stat',
+            4107: 'lstat',
+            4108: 'fstat',
+            4120: 'clone',
+            4122: 'uname',
+            4125: 'mprotect',
+            4140: 'llseek',
+            4141: 'getdents',
+            4179: 'rt_sigaction',
+            4180: 'pread64',
+            4181: 'pwrite64',
+            # ✅ Network syscalls (Critical for jjhttpd/upnp)
+            4183: 'socket',
+            4184: 'connect',
+            4185: 'accept',
+            4186: 'sendto',
+            4187: 'recvfrom',
+            4188: 'sendmsg',
+            4189: 'recvmsg',
+            4190: 'shutdown',
+            4191: 'bind',
+            4192: 'listen',
+            4193: 'getsockname',
+            4194: 'getpeername',
+            4195: 'socketpair',
+            4196: 'send',
+            4197: 'recv',
+            4198: 'getsockopt',
+            4199: 'setsockopt',
+            # More syscalls
+            4213: 'set_tid_address',
+            4214: 'getdents64',
+            4215: 'fcntl64',
+            4238: 'set_robust_list',
+            4246: 'exit_group',
+            4248: 'tkill',
+            4266: 'tgkill',
+            4294: 'getrandom',
+            4300: 'mmap2',
+            4305: 'openat',
+            4326: 'newfstatat',
+        }
+        
+        # Try MIPS first (4000+ range)
+        if nr >= 4000:
+            name = mips_map.get(nr)
+            if name:
+                return name
+        
+        # Try x86_64
+        name = x86_64_map.get(nr)
+        if name:
+            return name
+        
+        # Fallback to generic name
+        return f'syscall_{nr}'
     
     def _categorize(self) -> str:
         """Classify syscall - returns functional category, not pure/hybrid classification"""
@@ -191,7 +287,15 @@ class TraceAnalyzer:
     }
     TRACE_VERSION = 1
     
-    def __init__(self, trace_file: str):
+    def __init__(self, trace_file: str, endian: str = 'auto', word_size: int = 0):
+        """
+        Initialize TraceAnalyzer
+        
+        Args:
+            trace_file: Path to trace file
+            endian: Byte order - 'little', 'big', or 'auto' (default: auto-detect)
+            word_size: Architecture word size - 32, 64, or 0 for auto-detect (default)
+        """
         self.trace_file = trace_file
         self.syscalls: List[SyscallRecord] = []
         self.pure_syscalls: List[SyscallRecord] = []
@@ -207,15 +311,26 @@ class TraceAnalyzer:
             'network': 0,
             'time': 0,
             'process': 0,
-            'unknown': 0  # ✅ FIX: Add unknown category
+            'unknown': 0
         }
+        
+        # ✅ CRITICAL FIX: Multi-architecture support (endianness + word size)
+        self.endian_format = endian
+        self.detected_endian = None
+        self.struct_prefix = '<'
+        
+        # ✅ NEW: Architecture word size support
+        self.word_size_format = word_size  # 32, 64, or 0 (auto)
+        self.detected_word_size = None  # Will be set during analysis
+        self.arg_format = 'Q'  # Default to 64-bit, will be updated
+        self.args_size = 64  # 8 args * 8 bytes
+        self.retval_size = 8
         
         # BB trace related
         self.bb_trace_parser: Optional[BBTraceParser] = None
         self.bb_trace_available = False
-        self.merged_execution_sequence = []  # Merged execution sequence
+        self.merged_execution_sequence = []
         
-        # ✅ FIX: Track if already analyzed to prevent re-analysis
         self._analyzed = False
         
         # Parse trace file automatically
@@ -324,8 +439,8 @@ class TraceAnalyzer:
             return False
     
     def _read_header(self, f) -> bool:
-        """Read trace header"""
-        # Magic number (4 bytes)
+        """Read trace header and detect endianness"""
+        # Magic number (4 bytes) - architecture-neutral
         magic = struct.unpack('I', f.read(4))[0]
         if magic not in self.VALID_TRACE_MAGICS:
             valid_magics_str = ", ".join([f"0x{m:08X} ({n})" for m, n in self.VALID_TRACE_MAGICS.items()])
@@ -333,89 +448,165 @@ class TraceAnalyzer:
             alog(f"[TraceAnalyzer]    Expected one of: {valid_magics_str}", "TRACE", "ERROR")
             return False
         
-        # Record actual format used
         format_name = self.VALID_TRACE_MAGICS[magic]
-        # alog(f"Detected trace format: {format_name} (0x{magic:08X})", "TRACE", "DEBUG")
         
-        # Version (4 bytes)
-        version = struct.unpack('I', f.read(4))[0]
+        # First, read version and count from both endianness to detect
+        saved_pos = f.tell()
+        
+        # Try little-endian
+        version_le = struct.unpack('<I', f.read(4))[0]
+        count_le = struct.unpack('<I', f.read(4))[0]
+        
+        # Try big-endian
+        f.seek(saved_pos)
+        version_be = struct.unpack('>I', f.read(4))[0]
+        count_be = struct.unpack('>I', f.read(4))[0]
+        
+        # Determine endianness first
+        if self.endian_format == 'auto':
+            # Read first record header to check syscall_nr validity
+            first_syscall_pos = f.tell()
+            header_bytes = f.read(8)
+            f.seek(first_syscall_pos)
+            
+            if len(header_bytes) >= 8:
+                _, syscall_nr_le = struct.unpack('<Ii', header_bytes)
+                _, syscall_nr_be = struct.unpack('>Ii', header_bytes)
+                
+                # MIPS: 4000-4400, x86/ARM: 0-500
+                nr_le_valid = (0 <= syscall_nr_le <= 500) or (4000 <= syscall_nr_le <= 4400)
+                nr_be_valid = (0 <= syscall_nr_be <= 500) or (4000 <= syscall_nr_be <= 4400)
+                
+                if nr_be_valid and not nr_le_valid:
+                    self.detected_endian = 'big'
+                    self.struct_prefix = '>'
+                    version, count = version_be, count_be
+                else:
+                    self.detected_endian = 'little'
+                    self.struct_prefix = '<'
+                    version, count = version_le, count_le
+            else:
+                # Fallback to version/count heuristic
+                le_score = (version_le == 1) + (0 < count_le < 1000000)
+                be_score = (version_be == 1) + (0 < count_be < 1000000)
+                if be_score > le_score:
+                    self.detected_endian = 'big'
+                    self.struct_prefix = '>'
+                    version, count = version_be, count_be
+                else:
+                    self.detected_endian = 'little'
+                    self.struct_prefix = '<'
+                    version, count = version_le, count_le
+        else:
+            # User-specified
+            if self.endian_format == 'big':
+                self.struct_prefix = '>'
+                self.detected_endian = 'big'
+                version, count = version_be, count_be
+            else:
+                self.struct_prefix = '<'
+                self.detected_endian = 'little'
+                version, count = version_le, count_le
+        
+        # Now detect word size using count
+        if self.word_size_format == 0:
+            file_size = os.path.getsize(self.trace_file)
+            avg_record_size = (file_size - 12) / max(count, 1)
+            
+            if avg_record_size < 200:
+                self.detected_word_size = 32
+            else:
+                self.detected_word_size = 64
+            
+            alog(f"[TraceAnalyzer] Heuristic: avg_record_size={avg_record_size:.1f} → {self.detected_word_size}-bit", "TRACE", "DEBUG")
+        else:
+            self.detected_word_size = self.word_size_format
+        
+        # Update format strings based on word size
+        if self.detected_word_size == 32:
+            self.arg_format = 'I'  # 32-bit unsigned
+            self.args_size = 32  # 8 args * 4 bytes
+            self.retval_size = 4
+            alog(f"[TraceAnalyzer] Using 32-bit format (MIPS/ARM32)", "TRACE", "INFO")
+        else:
+            self.arg_format = 'Q'  # 64-bit unsigned
+            self.args_size = 64  # 8 args * 8 bytes
+            self.retval_size = 8
+            alog(f"[TraceAnalyzer] Using 64-bit format (x86_64/ARM64)", "TRACE", "INFO")
+        
         if version != self.TRACE_VERSION:
             print(f"[TraceAnalyzer] ⚠️  Trace version mismatch: {version} (expected {self.TRACE_VERSION})")
         
-        # Record count (4 bytes)
-        count = struct.unpack('I', f.read(4))[0]
         self.stats['total'] = count
-        
-        # self.stats['total'] = count
-        # alog(f"Trace header: Magic=0x{magic:08X}, Version={version}, Count={count}", "TRACE", "DEBUG")
+        alog(f"[TraceAnalyzer] Trace: format={format_name}, version={version}, count={count}, endian={self.detected_endian}, word_size={self.detected_word_size}", "TRACE", "INFO")
         
         return True
     
     def _read_syscall_records(self, f):
-        """Read all syscall records - fixed version, correctly parsing full trace format"""
+        """Read all syscall records - manually aligned with C writer logic"""
         index = 0
         
+        # Determine sizes based on detected environment
+        # Target: abi_long size (detected_word_size)
+        target_long_size = self.detected_word_size // 8
+        # Host: size_t size (always 8 for QEMU on 64-bit host)
+        host_long_size = 8 
+        
         while True:
-            # ===== Step 1: Read fixed fields (150 bytes) =====
             # [A] Record header (8 bytes): index + syscall_nr
             header_data = f.read(8)
             if len(header_data) < 8:
                 break  # EOF
             
-            rec_index, syscall_nr = struct.unpack('<Ii', header_data)
+            rec_index, syscall_nr = struct.unpack(f'{self.struct_prefix}Ii', header_data)
             
-            # [B] Args and retval (72 bytes): args[8] (64) + retval (8)
-            args_retval = f.read(72)
-            if len(args_retval) < 72:
-                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} args_retval")
-                break
+            # [B] Args (8 * 8 = 64 bytes) - ALWAYS 64-bit for universality
+            args_size = 64
+            args_data = f.read(args_size)
+            if len(args_data) < args_size: break
+            args = list(struct.unpack(f'{self.struct_prefix}8Q', args_data))
             
-            retval = struct.unpack('<q', args_retval[64:72])[0]
+            # [C] Retval (8 bytes) - ALWAYS 64-bit for universality
+            retval_data = f.read(8)
+            if len(retval_data) < 8: break
+            retval = struct.unpack(f'{self.struct_prefix}q', retval_data)[0]
             
-            # [C] Arg sizes (64 bytes): arg_sizes[8]
-            arg_sizes = f.read(64)
-            if len(arg_sizes) < 64:
-                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_sizes")
-                break
+            # [D] Arg sizes (8 * 8 = 64 bytes) - ALWAYS 64-bit for universality
+            arg_sizes_data = f.read(64)
+            if len(arg_sizes_data) < 64: break
+            arg_sizes_list = list(struct.unpack(f'{self.struct_prefix}8Q', arg_sizes_data))
             
-            # [D] Flags (6 bytes): creates_fd + uses_fd + created_fd
-            flags = f.read(6)
-            if len(flags) < 6:
-                print(f"[TraceAnalyzer] ⚠️  EOF at record {index} flags")
-                break
+            # [E] Flags and created_fd (EXACTLY 6 bytes, no padding in fwrite)
+            # Layout: bool(1), bool(1), int32_t(4) = 6 bytes
+            flags_data = f.read(6)
+            if len(flags_data) < 6: break
             
-            creates_fd = struct.unpack('<?', flags[0:1])[0]
-            uses_fd = struct.unpack('<?', flags[1:2])[0]
-            created_fd = struct.unpack('<i', flags[2:6])[0]
+            creates_fd = struct.unpack(f'{self.struct_prefix}?', flags_data[0:1])[0]
+            uses_fd = struct.unpack(f'{self.struct_prefix}?', flags_data[1:2])[0]
+            created_fd = struct.unpack(f'{self.struct_prefix}i', flags_data[2:6])[0]
             
             # ===== Step 2: Read variable arg_data section =====
             arg_data_map = {}
             while True:
                 arg_idx_bytes = f.read(4)
-                if len(arg_idx_bytes) < 4:
-                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_idx")
-                    break
+                if len(arg_idx_bytes) < 4: break
                 
-                arg_idx = struct.unpack('<i', arg_idx_bytes)[0]
+                arg_idx = struct.unpack(f'{self.struct_prefix}i', arg_idx_bytes)[0]
                 if arg_idx == -1:  # End marker
                     break
                 
-                # Read size and data
+                # Read size (size_t = 8 bytes) and data
                 size_bytes = f.read(8)
-                if len(size_bytes) < 8:
-                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_size")
-                    break
+                if len(size_bytes) < 8: break
                 
-                size = struct.unpack('<Q', size_bytes)[0]
-                if size > 1000000:  # Sanity check
-                    print(f"[TraceAnalyzer] ⚠️  Record {index}: suspicious arg_size={size}")
+                size = struct.unpack(f'{self.struct_prefix}Q', size_bytes)[0]
+                if size > 10000000:  # Sanity check
+                    if index < 100:
+                        alog(f"[TraceAnalyzer] ⚠️ Suspicious arg_size={size} at rec {index}, offset {f.tell()-8}", "TRACE", "WARN")
                     break
                 
                 data = f.read(size)
-                if len(data) < size:
-                    print(f"[TraceAnalyzer] ⚠️  EOF at record {index} arg_data")
-                    break
-                
+                if len(data) < size: break
                 arg_data_map[arg_idx] = data
             
             # ===== Step 3: Read aux_data section =====
@@ -424,59 +615,33 @@ class TraceAnalyzer:
             
             marker_bytes = f.read(4)
             if len(marker_bytes) >= 4:
-                marker = struct.unpack('<I', marker_bytes)[0]
-                
-                if marker == 0x41555844:  # "AUXD" (little-endian)
+                # The marker in file is written as uint32_t 0x41555844
+                # On little-endian machine it's 44 58 55 41
+                if marker_bytes in [b'AUXD', b'DXUA']:
                     has_aux_data = True
                     aux_cnt_bytes = f.read(4)
-                    if len(aux_cnt_bytes) < 4:
-                        print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux_count")
-                        break
-                    
-                    aux_count = struct.unpack('<I', aux_cnt_bytes)[0]
-                    
-                    # ✅ CRITICAL FIX: Iterate through all aux_data (don't break!)
-                    for j in range(aux_count):
-                        kind_bytes = f.read(1)
-                        arg_mask_bytes = f.read(1)
-                        size_bytes = f.read(4)
+                    if len(aux_cnt_bytes) >= 4:
+                        aux_count = struct.unpack(f'{self.struct_prefix}I', aux_cnt_bytes)[0]
                         
-                        if len(kind_bytes) < 1 or len(arg_mask_bytes) < 1 or len(size_bytes) < 4:
-                            print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux[{j}] header")
-                            break
-                        
-                        kind = struct.unpack('<B', kind_bytes)[0]
-                        arg_mask = struct.unpack('<B', arg_mask_bytes)[0]
-                        size = struct.unpack('<I', size_bytes)[0]
-                        
-                        if size > 1000000:  # Sanity check
-                            print(f"[TraceAnalyzer] ⚠️  Record {index}: suspicious aux_size={size}")
-                            break
-                        
-                        data = f.read(size)
-                        if len(data) < size:
-                            print(f"[TraceAnalyzer] ⚠️  EOF at record {index} aux[{j}] data")
-                            break
-                        
-                        aux_data_size += size
-            
-            # ===== Step 3: Read aux_data section =====
-            # ... (Keep original reading logic unchanged)
-            
-            # Manual heuristic fix (if flags from C side are unreliable)
-            name = SyscallRecord._nr_to_name(syscall_nr)
-            if name in ['open', 'openat', 'socket', 'accept', 'accept4', 'dup', 'dup2', 'dup3', 'epoll_create', 'epoll_create1', 'timerfd_create', 'eventfd', 'eventfd2', 'signalfd', 'signalfd4', 'memfd_create']:
-                if retval > 2: # Ignore stdin/stdout/stderr
-                    creates_fd = True
-                    created_fd = int(retval)
-            
-            if name in ['read', 'write', 'close', 'fstat', 'lseek', 'pread64', 'pwrite64', 'readv', 'writev', 'ioctl', 'fcntl', 'fadvise64', 'ftruncate', 'fchmod', 'fchown', 'fdatasync', 'fsync', 'getdents', 'getdents64', 'sendto', 'recvfrom', 'sendmsg', 'recvmsg', 'shutdown', 'bind', 'listen', 'connect', 'getsockname', 'getpeername', 'setsockopt', 'getsockopt']:
-                uses_fd = True
-            
-            # ===== Step 4: Create Record =====
-            # Parse args
-            args = list(struct.unpack('<8Q', args_retval[0:64]))
-            
+                        for j in range(aux_count):
+                            aux_header = f.read(6) # kind(1), arg_mask(1), size(4)
+                            if len(aux_header) < 6: break
+                            
+                            kind = struct.unpack(f'{self.struct_prefix}B', aux_header[0:1])[0]
+                            arg_mask = struct.unpack(f'{self.struct_prefix}B', aux_header[1:2])[0]
+                            size = struct.unpack(f'{self.struct_prefix}I', aux_header[2:6])[0]
+                            
+                            data = f.read(size)
+                            if len(data) < size: break
+                            aux_data_size += size
+                elif marker_bytes == b'\x00\x00\x00\x00':
+                    pass
+                else:
+                    # Desync recovery: if we found marker_bytes that looks like index, 
+                    # we should backtrack. But in current format, they strictly follow.
+                    f.seek(-4, os.SEEK_CUR) 
+
+            # Create Record
             record = SyscallRecord(
                 index=rec_index,
                 syscall_nr=syscall_nr,
@@ -493,7 +658,7 @@ class TraceAnalyzer:
             self.syscalls.append(record)
             index += 1
         
-        print(f"[TraceAnalyzer] ✅ Read {len(self.syscalls)} syscall records")
+        alog(f"[TraceAnalyzer] ✅ Read {len(self.syscalls)} syscall records", "TRACE", "INFO")
     
     def _classify_and_stats(self):
         """Classification and Statistics"""
@@ -716,21 +881,25 @@ class TraceAnalyzer:
 
 def main():
     """Test Entry Point"""
-    import sys
+    import argparse
     
-    if len(sys.argv) < 2:
-        print("Usage: trace_analyzer.py <trace_file>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="RR-Fuzz Trace Analyzer")
+    parser.add_argument("trace_file", help="Path to trace file")
+    parser.add_argument("-w", "--word-size", type=int, default=0, help="Word size (32 or 64, default: auto)")
+    parser.add_argument("-e", "--endian", default="auto", help="Endianness (little, big, or auto)")
+    parser.add_argument("-j", "--json", help="Export as JSON file")
     
-    trace_file = sys.argv[1]
+    args = parser.parse_args()
     
-    analyzer = TraceAnalyzer(trace_file)
+    # Update word size based on command line
+    analyzer = TraceAnalyzer(args.trace_file, endian=args.endian, word_size=args.word_size)
+    
     if analyzer.analyze():
         analyzer.print_summary()
         
         # Optional: Export JSON
-        if len(sys.argv) >= 3:
-            analyzer.export_to_json(sys.argv[2])
+        if args.json:
+            analyzer.export_to_json(args.json)
 
 
 if __name__ == '__main__':

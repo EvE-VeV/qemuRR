@@ -9,6 +9,7 @@ test_debug
 tests/test_bb_trace
 tests/complex_test_*
 tests/programs/test_programs/
+crashes/newbugs/
 fuzzing_output_*
 # Trace文件
 *.dat
@@ -19,13 +20,12 @@ fuzzing_output_*
 *.log
 test/*.log
 test/*.strace
-test/rr_test_file.txt
-test/simple_qemu_test.log
 compare/
 tests/dataset/*
 __MACOSX/
 crash/*
 tests/realworld/
+tests/images/
 
 # 文档归档（旧文档）
 docs/old-archive/

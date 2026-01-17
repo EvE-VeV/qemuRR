@@ -184,17 +184,17 @@ class QEMUExecutor:
                         cls._shared_coverage_shm = shared_memory.SharedMemory(
                             name=shm_name,
                             create=True,
-                            size=69672  # sizeof(rr_coverage_t)
+                            size=69664  # sizeof(rr_coverage_t)
                         )
                         # Initialize to zeros
-                        cls._shared_coverage_shm.buf[:] = bytes(69672)
+                        cls._shared_coverage_shm.buf[:] = bytes(69664)
                         alog(f"Created isolated coverage SHM ({shm_name})", "EXEC", "INFO")
                     except FileExistsError:
                         # Already exists, just open it
                         cls._shared_coverage_shm = shared_memory.SharedMemory(
                             name=shm_name,
                             create=False,
-                            size=69672
+                            size=69664
                         )
                         alog(f"Opened existing isolated coverage SHM ({shm_name})", "EXEC", "INFO")
                     cls._coverage_env_value = shm_name
@@ -202,14 +202,14 @@ class QEMUExecutor:
                     alog(f"⚠️  SharedMemory permission error: {e}", "EXEC", "WARN")
                     fallback_path = cls._coverage_fallback_path()
                     cls._shared_coverage_shm = cls._FileBackedSharedMemory(
-                        fallback_path, 64 * 1024 + 4096
+                        fallback_path, 69664
                     )
                     cls._coverage_env_value = f"file:{fallback_path}"
                 except Exception as e:
                     alog(f"⚠️  Failed to create shared coverage: {e}", "EXEC", "WARN")
                     fallback_path = cls._coverage_fallback_path()
                     cls._shared_coverage_shm = cls._FileBackedSharedMemory(
-                        fallback_path, 69672
+                        fallback_path, 69664
                     )
                     cls._coverage_env_value = f"file:{fallback_path}"
     
@@ -404,6 +404,30 @@ class QEMUExecutor:
             'RR_BB_TRACE_FILE': f"/tmp/qemu_bb_trace_{os.getpid()}_{self.total_executions}_{time.time()}.bbl",
         })
         
+        # ✅ CRITICAL FIX: Set QEMU_LD_PREFIX for cross-architecture emulation (MIPS, ARM, etc.)
+        # Priority: 1) Existing env var  2) Infer from target path  3) Skip if native
+        if 'QEMU_LD_PREFIX' not in env or not env.get('QEMU_LD_PREFIX'):
+            # Try to infer from target binary path
+            # Common patterns: /path/to/root/bin/program or /path/to/root/usr/bin/program
+            target_path = Path(self.target_binary).resolve()
+            possible_root = None
+            
+            # Walk up from target to find a likely root directory
+            # Look for directories containing 'lib', 'usr' subdirectories (firmware root)
+            for parent in target_path.parents:
+                if (parent / 'lib').exists() or (parent / 'usr').exists():
+                    # Check if it's a firmware root (not system root)
+                    if str(parent) != '/' and str(parent) != '/usr':
+                        possible_root = parent
+                        break
+            
+            if possible_root:
+                env['QEMU_LD_PREFIX'] = str(possible_root)
+                alog(f"🔧 Auto-detected QEMU_LD_PREFIX: {possible_root}", "EXEC", "INFO")
+            # else: native execution or can't be inferred, don't set it (x86_64 on x86_64)
+        else:
+            alog(f"✅ Using existing QEMU_LD_PREFIX: {env['QEMU_LD_PREFIX']}", "EXEC", "DEBUG")
+        
         if 'RR_TREE_OUTPUT' in env:
             alog(f"🌲 Env OK: RR_TREE_OUTPUT={env['RR_TREE_OUTPUT']}", "EXEC", "DEBUG")
         else:
@@ -459,21 +483,21 @@ class QEMUExecutor:
             # ✅ FIX: Ensure we don't leak pipe fds on failure
             raise RuntimeError(f"Failed to fork QEMU: {e}")
         finally:
-            # ✅ FIX: Always close child's pipe ends in parent (success or failure)
-            # These were passed to child, parent should close them
-            try:
-                if child_cmd_pipe is not None:
-                    os.close(child_cmd_pipe)
-                    self.cmd_pipe_read = None
-            except:
-                pass
-            
-            try:
-                if child_status_pipe is not None:
-                    os.close(child_status_pipe)
-                    self.status_pipe_write = None
-            except:
-                pass
+            # ✅ CRITICAL FIX: Do NOT close child's pipe ends that were passed via pass_fds!
+            # Those FDs are inherited by child and still needed.
+            # Only close parent's unused ends (if any).
+            # 
+            # Actually, in our setup:
+            #   - Parent uses: cmd_pipe_write (151), status_pipe_read (152)
+            #   - Child uses: cmd_pipe_read (150), status_pipe_write (153)
+            #   - pass_fds=[150, 153] ensures child inherits them
+            # 
+            # Python's Popen automatically closes all FDs NOT in pass_fds in child.
+            # Parent should keep its own ends open and NEVER close child's ends.
+            # 
+            # The previous code was WRONG - closing child_cmd_pipe/child_status_pipe
+            # in parent destroys the pipe for the child process!
+            pass  # Do nothing - let the pipes stay open for communication
     
     def _wait_for_status(self, timeout: float) -> Optional[tuple]:
         """
@@ -578,12 +602,24 @@ class QEMUExecutor:
                 map_size = 64 * 1024
                 raw_buf = self._shared_coverage_shm.buf
                 coverage_bitmap = bytes(raw_buf[start_offset : start_offset + map_size])
-                
-                # Debug: Check first 16 bytes and non-zero count
-                header = bytes(raw_buf[:16]).hex()
+                # Debug: Check first 128 bytes and non-zero count
+                header = bytes(raw_buf[:32]).hex()
                 nz_count = sum(1 for b in coverage_bitmap if b > 0)
-                if nz_count > 0 or self.total_executions % 100 == 0:
-                    alog(f"📊 [SHM-DEBUG] SHM Header: {header}, Map Non-Zero: {nz_count}", "EXEC", "DEBUG")
+                
+                # 🔥 DEEP DIAGNOSTIC: Check raw buffer directly
+                if nz_count == 0:
+                     # Check first 512 bytes of map for any life
+                     raw_nz = sum(1 for b in raw_buf[1:513] if b > 0)
+                     if raw_nz > 0:
+                         alog(f"🕵️ [SHM-MYSTERY] nz_count=0 but raw_buf[1:513] has {raw_nz} non-zero bytes!", "EXEC", "WARN")
+                         alog(f"🕵️ [SHM-MYSTERY] First 64 bytes: {bytes(raw_buf[:64]).hex()}", "EXEC", "WARN")
+
+                # 🔥 CRITICAL LOG: Force print if we find anything
+                if nz_count > 0:
+                    alog(f"🌟 [COVERAGE-FOUND] Map Non-Zero: {nz_count}, PID={os.getpid()}, Header={header[:16]}", "EXEC", "INFO")
+                
+                if nz_count > 0 or self.total_executions % 50 == 0:
+                    alog(f"📊 [SHM-DEBUG] Exec={self.total_executions}, NZ={nz_count}, RawFirst={bytes(raw_buf[:16]).hex()}", "EXEC", "DEBUG")
 
                 return coverage_bitmap
             except Exception as e:

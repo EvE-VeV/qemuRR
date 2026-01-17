@@ -70,7 +70,8 @@ int rr_ipc_init(void)
         /* Force close destination FD first to be safe */
         if (g_rr_framework->cmd_pipe_fd != safe_fd) {
             if (dup2(g_rr_framework->cmd_pipe_fd, safe_fd) < 0) {
-                RR_ERROR("Failed to relocate CMD pipe to FD %d", safe_fd);
+                RR_ERROR("Failed to relocate CMD pipe to FD %d: %s (source FD: %d)", 
+                         safe_fd, strerror(errno), g_rr_framework->cmd_pipe_fd);
             } else {
                 close(g_rr_framework->cmd_pipe_fd);
                 g_rr_framework->cmd_pipe_fd = safe_fd;
@@ -87,7 +88,8 @@ int rr_ipc_init(void)
         /* Force close destination FD first to be safe */
         if (g_rr_framework->status_pipe_fd != safe_fd) {
             if (dup2(g_rr_framework->status_pipe_fd, safe_fd) < 0) {
-                RR_ERROR("Failed to relocate STATUS pipe to FD %d", safe_fd);
+                RR_ERROR("Failed to relocate STATUS pipe to FD %d: %s (source FD: %d)", 
+                         safe_fd, strerror(errno), g_rr_framework->status_pipe_fd);
             } else {
                 close(g_rr_framework->status_pipe_fd);
                 g_rr_framework->status_pipe_fd = safe_fd;
@@ -172,8 +174,7 @@ int rr_ipc_receive_command(void)
     }
     
     if (n == 0) {
-        fprintf(stderr, "[DEBUG-IPC] EOF on command pipe FD %d\n", g_rr_framework->cmd_pipe_fd);
-        fflush(stderr);
+        RR_VERBOSE("[IPC] EOF on command pipe FD %d - QEMU will terminate loop", g_rr_framework->cmd_pipe_fd);
         return 'Q'; /* EOF */
     }
     

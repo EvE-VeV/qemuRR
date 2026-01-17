@@ -169,13 +169,21 @@ void rr_coverage_trace_edge(uint64_t cur_pc)
     
     /* [CRITICAL DEBUG] Log occasionally to verify edge tracking is alive */
     static uint64_t call_count = 0;
-    if ((++call_count % 1000) == 0) {
-        fprintf(stderr, "[COVERAGE-DEBUG] PID=%d, calls=%lu, cur_pc=0x%lx, range=0x%lx-0x%lx\n",
+    call_count++;
+    if ((call_count % 100) == 0) {
+        fprintf(stderr, "[COVERAGE-STAMP] PID=%d, calls=%lu, cur_pc=0x%lx, range=0x%lx-0x%lx\n",
                 getpid(), call_count, cur_pc, g_target_start, g_target_end);
     }
     
     if (!rr_in_target_range(cur_pc)) {
+        if (call_count < 10) {
+             fprintf(stderr, "[COVERAGE-SKIP] PC 0x%lx outside range\n", cur_pc);
+        }
         return;
+    }
+    
+    if (call_count < 10) {
+         fprintf(stderr, "[COVERAGE-HIT] PC 0x%lx INSIDE range!\n", cur_pc);
     }
     
     // Standardize PC by subtracting base address (ASLR support)

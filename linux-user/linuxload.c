@@ -184,7 +184,10 @@ bool imgsrc_read(void *dst, off_t offset, size_t len,
     ssize_t ret;
 
     if (offset + len <= img->cache_size) {
-        memcpy(dst, img->cache + offset, len);
+        /* Avoid UBSan warning: check cache is non-NULL before memcpy */
+        if (img->cache != NULL && len > 0) {
+            memcpy(dst, img->cache + offset, len);
+        }
         return true;
     }
 

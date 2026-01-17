@@ -13,6 +13,8 @@ import struct
 import random
 import sys
 import time
+import subprocess
+import re
 from pathlib import Path
 from typing import List, Optional, Any, Dict
 
@@ -206,8 +208,9 @@ class BaseMutator:
         """
         alog(f"Attempting IO mutation, trace={trace}, fork_point={fork_point}", "MUTATOR")
 
-        # Identify IO syscalls
-        io_syscalls = self.io_mutator.identify_io_syscalls(trace, analyzer=analyzer)
+        # Identify IO syscalls - respect passed analyzer parameter
+        effective_analyzer = analyzer if analyzer is not None else getattr(self, 'analyzer', None)
+        io_syscalls = self.io_mutator.identify_io_syscalls(trace, analyzer=effective_analyzer)
         alog(f"Found {len(io_syscalls)} IO syscalls", "MUTATOR")
 
         if not io_syscalls:
@@ -275,6 +278,15 @@ class BaseMutator:
                         b'MKD ' + b'A' * 2048 + b'\r\n'
                      ]
                      content_to_use = random.choice(patterns)
+                
+                # [NEW] Dictionary Injection
+                elif self.dictionary and random.random() < 0.5:
+                     token = random.choice(self.dictionary)
+                     if random.random() < 0.5:
+                         content_to_use = token
+                     else:
+                         content_to_use = b"A" * 8 + token + b"B" * 8
+                     alog(f"Dictionary Mutation: Injected '{token}'", "MUTATOR")
 
                 buffer_instruction = FuzzInstruction(
                     syscall_index=m.syscall_index,
@@ -412,7 +424,7 @@ class SmartMutator:
     # Class-level cache to avoid redundant parsing of same trace
     _trace_cache = {}  # {trace_file: TraceAnalyzer}
     
-    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None):
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None, word_size=0, endian='auto'):
         """
         Initialize SmartMutator
 
@@ -422,8 +434,12 @@ class SmartMutator:
             target_binary: Path to target binary (for PathFinder CFG analysis)
             path_finder: Existing PathFinder instance (optional, avoids re-initialization)
             analyzer: Existing TraceAnalyzer instance (optional, avoids redundant analysis)
+            word_size: Word size (32 or 64, 0 for auto)
+            endian: Endianness ('auto', 'little', 'big')
         """
         self.trace_file = trace_file
+        self.word_size = word_size
+        self.endian = endian
         
         # Use passed analyzer or cached TraceAnalyzer if available
         if analyzer:
@@ -441,7 +457,7 @@ class SmartMutator:
             from trace_analyzer import TraceAnalyzer
             
             # TraceAnalyzer calls analyze() automatically in __init__
-            self.analyzer = TraceAnalyzer(trace_file)
+            self.analyzer = TraceAnalyzer(trace_file, word_size=word_size, endian=endian)
             
             # Cache for future use
             SmartMutator._trace_cache[trace_file] = self.analyzer
@@ -526,6 +542,12 @@ class SmartMutator:
         self.use_io_mutation = True # SmartMutator always uses IO mutation
         self.io_mutator = IOReturnValueMutator()
         self.io_mutation_prob = 0.2 # Lower probability for IO mutation in SmartMutator
+        
+        # Dictionary Support
+        self.dictionary = []
+        if target_binary:
+            self._extract_dictionary_tokens(target_binary)
+            
         alog(f"Stagnation detection enabled (threshold={self.stagnation_threshold} iterations)", "MUTATOR", "INFO")
     
     def _perform_fd_tracking(self):
@@ -794,23 +816,66 @@ class SmartMutator:
         for node_id, edges in self.path_finder.dynamic_edges.items():
             if len(edges) == 1:  # Only one outgoing edge, likely another branch unexplored
                 edge = list(edges)[0]
+                
                 # Construct hypothetical uncovered branch
                 uncovered_branch = {
                     'from': self.path_finder.dynamic_nodes.get(node_id, node_id),
                     'to': self.path_finder.dynamic_nodes.get(edge, edge),
-                    'type': 'conditional',
-                    'has_syscall': node_id in self.path_finder.dynamic_syscalls,
-                    'distance': 1  # Simplified distance calculation
+                    'id': f"uncovered_{node_id}",
+                    'type': 'conditional'
                 }
-
-                # If node has syscall info, add it to branch info
-                if node_id in self.path_finder.dynamic_syscalls:
-                    uncovered_branch['syscalls'] = self.path_finder.dynamic_syscalls[node_id]
-
                 uncovered.append(uncovered_branch)
+        
+        return uncovered
 
-        # Limit quantity to avoid generating too many recipes
-        return uncovered[:15]
+    def _extract_dictionary_tokens(self, target_binary):
+        """Extract dictionary tokens from target binary using strings"""
+        if not target_binary or not os.path.exists(target_binary):
+            alog("Target binary not provided or not found, skipping dictionary extraction", "MUTATOR", "WARN")
+            return
+
+        try:
+            alog(f"Extracting dictionary tokens from {target_binary}...", "MUTATOR", "INFO")
+            result = subprocess.run(['strings', target_binary], capture_output=True, text=True, check=True)
+            strings = result.stdout.splitlines()
+
+            count = 0
+            for s in strings:
+                s = s.strip()
+                if 3 <= len(s) <= 32:
+                    try:
+                        token = s.encode('utf-8')
+                        if token not in self.dictionary:
+                            self.dictionary.append(token)
+                            count += 1
+                    except:
+                        pass
+            
+            # Common Magic Bytes
+            common_magics = [
+                b"HTTP/1.1", b"GET", b"POST", b"Host:", b"User-Agent:", 
+                b"Content-Length:", b"Content-Type:", b"Connection:",
+                b"admin", b"password", b"root", b"123456",
+                b"soap:Envelope", b"urn:schemas", 
+                b"M-SEARCH", b"NOTIFY", # UPnP specific
+                b"uuid:", b"serviceType"
+            ]
+            
+            for m in common_magics:
+                if m not in self.dictionary:
+                    self.dictionary.append(m)
+                    count += 1
+
+            alog(f"Extracted {count} tokens. Total dictionary size: {len(self.dictionary)}", "MUTATOR", "INFO")
+            
+            if len(self.dictionary) > 500:
+                 self.dictionary = random.sample(self.dictionary, 500)
+                 alog("Dictionary truncated to 500 items", "MUTATOR", "INFO")
+
+        except Exception as e:
+             alog(f"Failed to extract dictionary: {e}", "MUTATOR", "ERROR")
+
+
 
     def _load_recipes(self, recipe_file):
         """

@@ -1049,6 +1049,7 @@ int main(int argc, char **argv, char **envp)
      * 在main.c中再次设置，以确保使用的是RELOCATED之后的最终地址 (PIE兼容性)
      */
     rr_set_target_range(info->start_code, info->end_code);
+    rr_flush_tb_cache();
 
     /* 设置主程序地址范围（用于BB trace过滤） */
     /* 注意：只有在BB trace已初始化时才设置过滤 */

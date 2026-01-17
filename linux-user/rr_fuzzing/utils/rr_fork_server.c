@@ -891,7 +891,11 @@ int rr_fork_server_loop(void)
                     uint32_t iteration_id = shm->iteration_id;  // Read iteration_id
                     int num_variants = shm->num_variants;
                     if (num_variants <= 0) num_variants = 1;
-                    if (num_variants > RR_MAX_VARIANTS) num_variants = RR_MAX_VARIANTS;
+                    /* 🔥 HARDENING: Explicitly check against RR_MAX_VARIANTS to avoid OOB */
+                    if (num_variants > RR_MAX_VARIANTS) {
+                        RR_ERROR("Too many variants requested: %d (max %d)", num_variants, RR_MAX_VARIANTS);
+                        num_variants = RR_MAX_VARIANTS;
+                    }
                     
                     RR_INFO("Info: Fork command: fork_point=%u, variants=%d, depth=%u, iteration=%u",
                             fork_point, num_variants, depth, iteration_id);

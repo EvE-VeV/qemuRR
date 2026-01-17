@@ -215,10 +215,14 @@ syscall_record_t *read_next_record(void)
         return NULL;
     }
 
-    // Read remaining fields
-    if (fread(record->args, sizeof(abi_long) * 8, 1, g_trace_file) != 1 ||
-        fread(&record->retval, sizeof(abi_long), 1, g_trace_file) != 1 ||
-        fread(record->arg_size, sizeof(size_t) * 8, 1, g_trace_file) != 1 ||
+    // Read remaining fields (Fixed width)
+    uint64_t fixed_args[8];
+    int64_t fixed_retval;
+    uint64_t fixed_arg_sizes[8];
+
+    if (fread(fixed_args, 8, 8, g_trace_file) != 8 ||
+        fread(&fixed_retval, 8, 1, g_trace_file) != 1 ||
+        fread(fixed_arg_sizes, 8, 8, g_trace_file) != 8 ||
         fread(&record->creates_fd, sizeof(bool), 1, g_trace_file) != 1 ||
         fread(&record->uses_fd, sizeof(bool), 1, g_trace_file) != 1 ||
         fread(&record->created_fd, sizeof(int32_t), 1, g_trace_file) != 1) {
@@ -233,58 +237,76 @@ syscall_record_t *read_next_record(void)
         return NULL;
     }
 
+    /* Convert fixed-width back to native fields - Handle Little Endian conversion */
+    for (int i = 0; i < 8; i++) record->args[i] = (abi_long)le64_to_cpu(fixed_args[i]);
+    record->retval = (abi_long)le64_to_cpu((uint64_t)fixed_retval);
+    for (int i = 0; i < 8; i++) record->arg_size[i] = (size_t)le64_to_cpu(fixed_arg_sizes[i]);
+
+    uint32_t le_created_fd;
+    memcpy(&le_created_fd, &record->created_fd, sizeof(uint32_t));
+    record->created_fd = (int32_t)le32_to_cpu(le_created_fd);
+
+
     RR_VERBOSE("READ_NEXT_RECORD: Successfully read record fields");
     RR_VERBOSE("READ_NEXT_RECORD: Record data - index=%u, syscall=%d, ret=%ld",
                record->index, record->syscall_nr, (long)record->retval);
 
     /* Read parameter data */
-    int arg_index;
-    while (fread(&arg_index, sizeof(int), 1, g_trace_file) == 1) {
+    int32_t le_arg_index;
+    while (fread(&le_arg_index, sizeof(int32_t), 1, g_trace_file) == 1) {
+        int32_t arg_index = (int32_t)le32_to_cpu((uint32_t)le_arg_index);
         if (arg_index == -1) { // End marker
             break;
         }
 
+
         if (arg_index >= 0 && arg_index < RR_MAX_SYSCALL_ARGS) {
-            size_t size;
-            if (fread(&size, sizeof(size), 1, g_trace_file) == 1 && size > 0 && size <= RR_MAX_BUFFER_TOTAL) {
-                record->arg_data[arg_index] = g_malloc(size);
-                if (fread(record->arg_data[arg_index], size, 1, g_trace_file) == 1) {
-                    record->arg_size[arg_index] = size;
-                } else {
-                    g_free(record->arg_data[arg_index]);
-                    record->arg_data[arg_index] = NULL;
-                    record->arg_size[arg_index] = 0;
+            uint64_t le_size;
+            if (fread(&le_size, sizeof(uint64_t), 1, g_trace_file) == 1) {
+                uint64_t size = le64_to_cpu(le_size);
+                if (size > 0 && size <= RR_MAX_BUFFER_TOTAL) {
+                    record->arg_data[arg_index] = g_malloc(size);
+                    if (fread(record->arg_data[arg_index], 1, size, g_trace_file) == size) {
+                        record->arg_size[arg_index] = size;
+                    } else {
+                        g_free(record->arg_data[arg_index]);
+                        record->arg_data[arg_index] = NULL;
+                        record->arg_size[arg_index] = 0;
+                    }
                 }
             }
         }
+
     }
 
     /* Read aux_data if available */
-    uint32_t aux_marker = 0;
+    uint32_t le_aux_marker = 0;
     RR_VERBOSE("READ_NEXT_RECORD: About to read aux_marker at file pos %ld", ftell(g_trace_file));
-    if (fread(&aux_marker, sizeof(uint32_t), 1, g_trace_file) == 1) {
+    if (fread(&le_aux_marker, sizeof(uint32_t), 1, g_trace_file) == 1) {
+        uint32_t aux_marker = le32_to_cpu(le_aux_marker);
         RR_VERBOSE("READ_NEXT_RECORD: Read aux_marker = 0x%08x", aux_marker);
         if (aux_marker == 0x41555844) { // "AUXD" magic
             RR_VERBOSE("READ_NEXT_RECORD: Found AUXD magic, reading aux_data");
             /* Read aux_data count */
-            uint32_t aux_count = 0;
-            ssize_t read_result = fread(&aux_count, sizeof(uint32_t), 1, g_trace_file);
-            RR_VERBOSE("READ_NEXT_RECORD: fread aux_count result=%zd, aux_count=%u", read_result, aux_count);
-            if (read_result == 1 && aux_count > 0) {
+            uint32_t le_aux_count = 0;
+            if (fread(&le_aux_count, sizeof(uint32_t), 1, g_trace_file) == 1) {
+                uint32_t aux_count = le32_to_cpu(le_aux_count);
                 RR_VERBOSE("READ_NEXT_RECORD: aux_count = %u", aux_count);
                 record->has_aux_data = true;
                 
                 /* Read each aux_data exit */
                 for (uint32_t i = 0; i < aux_count; i++) {
                     uint8_t kind, arg_mask;
-                    uint32_t size;
+                    uint32_t le_size;
                     
                     if (fread(&kind, sizeof(uint8_t), 1, g_trace_file) != 1 ||
                         fread(&arg_mask, sizeof(uint8_t), 1, g_trace_file) != 1 ||
-                        fread(&size, sizeof(uint32_t), 1, g_trace_file) != 1) {
+                        fread(&le_size, sizeof(uint32_t), 1, g_trace_file) != 1) {
                         RR_ERROR("READ_NEXT_RECORD: Failed to read aux_data header");
                         break;
                     }
+                    uint32_t size = le32_to_cpu(le_size);
+
                     
                     /* Read data */
                     uint8_t *data = g_malloc(size);
@@ -298,15 +320,18 @@ syscall_record_t *read_next_record(void)
                     }
                     g_free(data);
                 }
-            } else {
-                RR_VERBOSE("READ_NEXT_RECORD: No aux_data count (read_result=%zd, aux_count=%u)", read_result, aux_count);
             }
-        } else {
-            RR_VERBOSE("READ_NEXT_RECORD: No AUXD magic (marker=0x%08x)", aux_marker);
+        } else if (aux_marker != 0) {
+            /* If it's not AUXD and not 0, it might be a desync or a legacy trace. 
+             * But for version 1, it should be one of them. 
+             * We do NOT seek back here if we expect a marker. 
+             */
+            RR_VERBOSE("READ_NEXT_RECORD: Unexpected marker 0x%08x at pos %ld", aux_marker, ftell(g_trace_file));
         }
-        /* If aux_marker == 0, there is no aux_data; this is normal */
     } else {
-        RR_ERROR("READ_NEXT_RECORD: Failed to read aux_marker at pos %ld", ftell(g_trace_file));
+        if (!feof(g_trace_file)) {
+            RR_ERROR("READ_NEXT_RECORD: Failed to read aux_marker at pos %ld", ftell(g_trace_file));
+        }
     }
 
     return record;
@@ -786,6 +811,7 @@ try_hybrid:
         {}
     }
 
+#ifdef TARGET_NR_clone
     if ((num == TARGET_NR_clone
 #ifdef TARGET_NR_fork
         || num == TARGET_NR_fork
@@ -794,6 +820,7 @@ try_hybrid:
         || num == TARGET_NR_vfork
 #endif
         ) && g_current_record && g_current_record->has_aux_data) {
+#endif
         rr_aux_data_t *aux = rr_aux_find(g_current_record->aux_data, 0);
         if (aux && aux->data && aux->size == sizeof(int64_t)) {
             pid_t recorded_pid = (pid_t)(*(int64_t *)aux->data);
@@ -811,11 +838,13 @@ try_hybrid:
      */
     RR_VERBOSE("REPLAY_SYSCALL: Hybrid replay path for syscall %d", num);
 
+#ifdef TARGET_NR_read
     /* 🔥 Special Case: When read returns 0 (EOF), directly return 0 even without aux_data */
     if (num == TARGET_NR_read && ret == 0) {
         RR_VERBOSE("REPLAY_SYSCALL: read returned 0 (EOF), returning directly without real syscall");
         goto replay_success;
     }
+#endif
 
     /* ✅ 2025-11-17: IO Return Value Mutation - Return value override in Hybrid mode */
     /* Key fix: Check if return value override is needed before executing real syscall */

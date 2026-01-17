@@ -1901,15 +1901,15 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
         fprintf(stderr, "[RRFUZZ-RANGE] load_bias=0x%lx, start_code=0x%lx, end_code=0x%lx\n",
                 (unsigned long)info->load_bias, (unsigned long)info->start_code, (unsigned long)info->end_code);
         fprintf(stderr, "[RRFUZZ-RANGE] Setting range: 0x%lx - 0x%lx\n",
-                (unsigned long)(info->load_bias + info->start_code),
-                (unsigned long)(info->load_bias + info->end_code));
+                (unsigned long)info->start_code,
+                (unsigned long)info->end_code);
         
         /* CRITICAL FIX: Use load_bias to get ACTUAL runtime addresses, not static ELF addresses.
          * For PIE/ASLR binaries, start_code/end_code contain virtual addresses from the ELF,
          * but load_bias contains the actual relocation offset where QEMU loaded the binary.
          * Runtime PCs will be in the range [load_bias + start_code, load_bias + end_code]. */
-        rr_set_target_range(info->load_bias + info->start_code, 
-                           info->load_bias + info->end_code);
+        rr_set_target_range(info->start_code, 
+                           info->end_code);
     }
 
     /* Do this so that we can load the interpreter, if need be.  We will

@@ -43,7 +43,7 @@ static const rr_config_t DEFAULT_CONFIG = {
     .fork_fallback_threshold = 20,                  // Fallback threshold: 20 syscalls
 
     /* IPC configuration */
-    .shared_memory_size = 64 * 1024,      // 64KB (matches Python side)
+    .shared_memory_size = 128 * 1024,      // 128KB (fits 10 variants)
     .ipc_timeout = 1000,                  // 1 second
     
     /* Advanced configuration */

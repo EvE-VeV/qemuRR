@@ -335,123 +335,265 @@ static void generic_post_hook(rr_strace_record_t *record, abi_long ret, abi_long
 
 static rr_syscall_handler_t syscall_handlers[] = {
     /* File I/O Class */
-    {"read", 0, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL, 
+#ifdef TARGET_NR_read
+    {"read", TARGET_NR_read, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL, 
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"write", 1, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_write
+    {"write", TARGET_NR_write, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"open", 2, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_open
+    {"open", TARGET_NR_open, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"close", 3, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_close
+    {"close", TARGET_NR_close, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"ioctl", 16, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_ioctl
+    {"ioctl", TARGET_NR_ioctl, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"pread64", 17, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_pread64
+    {"pread64", TARGET_NR_pread64, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"openat", 257, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_openat
+    {"openat", TARGET_NR_openat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"writev", 20, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_writev
+    {"writev", TARGET_NR_writev, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_CRITICAL,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"getdents64", 217, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_getdents64
+    {"getdents64", TARGET_NR_getdents64, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"newfstatat", 262, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_newfstatat
+    {"newfstatat", TARGET_NR_newfstatat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_faccessat
+    {"faccessat", TARGET_NR_faccessat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_faccessat2
+    {"faccessat2", TARGET_NR_faccessat2, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_renameat
+    {"renameat", TARGET_NR_renameat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_renameat2
+    {"renameat2", TARGET_NR_renameat2, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_unlinkat
+    {"unlinkat", TARGET_NR_unlinkat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_mkdirat
+    {"mkdirat", TARGET_NR_mkdirat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_readlinkat
+    {"readlinkat", TARGET_NR_readlinkat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_symlinkat
+    {"symlinkat", TARGET_NR_symlinkat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_statx
+    {"statx", TARGET_NR_statx, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
     
     /* Memory Management Class */
-    {"mmap", 9, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_CRITICAL,
+#ifdef TARGET_NR_mmap
+    {"mmap", TARGET_NR_mmap, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_CRITICAL,
      apply_memory_args, apply_memory_fd_mapping, memory_post_hook, true, true, true},
-    {"munmap", 11, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_mmap2
+    {"mmap2", TARGET_NR_mmap2, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_CRITICAL,
+     apply_memory_args, apply_memory_fd_mapping, memory_post_hook, true, true, true},
+#endif
+#ifdef TARGET_NR_munmap
+    {"munmap", TARGET_NR_munmap, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_memory_args, NULL, memory_post_hook, false, true, false},
-    {"mprotect", 10, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_mprotect
+    {"mprotect", TARGET_NR_mprotect, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_memory_args, NULL, memory_post_hook, false, true, false},
-    {"brk", 12, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_brk
+    {"brk", TARGET_NR_brk, SYSCALL_TYPE_MEMORY, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_memory_args, NULL, memory_post_hook, false, true, false},
+#endif
     
     /* Network Class */
-    {"socket", 41, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#ifdef TARGET_NR_socket
+    {"socket", TARGET_NR_socket, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"bind", 49, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_bind
+    {"bind", TARGET_NR_bind, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"listen", 50, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_listen
+    {"listen", TARGET_NR_listen, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"connect", 42, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_connect
+    {"connect", TARGET_NR_connect, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"accept", 43, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_accept
+    {"accept", TARGET_NR_accept, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"accept4", 288, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_accept4
+    {"accept4", TARGET_NR_accept4, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"sendto", 44, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_sendto
+    {"sendto", TARGET_NR_sendto, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"recvfrom", 45, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_recvfrom
+    {"recvfrom", TARGET_NR_recvfrom, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"send", 44, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_sendmsg
+    {"sendmsg", TARGET_NR_sendmsg, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"recv", 45, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_recvmsg
+    {"recvmsg", TARGET_NR_recvmsg, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"sendmsg", 46, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_getsockname
+    {"getsockname", TARGET_NR_getsockname, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"recvmsg", 47, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_getpeername
+    {"getpeername", TARGET_NR_getpeername, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"getsockname", 51, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_setsockopt
+    {"setsockopt", TARGET_NR_setsockopt, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"getpeername", 52, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_getsockopt
+    {"getsockopt", TARGET_NR_getsockopt, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"setsockopt", 54, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_shutdown
+    {"shutdown", TARGET_NR_shutdown, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"getsockopt", 55, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_epoll_create
+    {"epoll_create", TARGET_NR_epoll_create, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
-    {"shutdown", 48, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_epoll_create1
+    {"epoll_create1", TARGET_NR_epoll_create1, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_epoll_ctl
+    {"epoll_ctl", TARGET_NR_epoll_ctl, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_epoll_wait
+    {"epoll_wait", TARGET_NR_epoll_wait, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_epoll_pwait
+    {"epoll_pwait", TARGET_NR_epoll_pwait, SYSCALL_TYPE_NETWORK, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_network_args, apply_file_io_fd_mapping, network_post_hook, true, false, true},
+#endif
     
     /* System Information Class */
-    {"getpid", 39, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#ifdef TARGET_NR_getpid
+    {"getpid", TARGET_NR_getpid, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"getuid", 102, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#endif
+#ifdef TARGET_NR_getuid
+    {"getuid", TARGET_NR_getuid, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"getgid", 104, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#endif
+#ifdef TARGET_NR_getgid
+    {"getgid", TARGET_NR_getgid, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"uname", 63, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#endif
+#ifdef TARGET_NR_uname
+    {"uname", TARGET_NR_uname, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"arch_prctl", 158, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#endif
+#ifdef TARGET_NR_arch_prctl
+    {"arch_prctl", TARGET_NR_arch_prctl, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"set_tid_address", 218, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
+#endif
+#ifdef TARGET_NR_set_tid_address
+    {"set_tid_address", TARGET_NR_set_tid_address, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_ENVIRONMENT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"set_robust_list", 273, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_set_robust_list
+    {"set_robust_list", TARGET_NR_set_robust_list, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"statfs", 137, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_statfs
+    {"statfs", TARGET_NR_statfs, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"prlimit64", 302, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_prlimit64
+    {"prlimit64", TARGET_NR_prlimit64, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"getrandom", 318, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_getrandom
+    {"getrandom", TARGET_NR_getrandom, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"rseq", 334, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_rseq
+    {"rseq", TARGET_NR_rseq, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"access", 21, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_OPTIONAL,
+#endif
+#ifdef TARGET_NR_access
+    {"access", TARGET_NR_access, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_OPTIONAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"fstat", 5, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_fstat
+    {"fstat", TARGET_NR_fstat, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
+#ifdef TARGET_NR_fstat64
+    {"fstat64", TARGET_NR_fstat64, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
+     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
+#endif
     
     /* Process Management Class */
-    {"clone", 56, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
+#ifdef TARGET_NR_clone
+    {"clone", TARGET_NR_clone, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"fork", 57, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
+#endif
+#ifdef TARGET_NR_fork
+    {"fork", TARGET_NR_fork, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_IMPORTANT,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"exit_group", 231, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_CRITICAL,
+#endif
+#ifdef TARGET_NR_exit_group
+    {"exit_group", TARGET_NR_exit_group, SYSCALL_TYPE_PROCESS, SYSCALL_IMPORTANCE_CRITICAL,
      apply_generic_args, NULL, generic_post_hook, false, false, false},
-    
-    /* Other Common Syscalls */
-    {"access", 21, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_ENVIRONMENT,
-     apply_generic_args, NULL, generic_post_hook, false, false, false},
-    {"newfstatat", 262, SYSCALL_TYPE_FILE_IO, SYSCALL_IMPORTANCE_IMPORTANT,
-     apply_file_io_args, apply_file_io_fd_mapping, file_io_post_hook, true, false, true},
-    {"arch_prctl", 158, SYSCALL_TYPE_SYSTEM_INFO, SYSCALL_IMPORTANCE_IMPORTANT,
-     apply_generic_args, NULL, generic_post_hook, false, false, false},
+#endif
     
     {NULL, -1, SYSCALL_TYPE_UNKNOWN, SYSCALL_IMPORTANCE_ENVIRONMENT, NULL, NULL, NULL, false, false, false}
 };
 
 /* ==================== Fast Lookup Table ==================== */
 
-#define MAX_SYSCALL_NR 512
+#define MAX_SYSCALL_NR 10000
 static rr_syscall_handler_t* syscall_lookup_table[MAX_SYSCALL_NR];
 static bool dispatch_initialized = false;
 
