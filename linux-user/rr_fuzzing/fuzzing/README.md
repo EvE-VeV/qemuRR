@@ -28,14 +28,15 @@ RR-Fuzz 是一个基于 QEMU 用户态模拟的高性能、确定性 Fuzzing 框
 
 ```
 linux-user/rr_fuzzing/
-├── core/                    # C 语言核心 (Syscall Hooks, RR Framework)
-├── replay/                  # Replay 引擎与变异注入
+├── src/                     # C 语言核心实现 (core/engine/runtime/syscall/common)
+├── include/                 # C 头文件
 ├── fuzzing/                 # Python Fuzzing 引擎
-│   ├── conductor/          # 核心逻辑 (FuzzingCore, Mutator)
+│   ├── conductor/          # 核心逻辑 (FuzzingCore, Mutator, Coverage, Executor)
 │   ├── multiprocess/       # 多进程管理 (FuzzMaster, DynamicForkController)
-│   └── qemu_integration/   # QEMU 交互与覆盖率
+│   ├── config/             # target profiles / 字典 / schema
+│   └── utils/              # 辅助工具
 ├── tests/                   # 测试用例与脚本
-└── README.md
+└── docs/                    # 架构与分析文档
 ```
 
 ## 🚦 快速开始

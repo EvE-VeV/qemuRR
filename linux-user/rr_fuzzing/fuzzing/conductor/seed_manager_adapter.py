@@ -45,6 +45,7 @@ class SeedManagerAdapter:
                 use_advanced_scheduling=True
             )
             self.trace_to_seed_map: Dict[str, Seed] = {}
+            self.trace_cache: Dict[str, Trace] = {} # ✅ Cache Trace objects to maintain identity
             self.seed_counter = 0
 
             alog("Using AdvancedSeedQueue with Energy Scheduler", "CORE", "INFO")
@@ -84,7 +85,22 @@ class SeedManagerAdapter:
         return seed
 
     def _seed_to_trace(self, seed: Seed) -> Trace:
-        """Convert Seed object to Trace object"""
+        """Convert Seed object to Trace object (with caching)"""
+        if seed.seed_id in self.trace_cache:
+            # ✅ Synchronize using max() to ensure restored values from TracePool survive
+            trace = self.trace_cache[seed.seed_id]
+            
+            # Sync exec_count (source of truth can be either during transition)
+            new_count = max(trace.metadata.exec_count, seed.execution_count)
+            trace.metadata.exec_count = new_count
+            seed.execution_count = new_count
+            
+            # Sync energy and other metadata
+            trace.metadata.energy = max(trace.metadata.energy, seed.energy)
+            seed.energy = trace.metadata.energy
+            
+            return trace
+
         metadata = TraceMetadata(
             creation_time=seed.discovery_time,
             parent_trace_id=seed.parent_id,
@@ -99,7 +115,8 @@ class SeedManagerAdapter:
             file_path=seed.trace_file or "",
             metadata=metadata
         )
-
+        
+        self.trace_cache[seed.seed_id] = trace
         return trace
 
     def add_initial_trace(self, trace_file: str):
@@ -209,6 +226,7 @@ class SeedManagerAdapter:
 
     def get_trace_by_id(self, trace_id: str) -> Optional[Trace]:
         """Get trace by ID (TraceManager-compatible)"""
+        alog(f"get_trace_by_id({trace_id}): cache_size={len(self.trace_cache)}", "DEBUG")
         if self.use_advanced:
             seed = self.queue.seed_map.get(trace_id)
             return self._seed_to_trace(seed) if seed else None
@@ -256,7 +274,7 @@ class SeedManagerAdapter:
             )
 
     def record_execution(self, trace_id: str, trace_file: str, mutations: list,
-                         has_new_coverage: bool = False):
+                         has_new_coverage: bool = False, **kwargs):
         """
         Record execution statistics (TraceManager-compatible)
 
@@ -279,6 +297,18 @@ class SeedManagerAdapter:
                 self.queue.stats['no_new_coverage_count'] = 0
             else:
                 self.queue.stats['no_new_coverage_count'] += 1
+            
+            # ✅ Sync updated exec_count from Trace object back to Seed if available
+            if trace_id in self.trace_cache:
+                trace = self.trace_cache[trace_id]
+                seed = self.trace_to_seed_map.get(trace_id)
+                if seed:
+                    new_count = max(trace.metadata.exec_count, seed.execution_count)
+                    trace.metadata.exec_count = new_count
+                    seed.execution_count = new_count
+                    
+                    trace.metadata.energy = max(trace.metadata.energy, seed.energy)
+                    seed.energy = trace.metadata.energy
         else:
             # Delegate to TraceManager
             self.queue.record_execution(trace_id, trace_file, mutations, has_new_coverage)

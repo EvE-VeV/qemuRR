@@ -4,7 +4,7 @@
 # 编译器和标志
 CC := gcc
 CFLAGS := -Wall -Wextra -O2 -g -std=gnu99
-CFLAGS += -I../../include -I.. -I.
+CFLAGS += -I./include -I.. -I.
 CFLAGS += $(shell pkg-config --cflags glib-2.0)
 LDFLAGS += $(shell pkg-config --libs glib-2.0)
 
@@ -12,9 +12,9 @@ LDFLAGS += $(shell pkg-config --libs glib-2.0)
 CFLAGS += -DRR_DEBUG
 
 # 源文件
-SOURCES := rr_main.c rr_record.c rr_replay.c rr_ipc.c rr_fork_server.c rr_fuzz_engine.c rr_snapshot.c
+SOURCES := src/core/rr_main.c src/engine/rr_record.c src/engine/rr_replay.c src/runtime/rr_ipc.c src/runtime/rr_fork_server.c src/engine/rr_fuzz_engine.c src/runtime/rr_snapshot.c
 OBJECTS := $(SOURCES:.c=.o)
-HEADERS := rr_framework.h
+HEADERS := include/rr_framework.h
 
 # 目标：编译所有对象文件
 all: $(OBJECTS)

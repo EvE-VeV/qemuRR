@@ -1,0 +1,25 @@
+{
+  "experiment_name": "Tenda_AC15_24h_Benchmark",
+  "duration_hours": 24,
+  "runs_per_tool": 3,
+  "tools_to_evaluate": [
+    {
+      "name": "RR-Fuzz",
+      "command": "python3 linux-user/rr_fuzzing/fuzzing/fuzz_main.py --qemu ./qemu-mipsel --target linux-user/rr_fuzzing/tests/images/Tenda/usr/sbin/httpd --trace linux-user/rr_fuzzing/crashes/real_world_repro/TENDA_AC15/traces/tenda_test_v10.trace --out-dir {OUT_DIR} -w 32 --iterations 1000000 --features coverage,multiprocess",
+      "env": {
+        "LD_PREFIX": "linux-user/rr_fuzzing/tests/images/Tenda/"
+      }
+    },
+    {
+      "name": "AFL++",
+      "command": "afl-fuzz -i {IN_DIR} -o {OUT_DIR} -Q -- ./qemu-mipsel -L linux-user/rr_fuzzing/tests/images/Tenda/ linux-user/rr_fuzzing/tests/images/Tenda/usr/sbin/httpd",
+      "env": {}
+    }
+  ],
+  "metrics": [
+    "edge_coverage",
+    "unique_crashes",
+    "path_discovery_time",
+    "execs_per_second"
+  ]
+}

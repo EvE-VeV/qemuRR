@@ -9,12 +9,14 @@ test_debug
 tests/test_bb_trace
 tests/complex_test_*
 tests/programs/test_programs/
+tests/verified_targets/
 crashes/newbugs/
 fuzzing_output_*
+crashes/real_world_repro/
 # Trace文件
 *.dat
 *.dat.bbl
-
+evaluation/
 
 # 测试日志和临时文件
 *.log
@@ -45,6 +47,15 @@ __pycache__/
 fuzzing_reports/
 fuzzing_reports_mp/
 results_archive_*/
+
+# Generated fuzz outputs / runtime artifacts
+fuzz_output_*/
+fuzzing_output/
+fuzzing/scripts/fuzzing_output/
+tests/fuzz_output_*/
+*.trace
+*.trace.bbl
+*.trace.analyzer.pkl
 
 # 编辑器临时文件
 *~

@@ -58,8 +58,8 @@
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
 #ifdef CONFIG_RR_FUZZING
-#include "rr_fuzzing/core/rr_framework.h"
-#include "rr_fuzzing/core/rr_bb_trace.h"
+#include "rr_framework.h"
+#include "rr_bb_trace.h"
 extern void rr_set_target_range(uint64_t start, uint64_t end);
 #endif
 

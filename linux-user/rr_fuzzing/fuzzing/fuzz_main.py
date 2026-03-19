@@ -25,19 +25,46 @@ def main():
     parser.add_argument("--persistence", action="store_true", help="Enable unified session persistence (Auto Save/Resume)")
     parser.add_argument("--word-size", type=int, default=0, help="Word size (32 or 64, 0 for auto)")
     parser.add_argument("--endian", default="auto", choices=["auto", "little", "big"], help="Endianness")
+    parser.add_argument("-n", "--workers", type=int, default=1, help="Number of worker processes (default: 1)")
+    parser.add_argument("--dictionary", help="Path to dictionary file")
+    parser.add_argument("--ld-prefix", help="QEMU LD Prefix (RootFS)")
+    parser.add_argument("--fork-point", type=int, help="Manual fork point index (overrides DFC logic)")
+    
+    # Ablation Study Flags
+    parser.add_argument("--disable-smartdict", action="store_true", help="Disable SmartMutator (use BaseMutator instead)")
+    parser.add_argument("--disable-pathfinder", action="store_true", help="Disable PathFinder guided execution")
     
     args = parser.parse_args()
     
     fuzzing_core = None
     try:
+        # [NEW] Derive target architecture from QEMU path for consistent mapping
+        arch = 'auto'
+        qemu_name = os.path.basename(args.qemu).lower()
+        if 'aarch64' in qemu_name:
+            arch = 'arm64'
+        elif 'arm' in qemu_name:
+            arch = 'arm'
+        elif 'mips' in qemu_name:
+            arch = 'mips'
+        elif 'x86_64' in qemu_name:
+            arch = 'x86_64'
+        elif 'i386' in qemu_name:
+            arch = 'i386'
+            
         # Initialize Core
-        # Note: SmartMutator requires trace_file and target_binary
-        mutator = SmartMutator(
-            args.trace, 
-            target_binary=args.target,
-            word_size=args.word_size,
-            endian=args.endian
-        )
+        if args.disable_smartdict:
+            from conductor.mutator import BaseMutator
+            mutator = BaseMutator()
+        else:
+            mutator = SmartMutator(
+                args.trace, 
+                target_binary=args.target,
+                word_size=args.word_size,
+                endian=args.endian,
+                dictionary_file=args.dictionary,
+                arch=arch  # Pass derived arch
+            )
         
         fuzzing_core = FuzzingCore(
             qemu_path=args.qemu,
@@ -48,10 +75,33 @@ def main():
             use_fork_server=True,  # Internal design: high-speed fork server
             enable_persistence=args.persistence,
             target_args=args.args,
-            enable_tree_viz=args.tree
+            enable_tree_viz=args.tree,
+            ld_prefix=args.ld_prefix,
+            manual_fork_point=args.fork_point
         )
         
-        # Run Fuzzing
+        # Multi-Process Mode
+        if args.workers > 1:
+            from multiprocess.fuzz_master import FuzzMaster
+            print(f"[*] Starting Multi-Process Master with {args.workers} workers")
+            master = FuzzMaster(
+                qemu_path=args.qemu,
+                target_binary=args.target,
+                initial_trace=args.trace,
+                target_args=args.args,
+                num_workers=args.workers,
+                sync_dir=args.output,
+                mutator_type="base" if args.disable_smartdict else "smart",
+                enable_pathfinder=not args.disable_pathfinder,
+                enable_persistence=args.persistence,
+                dictionary_file=args.dictionary,
+                ld_prefix=args.ld_prefix,
+                manual_fork_point=args.fork_point
+            )
+            master.run()
+            return 0
+
+        # Run Fuzzing (Single-Process)
         stop_conditions = {
             'max_iterations': args.iterations,
             'no_progress_timeout': None if args.infinite else args.no_progress_timeout,

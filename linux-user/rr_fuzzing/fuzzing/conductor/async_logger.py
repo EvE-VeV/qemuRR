@@ -22,15 +22,18 @@ class AsyncLogger:
     """
     
     _instance = None
-    
-    def __init__(self, log_file: str = None, console: bool = True):
+
+    _LEVEL_PRIORITY = {"DEBUG": 0, "INFO": 1, "WARN": 2, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
+
+    def __init__(self, log_file: str = None, console: bool = True, min_level: str = "WARN"):
         self.log_queue = queue.SimpleQueue()
         self.running = False
         self.worker_thread = None
         self.log_file = log_file
         self.console = console
         self.file_handle = None
-        
+        self.min_priority = self._LEVEL_PRIORITY.get(min_level.upper(), 2)
+
         # Singleton pattern support (optional)
         AsyncLogger._instance = self
 
@@ -83,9 +86,15 @@ class AsyncLogger:
         # Level padded to 7 chars (e.g. "INFO   ")
         # Tag wrapped in [] if present
         
+        # Level filter — drop below min_level (except force)
+        if not force:
+            priority = self._LEVEL_PRIORITY.get(level.upper(), 1)
+            if priority < self.min_priority:
+                return
+
         tag_str = f"[{tag}]" if tag else ""
         formatted_msg = f"[{timestamp}] {level:<7} {tag_str} {msg}"
-        
+
         if force:
             # Synchronous path for critical errors or shutdown
             self._write(formatted_msg)

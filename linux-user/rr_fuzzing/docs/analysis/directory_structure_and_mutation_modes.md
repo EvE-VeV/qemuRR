@@ -151,7 +151,7 @@ multiprocess/ [14 files, ~225KB]
     └── fuzz_master.py            (21KB)          # 多进程主控
 ```
 
-#### 1.3.3 fuzzing/qemu_integration/ - QEMU集成 (C端)
+#### 1.3.3 src/engine/ - QEMU集成 (C端)
 
 ```
 qemu_integration/ [4 files, ~60KB]

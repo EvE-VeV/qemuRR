@@ -12,6 +12,8 @@ Responsible for:
 import hashlib
 import json
 import struct
+import fcntl
+import os
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Set
@@ -67,14 +69,16 @@ class CrashInfo:
 class CrashAnalyzer:
     """Crash Analyzer"""
     
-    def __init__(self, output_dir: Path):
+    def __init__(self, output_dir: Path, worker_id: int = 0):
         """
         Initialize Crash Analyzer
         
         Args:
             output_dir: Output directory
+            worker_id: Unique worker ID for naming
         """
         self.output_dir = Path(output_dir)
+        self.worker_id = worker_id
         self.crashes_dir = self.output_dir / "crashes"
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
         
@@ -84,23 +88,67 @@ class CrashAnalyzer:
         self.unique_hashes: Set[str] = set(self.crashes.keys())
     
     def _load_crash_db(self) -> Dict:
-        """Load known crash database"""
-        if self.crash_db_file.exists():
-            try:
-                with open(self.crash_db_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[CrashAnalyzer] Warning: Failed to load crash DB: {e}")
-                return {}
-        return {}
+        """Load known crash database (with locking for multi-process support)"""
+        if not self.crash_db_file.exists():
+            return {}
+            
+        try:
+            with open(self.crash_db_file, 'r') as f:
+                # Acquire shared lock for reading
+                fcntl.flock(f, fcntl.LOCK_SH)
+                try:
+                    data = json.load(f)
+                    return data
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as e:
+            print(f"[CrashAnalyzer] Warning: Failed to load crash DB: {e}")
+            return {}
     
     def _save_crash_db(self):
-        """Save crash database"""
+        """Save crash database (atomic write + lock for multi-process safety)"""
+        lock_file = self.crash_db_file.with_suffix(self.crash_db_file.suffix + '.lock')
+        tmp_file = self.crash_db_file.with_suffix(self.crash_db_file.suffix + '.tmp')
+
         try:
-            with open(self.crash_db_file, 'w') as f:
-                json.dump(self.crashes, f, indent=2)
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_file, 'a+') as lockf:
+                # Acquire exclusive process lock for full read-merge-write cycle
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                try:
+                    # Reload latest on-disk DB before writing to avoid lost updates
+                    if self.crash_db_file.exists():
+                        try:
+                            with open(self.crash_db_file, 'r') as rf:
+                                on_disk = json.load(rf)
+                            for h, data in on_disk.items():
+                                if h in self.crashes:
+                                    self.crashes[h]['count'] = max(self.crashes[h]['count'], data.get('count', 0))
+                                    existing_ids = set(self.crashes[h].get('crash_ids', []))
+                                    for cid in data.get('crash_ids', []):
+                                        if cid not in existing_ids:
+                                            self.crashes[h]['crash_ids'].append(cid)
+                                else:
+                                    self.crashes[h] = data
+                                    self.unique_hashes.add(h)
+                        except Exception:
+                            pass
+
+                    # Atomic write: write to temp, fsync, then replace
+                    with open(tmp_file, 'w') as wf:
+                        json.dump(self.crashes, wf, indent=2)
+                        wf.flush()
+                        os.fsync(wf.fileno())
+                    os.replace(tmp_file, self.crash_db_file)
+                finally:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
         except Exception as e:
             print(f"[CrashAnalyzer] Error: Failed to save crash DB: {e}")
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
     
     def analyze_crash(self, qemu_status: Dict, mutation_recipe: Dict, 
                      iteration: int = 0) -> CrashInfo:
@@ -143,8 +191,8 @@ class CrashAnalyzer:
         # Assess exploitability
         exploitability = self._assess_exploitability(signal, pc, fault_address, backtrace)
         
-        # Generate unique ID
-        crash_id = f"crash_{iteration:06d}_{crash_hash[:8]}"
+        # Generate unique ID (include worker_id to avoid collisions)
+        crash_id = f"crash_w{self.worker_id}_{iteration:06d}_{crash_hash[:8]}"
         
         # Create crash info
         crash_info = CrashInfo(
@@ -167,21 +215,35 @@ class CrashAnalyzer:
     def _compute_crash_hash(self, signal: int, pc: int, backtrace: List[str]) -> str:
         """
         Compute crash hash for deduplication
-        
-        Uses signal + PC + first 3 frames of the call stack
+
+        Uses signal + PC + first 3 frames of the call stack.
+        When backtrace is empty and PC is in ASLR-variable range
+        (x86-64 stack/heap: 0x7f0000000000+, or corrupted retaddr
+        pattern ending in a common suffix), normalise PC to 1MB
+        granularity to avoid every heap-overflow crash being unique.
         """
+        # Normalise ASLR-variable PCs for 64-bit targets (x86-64, aarch64).
+        # Any PC above 4GB (0x100000000) without a backtrace is treated as
+        # ASLR-variable — corrupted stack return addresses on 64-bit vary by
+        # 40+ bits per run. Without a stable backtrace anchor, collapse to
+        # signal-only to avoid every heap-overflow crash being unique.
+        # Examples caught: 0x6fff7ed22ec1, 0x7f3a1b2c3d4e, 0x7fffffffe8c0.
+        effective_pc = pc
+        if not backtrace and pc > 0x100000000:
+            effective_pc = 0  # signal-only grouping for ASLR heap overflows
+
         hash_components = [
             f"sig:{signal}",
-            f"pc:{pc:#x}" if pc else "pc:unknown",
+            f"pc:{effective_pc:#x}" if effective_pc else "pc:unknown",
         ]
-        
+
         # Add the first 3 frames of the call stack
         for i, frame in enumerate(backtrace[:3]):
             if isinstance(frame, str):
                 hash_components.append(f"frame{i}:{frame}")
             elif isinstance(frame, int):
                 hash_components.append(f"frame{i}:{frame:#x}")
-        
+
         hash_input = ":".join(hash_components)
         return hashlib.sha256(hash_input.encode()).hexdigest()
     

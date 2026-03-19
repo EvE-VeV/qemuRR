@@ -45,9 +45,9 @@ class AdvancedEnergyScheduler:
     def __init__(
         self,
         coverage_weight: float = 0.40,
-        depth_weight: float = 0.20,
-        speed_weight: float = 0.15,
-        entropy_weight: float = 0.15,
+        depth_weight: float = 0.30,
+        speed_weight: float = 0.10,
+        entropy_weight: float = 0.10,
         crash_weight: float = 0.10,
     ):
         """
@@ -175,8 +175,8 @@ class AdvancedEnergyScheduler:
         max_depth = 1000  # 假设最大深度
         normalized_depth = min(seed.path_depth, max_depth) / max_depth
         
-        # 使用log scale（避免过度偏向深路径）
-        score = math.log(1 + normalized_depth * 9) / math.log(10)
+        # 使用更激进的幂律评分，让深路径获得显著更高的能量
+        score = normalized_depth ** 0.5
         
         return score
     

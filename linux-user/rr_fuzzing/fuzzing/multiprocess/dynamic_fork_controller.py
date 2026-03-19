@@ -90,7 +90,10 @@ class DynamicForkController:
                  mutation_graph=None,
                  crash_detector=None,
                  crash_analyzer=None, # ✅ Task #8: Add deep crash analyzer
-                 analyzer=None):  # ✅ Task #8: Add crash detector
+                 analyzer=None,
+                 evolution_engine=None,
+                 manual_fork_point=None,
+                 arch: str = 'auto'):  # ✅ Pass architecture
         """Initialize dynamic fork controller
         
         Args:
@@ -99,6 +102,8 @@ class DynamicForkController:
             mutator: SmartMutator instance
             recipe_pool: RecipePool instance (optional)
             coverage_tracker: CoverageTracker instance
+            enable_pathfinder: Whether to use PathFinder for branch identification
+            recipe_pool: RecipePool instance (optional)
             trace_manager: TraceManager instance (for saving interesting seeds)
             fuzzing_stats: FuzzingStatistics instance (for unified tracking)
             mutation_graph: MutationDependencyGraph instance (for mutation tracking)
@@ -116,6 +121,9 @@ class DynamicForkController:
         self.crash_detector = crash_detector
         self.crash_analyzer = crash_analyzer # ✅ Layer 5 Analyzer
         self.analyzer = analyzer
+        self.evolution_engine = evolution_engine # ✅ Layer 6 Engine
+        self.manual_fork_point = manual_fork_point # ✅ Force specific fork point
+        self.arch = arch # ✅ Store architecture
         self.last_batch_execs = 0  # ✅ Track executions in last batch
         
         # Depth-first exploration mode configuration
@@ -126,7 +134,7 @@ class DynamicForkController:
         self.max_depth = int(os.environ.get('RR_MAX_DEPTH', 2))
         alog(f"Config: max_depth = {self.max_depth}", "DFC", "INFO")
         
-        self.max_variants_per_checkpoint = int(os.environ.get('RR_MAX_VARIANTS', 10))
+        self.max_variants_per_checkpoint = int(os.environ.get('RR_MAX_VARIANTS', 5))
         alog(f"Config: max_variants_per_checkpoint = {self.max_variants_per_checkpoint}", "DFC", "INFO")
         
         self.checkpoint_queue = []  # Queue of checkpoints to explore (Depth-First)
@@ -285,6 +293,7 @@ class DynamicForkController:
         """
         # Save current trace for mutation use
         self.current_trace = trace
+        self.current_trace_id = trace.id # ✅ Ensure ID is available for Evolution Engine
         if not self.depth_first_mode:
             # Compatibility: Use breadth-first mode if depth mode is not enabled
             return self._explore_breadth_first(trace, iteration_id)
@@ -312,23 +321,34 @@ class DynamicForkController:
         else:
             # Use static analysis to discover IO syscalls (avoids expensive QEMU baseline execution)
             alog("Static analysis to discover IO syscalls...", "DFC", "DEBUG")
-            io_syscalls = self._find_io_syscalls(trace, max_fork_points=2)
+            io_syscalls = self._find_io_syscalls(trace, max_fork_points=10)
             self._io_syscall_cache[cache_key] = io_syscalls
 
-        if not io_syscalls:
-            alog("No IO syscalls found", "DFC", "WARN")
-            return False
+        # ✅ Manual Fork Point Override (Force specific entrance for authenticated fuzzing)
+        if self.manual_fork_point is not None:
+             alog(f"🎯 Applying Manual Fork Point Override: {self.manual_fork_point}", "DFC", "INFO")
+             io_syscalls = [self.manual_fork_point]
 
-        alog(f"Found {len(io_syscalls)} IO syscalls: {io_syscalls}", "DFC", "DEBUG")
+        if not io_syscalls:
+            alog("No IO syscalls found, falling back to Havoc mode at fork point 0", "DFC", "WARN")
+            import time
+            time.sleep(0.1) # small delay to prevent rapid spinning if execution fails
+            io_syscalls = [0]
+
+        alog(f"Found {len(io_syscalls)} IO syscalls: {io_syscalls[:10]}...", "DFC", "DEBUG")
 
         # ✅ Store as instance variable for nested fork use
         self.current_io_syscalls = io_syscalls
 
-        # Start depth exploration from first IO syscall
-        first_io_syscall = io_syscalls[0]
-        alog(f"🎯 Starting deep exploration at first IO syscall[{first_io_syscall}]", "DFC", "INFO")
-
-        return self._explore_at_checkpoint(trace.file_path, first_io_syscall, 0, iteration_id, "root")
+        # Horizontal exploration: Try all preselected IO syscalls at root level
+        any_success = False
+        for i, syscall_index in enumerate(io_syscalls):
+            alog(f"🎯 Starting deep exploration branch {i+1}/{len(io_syscalls)} @syscall[{syscall_index}]", "DFC", "INFO")
+            success = self._explore_at_checkpoint(trace.file_path, syscall_index, 0, iteration_id, f"root_{i}")
+            if success:
+                any_success = True
+                
+        return any_success
 
     def _explore_at_checkpoint(self, trace_file: str, syscall_index: int, depth: int, iteration_id: int, parent_id: str) -> bool:
         """
@@ -394,6 +414,7 @@ class DynamicForkController:
             alog(f"Executing {len(mutations)} variants in parallel...", "DFC", "DEBUG")
 
             try:
+                alog(f"DEBUG-DFC: Calling execute_fork with iteration_id={iteration_id}", "DFC", "INFO")
                 results = self.executor.execute_fork(
                     trace_file=trace_file,
                     fork_point=syscall_index,
@@ -405,8 +426,12 @@ class DynamicForkController:
                 # ✅ Update unified stats counter (1 execution per variant)
                 if self.fuzzing_stats and results:
                     batch_count = len(results)
+                    # Use a lock or thread-safe way? 
+                    # FuzzingStatistics should be process-local for worker
                     self.fuzzing_stats.total_execs += batch_count
-                    self.last_batch_execs += batch_count
+                    self.fuzzing_stats.session_execs += batch_count
+                    if hasattr(self, 'last_batch_execs'):
+                        self.last_batch_execs += batch_count
 
                 any_new_path = False
                 if results and len(results) > 0:
@@ -434,6 +459,13 @@ class DynamicForkController:
                             if result.crashed:
                                 if self.crash_detector:
                                     alog(f"Saving crash report...", "DFC", "INFO")
+                                    if result.crashed:
+                                        # ✅ Active PC Capture: Read PC from SHM
+                                        shm_pc = self.executor.shm.read_crash_pc(i) if self.executor.shm else 0
+                                        if shm_pc:
+                                            result.pc = shm_pc
+                                            alog(f"🎯 Captured Crash PC from SHM: 0x{shm_pc:x} (Variant {i})", "DFC", "INFO")
+
                                     trace_obj = self.current_trace
                                     # Ensure trace object has file_path
                                     if trace_obj and not hasattr(trace_obj, 'file_path'):
@@ -455,7 +487,7 @@ class DynamicForkController:
                                     qemu_status = {
                                         'signal': result.signal_number,
                                         'exit_code': result.qemu_exit_code,
-                                        'pc': getattr(result, 'pc', 0),
+                                        'pc': result.pc if result.pc else 0,
                                         'fault_address': getattr(result, 'fault_address', None),
                                         'backtrace': getattr(result, 'backtrace', [])
                                     }
@@ -501,6 +533,13 @@ class DynamicForkController:
                                     'total_unique_edges': coverage_stats.get('total_edges', 0),
                                     'edges': new_edges if new_edges else set()
                                 }
+
+                                # ✅ Layer 6: Evaluate for evolution candidate
+                                if self.evolution_engine:
+                                    result.new_coverage = has_new_coverage
+                                    result.trace_id = getattr(self, 'current_trace_id', 'unknown')
+                                    m_inst = mutations[i] if i < len(mutations) else []
+                                    self.evolution_engine.evaluate_iteration(result, m_inst)
 
                                 mutation_dicts = []
                                 current_mutation = mutations[i] if i < len(mutations) else []
@@ -705,20 +744,20 @@ class DynamicForkController:
         # Should analyze trace file to find subsequent IO syscalls
         # For simplicity, returning some hypothetical subsequent IO syscalls for now
         try:
-            from ..trace_analyzer import TraceAnalyzer
+            from conductor.trace_analyzer import TraceAnalyzer
         except ImportError:
             # Fix relative import error
             import sys
             from pathlib import Path
             parent_dir = Path(__file__).parent.parent
             sys.path.insert(0, str(parent_dir))
-            from trace_analyzer import TraceAnalyzer
+            from conductor.trace_analyzer import TraceAnalyzer
 
         try:
             analyzer = TraceAnalyzer(trace_file)
             all_io_syscalls = []
             for record in analyzer.syscalls:
-                if hasattr(record, 'name') and record.name.lower() in ['read', 'write', 'open', 'close', 'openat']:
+                if hasattr(record, 'name') and record.name.lower() in ['read', 'write', 'open', 'close', 'openat', 'accept', 'accept4', 'select', 'pselect6', 'recv', 'recvfrom', '_newselect']:
                     all_io_syscalls.append(record.index)
 
             # Return IO syscalls greater than current_index
@@ -822,7 +861,7 @@ class DynamicForkController:
         
         return None
     
-    def _find_io_syscalls(self, trace: Trace, max_fork_points: int = 2) -> list:
+    def _find_io_syscalls(self, trace: Trace, max_fork_points: int = 10) -> list:
         """
         Intelligently select IO syscalls as fork points
 
@@ -843,11 +882,11 @@ class DynamicForkController:
         # Import TraceAnalyzer
         import sys
         from pathlib import Path
-        import trace_analyzer
+        from conductor import trace_analyzer
         if self.analyzer and getattr(self.analyzer, 'trace_file', None) == trace.file_path:
              analyzer = self.analyzer
         else:
-             analyzer = trace_analyzer.TraceAnalyzer(trace.file_path)
+             analyzer = trace_analyzer.TraceAnalyzer(trace.file_path, arch=self.arch)
              if not hasattr(analyzer, 'trace_file'):
                  analyzer.trace_file = trace.file_path
              self.analyzer = analyzer  # ✅ FIX: Save for reuse
@@ -858,12 +897,13 @@ class DynamicForkController:
         for sc in analyzer.syscalls:
             # Only consider IO syscalls
             if sc.name in PRIMARY_IO_SYSCALLS:
-                # Skip first 10% of syscalls (initialization phase)
-                if sc.index < len(analyzer.syscalls) * 0.1:
-                    continue
-
                 # ✅ Calculate priority score
                 priority_score = 0
+                
+                # Penalize early syscalls (initialization phase) instead of strictly skipping them
+                if sc.index < len(analyzer.syscalls) * 0.1:
+                    priority_score -= 20
+
 
                 # 1. Syscall type priority
                 if sc.name in ['read', 'recv', 'recvfrom']:

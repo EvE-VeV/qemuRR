@@ -1,0 +1,35 @@
+{
+    "name": "Netgear_RAX30",
+    "arch": "arm",
+    "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Netgear_RAX30/rootfs",
+    "binary_path": "usr/sbin/lighttpd",
+    "start_command": [
+        "usr/sbin/lighttpd",
+        "-D",
+        "-f",
+        "/tmp/fuzz_lighttpd.conf"
+    ],
+    "ld_prefix": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Netgear_RAX30/rootfs",
+    "web_root": "webs/",
+    "fork_point": 279,
+    "shared_memory_size": "2M",
+    "env": {
+        "TERM": "xterm",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin"
+    },
+    "config_patches": [
+        {
+            "source": "etc/lighttpd/fuzz_lighttpd.conf",
+            "target": "/tmp/fuzz_lighttpd.conf",
+            "replacements": {
+                "server.port = 8080": "server.port = 9090",
+                "server.document-root = \"/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/RAX30/sim_root/webs/\"": "server.document-root = \"{{ROOTFS}}/webs/\"",
+                "server.errorlog = \"/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/RAX30/sim_root/var/log/lighttpd.error.log\"": "server.errorlog = \"/tmp/error.log\"",
+                "server.pid-file = \"/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/RAX30/sim_root/var/run/lighttpd.pid\"": "server.pid-file = \"/tmp/lighttpd.pid\"",
+                "cgi.assign = ( \"\" => \"\" )": "cgi.assign = ( \".cgi\" => \"\", \".php\" => \"\" )",
+                "index-file.names = ( \"index.html\" )": "index-file.names = ( \"index.html\", \"index.php\" )",
+                "server.modules = (": "debug.log-request-handling = \"enable\"\ndebug.log-file-not-found = \"enable\"\nserver.modules = ("
+            }
+        }
+    ]
+}

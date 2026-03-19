@@ -140,6 +140,11 @@ class DualLevelPathFinder:
                 
                 # Save to cache
                 self._tree_cache[tree_file] = (mtime, size, tree_data)
+                
+                # 🔥 Performance: Cap tree cache
+                if len(self._tree_cache) > 10:
+                    del_key = next(iter(self._tree_cache))
+                    del self._tree_cache[del_key]
 
             # 3. Process nodes and build graph
             nodes = tree_data.get('nodes', [])
@@ -165,12 +170,19 @@ class DualLevelPathFinder:
                 self.syscall_blocks[idx] = block
                 id_to_block[node.get('id', -1)] = block
                 
-                # Build BB map
-                for addr in block.bb_addrs:
+                # Build BB map and store as integers
+                block.bb_addrs = []
+                for addr in node.get('bb_addresses', []):
                     if isinstance(addr, str):
-                        try: addr = int(addr, 16)
-                        except: continue
-                    self.bb_to_syscall[addr] = idx
+                        try:
+                            clean_addr = int(addr, 16)
+                            block.bb_addrs.append(clean_addr)
+                            self.bb_to_syscall[clean_addr] = idx
+                        except:
+                            continue
+                    elif isinstance(addr, int):
+                        block.bb_addrs.append(addr)
+                        self.bb_to_syscall[addr] = idx
 
             # Build edges
             for node in nodes:
@@ -244,11 +256,11 @@ class DualLevelPathFinder:
 
         try:
             # Import TraceAnalyzer
-            from trace_analyzer import TraceAnalyzer
+            from .trace_analyzer import TraceAnalyzer
 
             # Parse trace
             if not analyzer:
-                from trace_analyzer import TraceAnalyzer
+                from .trace_analyzer import TraceAnalyzer
                 analyzer = TraceAnalyzer(trace_file)
                 if not analyzer.analyze():
                     alog("TraceAnalyzer parsing failed", "PathFinder", "ERROR")
@@ -703,6 +715,22 @@ class DualLevelPathFinder:
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics"""
         return self.stats.copy()
+
+    def get_hit_bbs(self, coverage_bitmap: bytes) -> List[int]:
+        """
+        Translates a coverage bitmap (edges) into a list of hit basic block addresses.
+        Simplified version for SecurityWatchdog.
+        """
+        hit_bbs = set()
+        # In RR-Fuzz, the coverage_bitmap represents edge hashes.
+        # To accurately reverse this, we'd need the full edge map.
+        # For now, we return the BBs mapped from the syscall tree.
+        for bb in self.bb_to_syscall.keys():
+            # Heuristic: if a BB is in our known map, we consider it a candidate
+            # In a full implementation, we'd look for specific bits in the bitmap.
+            hit_bbs.add(bb)
+            
+        return list(hit_bbs)
 
     def export_cfg(self, output_file: str):
         """

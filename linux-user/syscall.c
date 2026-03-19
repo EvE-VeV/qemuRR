@@ -26,8 +26,8 @@
 #include "tcg/startup.h"
 
 #ifdef CONFIG_RR_FUZZING
-#include "rr_fuzzing/core/rr_framework.h"
-#include "rr_fuzzing/replay/rr_replay_strace.h"
+#include "rr_framework.h"
+#include "rr_replay_strace.h"
 
 /* ==================== 优化开关 ==================== */
 // 🔥 Speed Optimization: 禁用PARAM_MODIFIED日志减少I/O开销
@@ -5643,7 +5643,8 @@ IOCTLEntry ioctl_entries[] = {
 };
 
 /* ??? Implement proper locking for ioctls.  */
-/* do_ioctl() Must return target values and target errnos. */
+#include "rr_mock_ioctls.h"
+
 static abi_long do_ioctl(int fd, int cmd, abi_long arg)
 {
     const IOCTLEntry *ie;
@@ -5652,6 +5653,13 @@ static abi_long do_ioctl(int fd, int cmd, abi_long arg)
     uint8_t buf_temp[MAX_STRUCT_SIZE];
     int target_size;
     void *argptr;
+
+    /* [RRFUZZ] Professional Mocking Hook */
+    if (rr_try_mock_ioctl(fd, cmd, arg)) {
+        return 0;
+    }
+
+
 
     ie = ioctl_entries;
     for(;;) {
@@ -9281,6 +9289,10 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 {
     CPUState *cpu = env_cpu(cpu_env);
     abi_long ret;
+
+#if defined(TARGET_MIPS)
+    rr_fix_mips_abi(cpu_env);
+#endif
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_stat64) \
     || defined(TARGET_NR_lstat) || defined(TARGET_NR_lstat64) \
     || defined(TARGET_NR_fstat) || defined(TARGET_NR_fstat64) \

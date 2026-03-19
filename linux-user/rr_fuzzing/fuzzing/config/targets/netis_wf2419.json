@@ -1,0 +1,25 @@
+{
+    "name": "Netis_WF2419",
+    "arch": "mips",
+    "trace_file": "tests/seeds/Netis_WF2419/netis_wf2419_seed.bin",
+    "word_size": 32,
+    "dictionary": "config/dicts/totolink_http.dict",
+    "fork_point": 0,
+    "protocol": "http",
+    "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Netis_WF2419/rootfs",
+    "binary_path": "bin/boa",
+    "ld_prefix": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Netis_WF2419/rootfs",
+    "start_command": [
+        "bin/boa",
+        "-p",
+        "/bin/boa",
+        "-f",
+        "/etc/boa.conf"
+    ],
+    "env": {
+        "TERM": "xterm",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin"
+    },
+    "workers": 1,
+    "config_patches": []
+}

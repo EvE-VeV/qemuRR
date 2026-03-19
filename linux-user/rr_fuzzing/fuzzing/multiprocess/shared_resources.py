@@ -74,7 +74,8 @@ class SharedCoverage:
     def _create_shared_resources(cls):
         """Create shared resources (should be called in parent process)"""
         return {
-            'array': mp.Array('B', COVERAGE_MAP_SIZE),
+            # ✅ Performance: Disable internal lock since we use an explicit global lock
+            'array': mp.Array('B', COVERAGE_MAP_SIZE, lock=False),
             'lock': mp.Lock(),
             'revision': mp.Value('L', 0)
         }
@@ -131,36 +132,28 @@ class SharedCoverage:
             if self.revision.value == self.local_revision:
                 return 0
                 
-            # Access underlying buffer for fast struct unpacking
-            # self.shared_array.get_obj() returns the raw ctypes array
-            try:
-                global_buf = self.shared_array.get_obj()
-            except AttributeError:
-                # Fallback if not a SynchronizedArray
-                global_buf = bytes(self.shared_array)
-
-            global_longs = struct.unpack('<8192Q', global_buf)
-            local_longs = struct.unpack('<8192Q', self.local_bitmap)
+            # ✅ Optimized: Use memoryview for fast buffer access
+            global_view = memoryview(self.shared_array)
+            local_view = memoryview(self.local_bitmap)
+            
+            # Vectorized comparison using struct
+            global_longs = struct.unpack('<8192Q', global_view)
+            local_longs = struct.unpack('<8192Q', local_view)
             
             for k in range(8192):
-                g_long = global_longs[k]
-                l_long = local_longs[k]
-                
-                # Fast path: No new coverage in this 8-byte chunk
-                if g_long == l_long:
+                if global_longs[k] == local_longs[k]:
                     continue
                 
-                # If we are here, at least one byte changed.
-                # Update individual bytes in this chunk
+                # Update chunk
                 base = k * 8
                 for j in range(8):
                     idx = base + j
-                    g_byte = self.shared_array[idx]
-                    l_byte = self.local_bitmap[idx]
+                    g_byte = global_view[idx]
+                    l_byte = local_view[idx]
                     
                     if g_byte > l_byte:
                         new_edges += 1
-                        self.local_bitmap[idx] = g_byte
+                        local_view[idx] = g_byte
             
             # Sync complete, update local revision
             self.local_revision = self.revision.value
@@ -194,41 +187,37 @@ class SharedCoverage:
             # Re-check against local after lock is acquired (another sync might have happened)
             if exec_bitmap == self.local_bitmap:
                 return 0
-                
-            exec_longs = struct.unpack('<8192Q', exec_bitmap)
-            local_longs = struct.unpack('<8192Q', self.local_bitmap)
             
-            # Access global buffer for manual updates
-            try:
-                global_buf = self.shared_array.get_obj()
-            except AttributeError:
-                global_buf = self.shared_array
+            # ✅ Optimized: Use memoryview for fast buffer access
+            global_view = memoryview(self.shared_array)
+            local_view = memoryview(self.local_bitmap)
+            exec_view = memoryview(exec_bitmap)
+                
+            exec_longs = struct.unpack('<8192Q', exec_view)
+            local_longs = struct.unpack('<8192Q', local_view)
 
             for k in range(8192):
-                e_long = exec_longs[k]
-                l_long = local_longs[k]
-                
-                # Skip chunks with no NEW local coverage
-                if e_long == l_long:
+                if exec_longs[k] == local_longs[k]:
                     continue
                 
                 # Check byte-by-byte and update global
                 base = k * 8
                 for j in range(8):
                     idx = base + j
-                    e_byte = exec_bitmap[idx]
+                    e_byte = exec_view[idx]
+                    l_byte = local_view[idx]
                     
-                    if e_byte > self.local_bitmap[idx]:
-                        self.local_bitmap[idx] = e_byte
+                    if e_byte > l_byte:
+                        local_view[idx] = e_byte
                         
                         # Update global if better
-                        if e_byte > self.shared_array[idx]:
-                            self.shared_array[idx] = e_byte
+                        if e_byte > global_view[idx]:
+                            global_view[idx] = e_byte
                             new_edges += 1
             
             # If we updated global, increment revision
             if new_edges > 0:
-                with self.revision.get_lock(): # Only needed for Value, though usually mp.Value handles it
+                with self.revision.get_lock():
                     self.revision.value += 1
                 self.local_revision = self.revision.value # Keep local in sync
         

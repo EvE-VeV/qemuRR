@@ -63,7 +63,7 @@ class FuzzInstruction:
         uint32_t offset;            // uint32
         uint32_t size;              // uint32
         uint32_t data_len;          // uint32
-        uint8_t data[256];          // uint8 array
+        uint8_t data[4096];         // 🔥 Updated to 4K
     } FuzzInstruction;
     """
     syscall_index: int
@@ -85,18 +85,17 @@ class FuzzInstruction:
     def pack(self) -> bytes:
         """
         Pack into binary format matching the C struct.
-        Returns 280 bytes.
+        Returns 4120 bytes.
         """
         data_bytes = self.data if isinstance(self.data, bytes) else struct.pack('q', self.data)
         data_len = len(data_bytes)
         
-        # Pad to 256 bytes
-        # Use FUZZ_INSTRUCTION_DATA which is typically 256
+        # Pad to 4096 bytes (FUZZ_INSTRUCTION_DATA)
         padded_data = data_bytes + b'\x00' * (FUZZ_INSTRUCTION_DATA - data_len)
         
         # Pack fields matches C struct order:
         # cmd, syscall_index, arg_index, offset, size, data_len, data
-        return struct.pack('IIIIII256s', 
+        return struct.pack('IIIIII4096s', 
                           self.cmd,
                           self.syscall_index,
                           self.arg_index,
@@ -107,5 +106,5 @@ class FuzzInstruction:
 
     @property
     def struct_size(self) -> int:
-        """Returns the fixed size of the C structure (280 bytes)."""
-        return 280
+        """Returns the fixed size of the C structure (4120 bytes)."""
+        return 24 + 4096

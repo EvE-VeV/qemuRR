@@ -1,0 +1,59 @@
+# Telnet Command Dictionary for Fuzzing
+
+# CVE-2023-40478 Target: passwd command
+passwd
+password
+oldpasswd
+newpasswd
+
+# Common Telnet commands
+ls
+cd
+pwd
+cat
+echo
+exit
+quit
+help
+?
+
+# Administrative commands
+reboot
+shutdown
+ifconfig
+route
+netstat
+ps
+top
+kill
+
+# Potentially vulnerable commands
+telnetCommand details not shown as this is a security research tool.
+# Telnet特殊字符
+\r\n
+\n
+\r
+\x00
+\xFF
+
+# Buffer overflow patterns
+A
+AA
+AAAA
+AAAAAAAA
+AAAAAAAAAAAAAAAA
+
+# Command injection attempts
+;id;
+|id|
+`id`
+$(id)
+&&id&&
+
+# Special escape sequences
+\x1b
+\x1b[
+\x1b[A
+\x1b[B
+\x1b[C
+\x1b[D

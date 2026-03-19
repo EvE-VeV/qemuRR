@@ -18,8 +18,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Any, Dict
 
-# Add analysis directory to path to import trace_analyzer
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "analysis"))
+# Imports for trace_analyzer and other engine components
 
 try:
     from .constants import (
@@ -38,20 +37,10 @@ try:
     from .shadow_registry import ShadowRegistry
 except ImportError:
     # Standalone script fallback
-    from constants import (
-        FUZZ_CMD_FLIP_BITS, FUZZ_CMD_LIGHT_MUTATION, FUZZ_CMD_INTERESTING_VALUES,
-        FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_TRUNCATE, FUZZ_CMD_EXTEND,
-        FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_MUTATE_AUX_BUFFER, FUZZ_CMD_MUTATE_FLAGS,
-        FUZZ_CMD_MUTATE_ARG, FUZZ_CMD_OVERWRITE_AT_OFFSET,
-        INIT_SYSCALLS, INIT_PHASE_THRESHOLD, IMPORTANT_SYSCALLS,
-        PRIMARY_IO_SYSCALLS, SECONDARY_IO_SYSCALLS, FORBIDDEN_MUTATION_SYSCALLS,
-        FUZZ_MAX_INSTRUCTIONS
-    )
-    from instruction import FuzzInstruction
-    from io_mutator import IOReturnValueMutator
-    from async_logger import alog
-    from conductor_types import MutationRecipe
-    from shadow_registry import ShadowRegistry
+    # This block is intentionally left empty as relative imports are now preferred.
+    # If this script is run standalone, it should be run from the package root
+    # or the package should be installed.
+    pass
 
 
 class BaseMutator:
@@ -74,6 +63,7 @@ class BaseMutator:
         self.use_io_mutation = use_io_mutation
         self.io_mutator = IOReturnValueMutator() if use_io_mutation else None
         self.last_mutation_type = 'unknown'
+        self.dictionary = [] # Dictionary for token injection
 
         mode_str = "Random Mutation + IO Retval Mutation" if use_io_mutation else "Random Mutation Mode"
         alog(f"Initialized ({mode_str})", "MUTATOR", "INFO")
@@ -113,12 +103,14 @@ class BaseMutator:
                 syscall_index = fork_point
                 alog(f"Mutation targeting fork_point={fork_point}", "MUTATOR")
             else:
-                # Random syscall index, ensuring >= fork_point (if specified)
+                # 🔥 2026-01-22: Removed the conservative "+20" locality limit.
+                # Now allow targeting any syscall up to the end of the trace (or default 1000).
+                max_idx = (len(trace.syscalls) - 1) if (trace and hasattr(trace, 'syscalls')) else 1000
                 if fork_point is not None:
-                    syscall_index = random.randint(fork_point, max(fork_point + 20, 99))
+                    syscall_index = random.randint(fork_point, max(fork_point, max_idx))
                 else:
-                    syscall_index = random.randint(0, 99)
-                alog(f"Mutation {i+1} targeting random syscall_index={syscall_index}", "MUTATOR")
+                    syscall_index = random.randint(0, max_idx)
+                alog(f"Mutation {i+1} targeting syscall_index={syscall_index} (max_idx={max_idx})", "MUTATOR")
             
             # Mutation command selection
             mutation_types = [
@@ -267,7 +259,12 @@ class BaseMutator:
                 
                 # Chance to use attack patterns instead of IOMutator content
                 content_to_use = m.buffer_content
-                if random.random() < 0.3:
+                alog(f"WARN: Inside buffer_content. Dict len: {len(self.dictionary)}", "MUTATOR", "WARN")
+                with open("/tmp/debug_token.txt", "a") as df:
+                    df.write(f"INSIDE BUFFER: Dict len={len(self.dictionary)}\n")
+                
+                # Chance to use attack patterns instead of IOMutator content
+                if random.random() < 0.01: # Reduced from 0.3 to force dictionary
                      patterns = [
                         b'%s%s%s%s', b'A' * 64, b'../../../etc/passwd', 
                         b'; cat /etc/passwd', b'\x00' * 8, 
@@ -279,14 +276,22 @@ class BaseMutator:
                      ]
                      content_to_use = random.choice(patterns)
                 
-                # [NEW] Dictionary Injection
-                elif self.dictionary and random.random() < 0.5:
-                     token = random.choice(self.dictionary)
-                     if random.random() < 0.5:
-                         content_to_use = token
-                     else:
-                         content_to_use = b"A" * 8 + token + b"B" * 8
-                     alog(f"Dictionary Mutation: Injected '{token}'", "MUTATOR")
+                # [NEW] Dictionary Injection - FORCED
+                elif self.dictionary: # Removed random check and random.random() < 0.5
+                     try:
+                         token = random.choice(self.dictionary)
+                         alog(f"WARN: Selected dictionary token: {token}", "MUTATOR", "WARN")
+                         
+                         if random.random() < 0.5:
+                             content_to_use = token
+                         else:
+                             content_to_use = b"A" * 8 + token + b"B" * 8
+                         alog(f"Dictionary Mutation: Injected '{token}'", "MUTATOR", "WARN")
+                     except Exception as e:
+                         alog(f"ERROR: Dictionary mutation failed: {e}", "MUTATOR", "ERROR")
+                         import traceback
+                         traceback.print_exc()
+                         content_to_use = b"A" * 64 # Fallback
 
                 buffer_instruction = FuzzInstruction(
                     syscall_index=m.syscall_index,
@@ -424,7 +429,7 @@ class SmartMutator:
     # Class-level cache to avoid redundant parsing of same trace
     _trace_cache = {}  # {trace_file: TraceAnalyzer}
     
-    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None, word_size=0, endian='auto'):
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None, word_size=0, endian='auto', dictionary_file=None, arch='auto'):
         """
         Initialize SmartMutator
 
@@ -436,10 +441,12 @@ class SmartMutator:
             analyzer: Existing TraceAnalyzer instance (optional, avoids redundant analysis)
             word_size: Word size (32 or 64, 0 for auto)
             endian: Endianness ('auto', 'little', 'big')
+            dictionary_file: Path to external dictionary file (optional)
         """
         self.trace_file = trace_file
         self.word_size = word_size
         self.endian = endian
+        self.arch = arch
         
         # Use passed analyzer or cached TraceAnalyzer if available
         if analyzer:
@@ -453,17 +460,28 @@ class SmartMutator:
             # Analyze using repaired TraceAnalyzer
             alog(f"Analyzing trace file: {trace_file}", "MUTATOR", "INFO")
             
+            # ✅ BB Trace support
+            try:
+                from .bb_trace_parser import BBTraceParser, BBEntry
+            except ImportError:
+                alog("Could not import bb_trace_parser. BB Trace support disabled.", "MUTATOR", "WARN")
+            
             # Import TraceAnalyzer
-            from trace_analyzer import TraceAnalyzer
+            from .trace_analyzer import TraceAnalyzer
             
             # TraceAnalyzer calls analyze() automatically in __init__
-            self.analyzer = TraceAnalyzer(trace_file, word_size=word_size, endian=endian)
+            self.analyzer = TraceAnalyzer(trace_file, word_size=word_size, endian=endian, arch=arch)
             
             # Cache for future use
             SmartMutator._trace_cache[trace_file] = self.analyzer
+            
+            # 🔥 Performance: Cap trace cache to prevent memory pressure
+            if len(SmartMutator._trace_cache) > 10:
+                del_key = next(iter(SmartMutator._trace_cache))
+                del SmartMutator._trace_cache[del_key]
         
         # Shadow Registry for resource tracking (Phase B)
-        from shadow_registry import ShadowRegistry
+        from .shadow_registry import ShadowRegistry
         self.shadow_registry = ShadowRegistry()
         
         # Get all pure replay syscalls (those with aux_data)
@@ -518,12 +536,13 @@ class SmartMutator:
         auto_recipes = self._generate_automatic_recipes()
         if auto_recipes:
             self.recipes.extend(auto_recipes)
-        if auto_recipes:
-            self.recipes.extend(auto_recipes)
             alog(f"Automatically generated {len(auto_recipes)} recipes (Total: {len(self.recipes)})", "MUTATOR", "INFO")
 
-        if len(self.recipes) > 0:
-            self.recipe_mode = True
+        # 🔥 Cap recipes to prevent memory growth
+        if len(self.recipes) > 200:
+            alog(f"⚠️ Too many recipes ({len(self.recipes)}), capping at 200", "MUTATOR", "WARN")
+            self.recipes = self.recipes[:200]
+
         if len(self.recipes) > 0:
             self.recipe_mode = True
             alog(f"Recipe-driven mode enabled (Total: {len(self.recipes)} recipes)", "MUTATOR", "INFO")
@@ -544,11 +563,69 @@ class SmartMutator:
         self.io_mutation_prob = 0.2 # Lower probability for IO mutation in SmartMutator
         
         # Dictionary Support
-        self.dictionary = []
+        self.dictionary = [
+            # Command Injection
+            b";", b"|", b"&", b"$(id)", b"`id`", b"\n", b"admin", b"root", b"127.0.0.1",
+            # Path Traversal
+            b"../", b"../../../../etc/passwd", b"..\\", 
+            # Format String
+            b"%s%s%s%s%s", b"%n%n%n", b"%p%p%p",
+            # Shell/Logic
+            b"True", b"False", b"yes", b"no", b"allow", b"deny",
+            # HTTP/Web
+            b"application/x-www-form-urlencoded", b"multipart/form-data", b"text/html"
+        ]
         if target_binary:
             self._extract_dictionary_tokens(target_binary)
             
+        # Load external dictionary if provided
+        if dictionary_file:
+            self._load_dictionary(dictionary_file)
+            
         alog(f"Stagnation detection enabled (threshold={self.stagnation_threshold} iterations)", "MUTATOR", "INFO")
+
+    def clear(self):
+        """Explicitly release resources"""
+        self.recipes = []
+        self.mutable_candidates = []
+        self.syscalls = []
+        self.pure_candidates = []
+        self.hybrid_candidates = []
+        self.dictionary = []
+        self.analyzer = None
+        self.path_finder = None
+        self.shadow_registry = None
+        import gc
+        gc.collect()
+
+    def _load_dictionary(self, dict_file):
+        """Load tokens from external dictionary file"""
+        if not os.path.exists(dict_file):
+            alog(f"Dictionary file not found: {dict_file}", "MUTATOR", "WARN")
+            return
+            
+        try:
+            count = 0
+            with open(dict_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    # Handle quoted strings (e.g. "GET")
+                    if line.startswith('"') and line.endswith('"'):
+                        token_str = line[1:-1]
+                        # Process generic escape sequences
+                        token_bytes = token_str.encode('utf-8').decode('unicode_escape').encode('latin1')
+                    else:
+                        token_bytes = line.encode('utf-8')
+                        
+                    self.dictionary.append(token_bytes)
+                    count += 1
+            
+            alog(f"Loaded {count} tokens from dictionary: {dict_file}", "MUTATOR", "INFO")
+        except Exception as e:
+            alog(f"Failed to load dictionary {dict_file}: {e}", "MUTATOR", "ERROR")
     
     def _perform_fd_tracking(self):
         """
@@ -710,6 +787,11 @@ class SmartMutator:
         # Final consolidation of mutable candidates
         mutable = important + primary_io + secondary_io + others
 
+        # 🔥 Cap candidates to prevent massive memory footprint on large traces
+        if len(mutable) > 1000:
+            alog(f"⚠️ Too many mutable candidates ({len(mutable)}), capping at 1000", "MUTATOR", "WARN")
+            mutable = mutable[:1000]
+
         alog(f"Mutable syscall candidates: {len(mutable)}", "MUTATOR", "INFO")
         if not mutable:
             alog(f"WARNING: No candidates found for mutation!", "MUTATOR", "WARN")
@@ -722,15 +804,7 @@ class SmartMutator:
         """
         try:
             # Import PathFinder
-            import sys
-            from pathlib import Path
-
-            # Add conductor directory to path
-            conductor_dir = Path(__file__).parent
-            if str(conductor_dir) not in sys.path:
-                sys.path.insert(0, str(conductor_dir))
-
-            # Import DualLevelPathFinder
+            # Remove sys.path manipulation, rely on package structure
             from .dual_level_path_finder import DualLevelPathFinder as PathFinder
             # Config is part of DB or params, maybe unnecessary or can use dummy
             # DualLevel uses different config, let's omit Config class import as it's not strictly needed if we pass dict or it handles it.
@@ -842,7 +916,8 @@ class SmartMutator:
             count = 0
             for s in strings:
                 s = s.strip()
-                if 3 <= len(s) <= 32:
+                # Optimized range for keywords and identifiers
+                if 4 <= len(s) <= 32:
                     try:
                         token = s.encode('utf-8')
                         if token not in self.dictionary:
@@ -851,14 +926,30 @@ class SmartMutator:
                     except:
                         pass
             
-            # Common Magic Bytes
+            # Common Magic Bytes and Protocol Keywords
             common_magics = [
-                b"HTTP/1.1", b"GET", b"POST", b"Host:", b"User-Agent:", 
-                b"Content-Length:", b"Content-Type:", b"Connection:",
-                b"admin", b"password", b"root", b"123456",
+                # HTTP / Web
+                b"HTTP/1.1", b"GET", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS",
+                b"Host:", b"User-Agent:", b"Content-Length:", b"Content-Type:", b"Connection:",
+                b"Accept-Encoding:", b"Authorization: Basic ", b"Cookie: ",
+                
+                # Protocol Specifics (FTP, SMTP, etc)
+                b"USER ", b"PASS ", b"PORT ", b"RETR ", b"STOR ", b"HELO ", b"MAIL FROM:", b"RCPT TO:",
+                
+                # Device / Admin
+                b"admin", b"password", b"root", b"123456", b"guest", b"1234",
                 b"soap:Envelope", b"urn:schemas", 
-                b"M-SEARCH", b"NOTIFY", # UPnP specific
-                b"uuid:", b"serviceType"
+                
+                # UPnP / SSDP
+                b"M-SEARCH", b"NOTIFY", b"uuid:", b"serviceType", b"deviceType",
+                b"ST: ", b"MX: ", b"MAN: \"ssdp:discover\"",
+                
+                # Security / Shell
+                b"/bin/sh", b"; cat /etc/passwd", b"id", b"whoami", b"&& sleep 10",
+                b"`id`", b"$(id)", b"| id",
+                
+                # Format Strings
+                b"%s%s%s%s", b"%x%x%x%x", b"%p%p%p%p", b"%n%n%n%n"
             ]
             
             for m in common_magics:
@@ -866,11 +957,12 @@ class SmartMutator:
                     self.dictionary.append(m)
                     count += 1
 
-            alog(f"Extracted {count} tokens. Total dictionary size: {len(self.dictionary)}", "MUTATOR", "INFO")
+            alog(f"Extracted dictionary: {count} new tokens. Total size: {len(self.dictionary)}", "MUTATOR", "INFO")
             
-            if len(self.dictionary) > 500:
-                 self.dictionary = random.sample(self.dictionary, 500)
-                 alog("Dictionary truncated to 500 items", "MUTATOR", "INFO")
+            # Cap dictionary size but keep it representative
+            if len(self.dictionary) > 1000:
+                 self.dictionary = random.sample(self.dictionary, 1000)
+                 alog("Dictionary capped at 1000 items", "MUTATOR", "INFO")
 
         except Exception as e:
              alog(f"Failed to extract dictionary: {e}", "MUTATOR", "ERROR")
@@ -1122,22 +1214,39 @@ class SmartMutator:
         
         elif strategy_type == 5:
             # MUTATE_AUX_BUFFER
-            num_changes = random.randint(1, 4)
-            data = struct.pack('I', num_changes)
-            instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, data, mutation_type='aux_buffer')
+            # 🔥 2026-01-22: Dictionary Injection support for Aux Buffers
+            if self.dictionary and random.random() < 0.4:
+                data = random.choice(self.dictionary)
+                # cmd remains same, C-side will replace content with this data
+                instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='dictionary_aux')
+            else:
+                num_changes = random.randint(1, 4)
+                data = struct.pack('I', num_changes)
+                instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, data, mutation_type='aux_buffer')
         
         elif strategy_type == 6:
             # REPLACE_BUFFER (small)
-            size = random.choice([4, 8, 16, 32])
-            data = bytes([random.randint(0, 255) for _ in range(size)])
-            instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer')
+            # 🔥 2026-01-22: Use dictionary tokens if available
+            if self.dictionary and random.random() < 0.6:
+                data = random.choice(self.dictionary)
+                instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='dictionary_token')
+            else:
+                size = random.choice([4, 8, 16, 32])
+                data = bytes([random.randint(0, 255) for _ in range(size)])
+                instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer')
         
         elif strategy_type == 7:
             # REPLACE_BUFFER (large)
-            size = random.choice([128, 512, 1024])
-            pattern = random.choice([b'A', b'\x00', b'\xFF'])
-            data = pattern * size
-            instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer_large')
+            # 🔥 2026-01-22: Inject multiple tokens or large patterns
+            if self.dictionary and random.random() < 0.3:
+                tokens = random.sample(self.dictionary, min(3, len(self.dictionary)))
+                data = b"".join(tokens)
+                instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='dictionary_multi')
+            else:
+                size = random.choice([128, 512, 1024])
+                pattern = random.choice([b'A', b'\x00', b'\xFF'])
+                data = pattern * size
+                instr = FuzzInstruction(index, FUZZ_CMD_REPLACE_BUFFER, 1, data, mutation_type='replace_buffer_large')
             
         elif strategy_type == 8:
             # BOUNDARY_VALUE
@@ -1241,6 +1350,7 @@ class SmartMutator:
                 
                 # Chance to use attack patterns instead of IOMutator content
                 content_to_use = m.buffer_content
+                # [NEW] Dictionary Injection
                 if random.random() < 0.3:
                      patterns = [
                         b'%s%s%s%s', b'A' * 64, b'../../../etc/passwd', 
@@ -1249,6 +1359,16 @@ class SmartMutator:
                         b'CRASH_ME\x00', b'CRASH_ME\n\x00'
                      ]
                      content_to_use = random.choice(patterns)
+                elif self.dictionary and random.random() < 0.5:
+                     try:
+                         token = random.choice(self.dictionary)
+                         if random.random() < 0.5:
+                             content_to_use = token
+                         else:
+                             content_to_use = b"A" * 8 + token + b"B" * 8
+                         alog(f"Dictionary Mutation: Injected '{token}'", "MUTATOR")
+                     except Exception:
+                         pass
 
                 buffer_instruction = FuzzInstruction(
                     syscall_index=m.syscall_index,

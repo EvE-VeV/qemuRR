@@ -1,0 +1,11 @@
+{
+    "name": "ls_baseline_test",
+    "arch": "x86_64",
+    "trace_file": "seeds/ls_test/ls.trace",
+    "fork_point": 10,
+    "protocol": "cli",
+    "binary_path": "/bin/ls",
+    "start_command": ["/bin/ls", "/tmp"],
+    "env": {},
+    "workers": 2
+}

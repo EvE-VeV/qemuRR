@@ -1,0 +1,22 @@
+{
+    "name": "Linksys_E1200",
+    "arch": "mipsel",
+    "trace_file": "tests/seeds/Linksys_E1200/linksys_e1200_seed.bin",
+    "dictionary": "config/dicts/totolink_http.dict",
+    "fork_point": 0,
+    "protocol": "http",
+    "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Linksys_E1200/rootfs",
+    "binary_path": "usr/sbin/httpd",
+    "ld_prefix": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/verified_targets/Linksys_E1200/rootfs",
+    "start_command": [
+        "usr/sbin/httpd",
+        "-p",
+        "8081"
+    ],
+    "env": {
+        "TERM": "xterm",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin"
+    },
+    "workers": 1,
+    "config_patches": []
+}

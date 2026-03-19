@@ -134,25 +134,46 @@ class FuzzSharedMemory:
         # Checksum
         checksum = FUZZ_MAGIC ^ self.sequence ^ num_variants ^ fork_point ^ depth
         
-        # Prepare header parts
-        # Header layout: magic(0), sequence(4), num_variants(8), checksum(12), iteration_id(16), reserved(20)
-        #                fork_point(24), depth(28), reserved(32)
+        # Calculate structure sizes and offsets
+        # FuzzInstruction packing format: IIIIII4096s (24 + 4096 = 4120 bytes)
+        inst_pack_format = 'IIIIII4096s'
+        inst_size = struct.calcsize(inst_pack_format)
         
+        # Header layout in C:
+        # magic(4), sequence(4), num_variants(4), checksum(4), iteration_id(4), reserved_1(4),
+        # fork_point(4), current_depth(4), reserved_2(4) = 36 bytes
+        header_base_size = 36 
+        
+        # FuzzVariant layout in C:
+        # instruction_count(4) + PADDING(4) + crash_pc(8) + instructions[16](16 * 4120) 
+        # = 16 + 65920 = 65936 bytes (8-byte aligned)
+        variant_struct_size = 16 + FUZZ_MAX_INSTRUCTIONS * inst_size
+        
+        # FuzzSharedMemory layout:
+        # Header(36) + instructions[16](65920) + PADDING(4) + variants[5](variants array)
+        # Note: PADDING(4) is needed to align 'variants' array on 8-byte boundary due to uint64_t in FuzzVariant
+        variant_array_offset = header_base_size + FUZZ_MAX_INSTRUCTIONS * inst_size + 4
+        
+        # Prepare header parts
         header_part1 = struct.pack('III', FUZZ_MAGIC, self.sequence, num_variants)
-        header_part2 = struct.pack('IIIIII', iteration_id, 0, fork_point, depth, 0, 0)
+        header_part2 = struct.pack('IIIII', iteration_id, 0, fork_point, depth, 0)
         
         # 1. First write variant data
-        base_offset = 36 + 32 * 280
-        variant_struct_size = 4 + 32 * 280
         for variant_idx, instructions in enumerate(mutation_variants):
-            variant_offset = base_offset + variant_idx * variant_struct_size
+            variant_offset = variant_array_offset + variant_idx * variant_struct_size
             self.mem.seek(variant_offset)
+            # Write instruction_count (4 bytes)
             self.mem.write(struct.pack('I', len(instructions)))
-            inst_offset = variant_offset + 4
+            
+            # Clear crash_pc (8 bytes, at offset 8)
+            self.mem.seek(variant_offset + 8)
+            self.mem.write(struct.pack('Q', 0))
+            
+            inst_sub_offset = variant_offset + 16 # Instructions start at offset 16
             for inst in instructions:
-                self.mem.seek(inst_offset)
+                self.mem.seek(inst_sub_offset)
                 self.mem.write(inst.pack())
-                inst_offset += 280
+                inst_sub_offset += inst_size
         
         # 2. Write non-checksum parts of Header
         self.mem.seek(0)
@@ -173,6 +194,56 @@ class FuzzSharedMemory:
         for i, variant in enumerate(mutation_variants):
             if variant:  # only print non-empty variants
                 print(f"  Variant {i}: {len(variant)} instructions")
+
+    def read_crash_pc(self, variant_idx: int) -> int:
+        """
+        Read the crash PC for a specific variant.
+        
+        Args:
+            variant_idx: Variant index
+            
+        Returns:
+            Program counter (int)
+        """
+        if not self.mem:
+            return 0
+            
+        # Offset calculation must match write_fork_request
+        inst_pack_format = 'IIIIII4096s'
+        inst_size = struct.calcsize(inst_pack_format)
+        header_base_size = 36
+        variant_array_offset = header_base_size + FUZZ_MAX_INSTRUCTIONS * inst_size + 4
+        variant_struct_size = 16 + FUZZ_MAX_INSTRUCTIONS * inst_size
+        
+        # PC is at offset 8 within FuzzVariant
+        pc_offset = variant_array_offset + (variant_idx * variant_struct_size) + 8
+        
+        try:
+            self.mem.seek(pc_offset)
+            pc_bytes = self.mem.read(8)
+            return struct.unpack('Q', pc_bytes)[0]
+        except Exception as e:
+            print(f"[SharedMemory] Failed to read crash PC: {e}")
+            return 0
+            
+    def clear_crash_pc(self, variant_idx: int):
+        """Clear crash PC for a variant"""
+        if not self.mem:
+            return
+            
+        inst_pack_format = 'IIIIII4096s'
+        inst_size = struct.calcsize(inst_pack_format)
+        header_base_size = 36
+        variant_array_offset = header_base_size + FUZZ_MAX_INSTRUCTIONS * inst_size + 4
+        variant_struct_size = 16 + FUZZ_MAX_INSTRUCTIONS * inst_size
+        
+        pc_offset = variant_array_offset + (variant_idx * variant_struct_size) + 8
+        
+        try:
+            self.mem.seek(pc_offset)
+            self.mem.write(struct.pack('Q', 0))
+        except:
+            pass
     
     def close(self):
         """Close shared memory"""
@@ -209,6 +280,41 @@ class FuzzSharedMemory:
         except Exception as exc:
             print(f"[Conductor] ⚠️  Failed to unlink shared memory '{target}': {exc}")
             
+    @staticmethod
+    def cleanup_orphaned_shm():
+        """
+        Scan /dev/shm for orphaned rr_fuzz_* and rr_coverage_* files.
+        Removes them if the associated PID is no longer running.
+        """
+        import glob
+        import re
+        
+        shm_patterns = ["/dev/shm/rr_fuzz_*", "/dev/shm/rr_coverage_*"]
+        removed_count = 0
+        
+        for pattern in shm_patterns:
+            for shm_path in glob.glob(pattern):
+                try:
+                    # Extract PID from filename (e.g., rr_fuzz_1234_...)
+                    match = re.search(r'_(?P<pid>\d+)(?:_|$)', os.path.basename(shm_path))
+                    if match:
+                        pid = int(match.group('pid'))
+                        
+                        # Check if PID is alive
+                        try:
+                            os.kill(pid, 0)
+                        except OSError:
+                            # PID is dead, safe to remove
+                            print(f"[Cleanup] Removing orphaned SHM: {shm_path} (PID {pid} is dead)")
+                            os.unlink(shm_path)
+                            removed_count += 1
+                except Exception as e:
+                    print(f"[Cleanup] Error checking {shm_path}: {e}")
+                    
+        if removed_count > 0:
+            print(f"[Cleanup] Successfully removed {removed_count} orphaned SHM objects.")
+        return removed_count
+
     def __del__(self):
         """Ensure resources are released on object destruction"""
         try:

@@ -1,4 +1,5 @@
 /GNUmakefile
+baseline_tools/
 /build/
 /.cache/
 /.vscode/

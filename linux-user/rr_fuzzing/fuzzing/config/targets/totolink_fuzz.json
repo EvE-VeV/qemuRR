@@ -1,0 +1,21 @@
+{
+    "name": "TOTOLINK_A720R",
+    "arch": "mips",
+    "trace_file": "seeds/TOTOLINK/boa_totolink_v2.trace",
+    "dictionary": "config/dicts/totolink_http.dict",
+    "fork_point": 180,
+    "protocol": "http",
+    "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
+    "binary_path": "bin/boa",
+    "ld_prefix": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
+    "start_command": [
+        "bin/boa"
+    ],
+    "env": {
+        "TERM": "xterm",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "RR_MOCK_WIRELESS": "1"
+    },
+    "workers": 4,
+    "config_patches": []
+}

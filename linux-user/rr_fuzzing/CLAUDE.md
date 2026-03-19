@@ -63,28 +63,29 @@ Layer 2: Fuzzing Engine
   └─ FuzzingCore, BaseMutator, SmartMutator, AFLEnhancedMutator (NOT enabled)
 
 Layer 1: RR Core (C)
-  └─ rr_main.c, rr_replay.c, rr_record.c, rr_syscall_tree.c (NOT exported)
+  └─ src/core/rr_main.c, src/engine/rr_replay.c, src/engine/rr_record.c, src/syscall/rr_syscall_tree.c
 ```
 
 ### Key Components
 
-**C-Side Core** (`core/`, `replay/`, `record/`):
-- `core/rr_main.c` - Framework initialization, syscall hooks
-- `replay/rr_replay.c` - Replay logic and mutation application
-- `record/rr_record.c` - Trace recording
-- `utils/rr_syscall_tree.c` - Syscall tree construction (⚠️ NOT exported to Python)
+**C-Side Core** (`src/core/`, `src/engine/`, `src/syscall/`, `src/runtime/`, `src/common/`):
+- `src/core/rr_main.c` - Framework initialization, syscall hooks
+- `src/engine/rr_replay.c` - Replay logic and mutation application
+- `src/engine/rr_record.c` - Trace recording
+- `src/syscall/rr_syscall_tree.c` - Syscall tree construction
 
 **Python Fuzzing Engine** (`fuzzing/conductor/`):
 - `fuzzing_core.py` - Main fuzzing loop coordinator
 - `mutator.py` - BaseMutator and SmartMutator
+- `trace_analyzer.py` - Trace parsing and analysis
 - `qemu_executor.py` - QEMU process management
 - `coverage.py` - Coverage tracking
 
 **Advanced Strategies** (`fuzzing/multiprocess/`):
 - `dynamic_fork_controller.py` - Depth-first exploration (✅ ENABLED)
-- `path_finder.py` - CFG analysis for targeted mutations
-- `energy_scheduler.py` - 5-factor seed prioritization (❌ NOT enabled)
-- `fuzz_master.py` - Multi-process coordinator (❌ NOT enabled)
+- `dual_level_path_finder.py` - CFG analysis for targeted mutations (✅ ENABLED in `FuzzingCore`)
+- `energy_scheduler.py` - 5-factor seed prioritization (✅ ENABLED via `SeedManagerAdapter` by default)
+- `fuzz_master.py` - Multi-process coordinator (✅ ENABLED via `fuzz_main.py --workers`)
 
 ---
 
@@ -94,13 +95,20 @@ Layer 1: RR Core (C)
 
 | Feature | Location | Lines | Status | Impact |
 |---------|----------|-------|--------|--------|
-| Aux Data Mutation Engine | `fuzzing/qemu_integration/rr_fuzz_aux_mutations.c` | 460 | ✅ **ENABLED** (2025-11-17) | +50% coverage, +80% bugs |
-| Syscall Tree JSON Export | `utils/rr_syscall_tree.c` | 500 | ✅ **ACTIVE** (exports to `/tmp/syscall_tree.json`) | +80% PathFinder accuracy |
+| Aux Data Mutation Engine | `src/engine/rr_fuzz_aux_mutations.c` | 460 | ✅ **ENABLED** (2025-11-17) | +50% coverage, +80% bugs |
+| Syscall Tree JSON Export | `src/syscall/rr_syscall_tree.c` | 500 | ✅ **ACTIVE** (exports to `/tmp/syscall_tree.json`) | +80% PathFinder accuracy |
 | AFL Enhanced Mutator | `fuzzing/conductor/afl_enhanced_mutator.py` | 300 | ✅ **AVAILABLE** (use `--afl-enhanced`) | +100% diversity |
 | Energy Scheduler | `fuzzing/multiprocess/energy_scheduler.py` | 400 | ⚠️ REQUIRES REFACTORING | +40% seed quality |
 | FuzzMaster Multi-Process | `fuzzing/multiprocess/fuzz_master.py` | 500 | ⚠️ REQUIRES INTEGRATION | +200% throughput |
 
 **See `analysis_reports/09_EXPLORATION_STRATEGIES_ANALYSIS.md` for full details.**
+
+## Critical Findings: Embedded Firmware Emulation (ASUS RT-AX56U)
+**Proven patterns for stabilizing stubborn embedded binaries:**
+1.  **Environment Sanitization**: Host `LD_LIBRARY_PATH` leaking allows incompatible host libs to crash guest binaries. *Fix*: Use `env -i` or manual `os.environ` clearing in Python harness.
+2.  **Binary Patching**: Patching hardcoded paths (e.g., `/etc/cert.pem` -> `/tmp/cert.pem`) is more robust than syscall hooking for file redirection when libc versions conflict.
+3.  **Freestanding Mocks**: When target uses ancient libc, compile mocks with `-nostdlib` to avoid dynamic linker version errors (`GLIBC_2.34 not found`).
+
 
 ---
 
@@ -372,33 +380,41 @@ DFS recursively explores deep execution paths that might trigger complex bugs, c
 
 ```
 qemu/linux-user/rr_fuzzing/
-├── core/                      # Layer 1: RR Core (C)
-│   ├── rr_main.c             ⭐ Framework entry point
-│   ├── rr_framework.h
-│   └── rr_constants.h
-├── replay/
-│   └── rr_replay.c           ⭐ Replay + mutation application
-├── record/
-│   └── rr_record.c
+├── src/core/                  # Subsystem 1: Core Framework
+│   ├── rr_main.c             ⭐⭐ Framework entry point
+├── src/engine/                # Subsystem 2: Execution Engine
+│   ├── rr_replay.c           ⭐⭐ Replay + mutation application
+│   ├── rr_record.c           ⭐ Record logic
+│   └── rr_fuzz_engine.c      ⭐ Fuzzing integration
+├── src/syscall/               # Subsystem 3: Syscall Mediator
+│   ├── rr_syscall_tree.c     ⭐⭐ Tree builder
+│   └── rr_syscallparser.c
+├── src/runtime/               # Subsystem 4: Runtime Support
+│   ├── rr_fork_server.c
+│   └── rr_ipc.c
+├── src/common/                # Subsystem 5: Common Utilities
+│   └── rr_mapping_manager.c
+├── include/                   # Centralized Headers
+│   └── rr_framework.h
 ├── fuzzing/
 │   ├── fuzz_main.py          ⭐⭐⭐ CLI entry point
-│   ├── conductor/            # Layer 2: Engine
+│   ├── fuzz_multiprocess.py  ⭐ Multi-process entry point
+│   ├── conductor/            # Layer 2: Core Engine (Python)
 │   │   ├── fuzzing_core.py   ⭐⭐⭐ Main loop
 │   │   ├── mutator.py        ⭐⭐ Mutation strategies
+│   │   ├── trace_analyzer.py ⭐⭐ Trace analysis
 │   │   └── qemu_executor.py
 │   ├── multiprocess/         # Layer 4: Advanced
 │   │   ├── dynamic_fork_controller.py  ⭐ DFS
-│   │   ├── path_finder.py    ⭐⭐ CFG analysis
+│   │   ├── dual_level_path_finder.py   ⭐⭐ CFG analysis (Dual Layer)
 │   │   ├── energy_scheduler.py  ❌ NOT enabled
-│   │   └── fuzz_master.py    ❌ NOT enabled
-│   └── qemu_integration/
-│       └── rr_fuzz_aux_mutations.c  ❌ NOT called
-├── utils/
-│   ├── rr_syscall_tree.c     ⭐⭐ Tree builder (NOT exported)
-│   └── rr_nested_fork.c
-└── analysis_reports/         # Documentation
-    ├── 09_EXPLORATION_STRATEGIES_ANALYSIS.md
-    └── ARCHITECTURE_INTEGRATION_GUIDE.md
+│   │   └── fuzz_master.py       ❌ NOT enabled
+│   ├── utils/                # Subsystem 6: Auxiliary Tools
+│   │   ├── log_analyzer.py   ⭐ Execution log analysis
+│   │   └── verify_checkpoint.py
+└── docs/                      # Documentation
+    ├── archive/               # Historical docs
+    └── analysis/              # Technical reports
 ```
 
 ---

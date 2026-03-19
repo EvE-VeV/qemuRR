@@ -1,0 +1,19 @@
+{
+    "name": "TOTOLINK_A720R",
+    "arch": "mips",
+    "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
+    "binary_path": "bin/boa",
+    "start_command": [
+        "bin/boa"
+    ],
+    "ld_prefix": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
+    "web_root": "web/",
+    "fork_point": 0,
+    "shared_memory_size": "2M",
+    "env": {
+        "TERM": "xterm",
+        "PATH": "/usr/bin:/usr/sbin:/bin:/sbin",
+        "RR_MOCK_WIRELESS": "1"
+    },
+    "config_patches": []
+}

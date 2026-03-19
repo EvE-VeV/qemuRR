@@ -118,6 +118,10 @@ class CoverageTracker:
         if not current_map or len(current_map) != COVERAGE_MAP_SIZE:
             return False
 
+        # ✅ FIX: Handle memoryview with unsupported format by converting to bytes
+        if isinstance(current_map, memoryview):
+            current_map = current_map.tobytes()
+
         with self._lock:
             if self.shared_coverage and self.total_executions % 100 == 0:
                 synced_edges = self.shared_coverage.sync_coverage()
@@ -205,6 +209,12 @@ class CoverageTracker:
             # Track edges per execution
             self.edges_per_execution.append(current_edge_count)
             
+            # 🔥 Performance: Cap history lists to prevent memory exhaustion in long runs
+            if len(self.edges_per_execution) > 10000:
+                self.edges_per_execution = self.edges_per_execution[-10000:]
+            if len(self.coverage_history) > 10000:
+                self.coverage_history = self.coverage_history[-10000:]
+            
             # Async Log summary every 50 executions (reduced frequency)
             if self.total_executions % 50 == 0 or new_coverage:
                 # edges_after = sum(1 for b in self.global_bitmap if b > 0) # Expensive! Use cached.
@@ -225,7 +235,8 @@ class CoverageTracker:
                 self._update_hotspots()
                 self._update_stability()
 
-        return new_coverage
+        # 返回新发现的边数，如果是已有点的HitCount位桶更新，则记为1个虚拟新发现
+        return new_edges if new_edges > 0 else (1 if new_coverage else 0)
     
     def _update_hotspots(self):
         """Identify hotspots (frequently hit edges) and rare edges"""

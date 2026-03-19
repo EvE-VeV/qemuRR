@@ -36,21 +36,38 @@ class StaticAnalyzer:
             return False
 
         try:
+            import fcntl
+            lock_file = "/tmp/static_analyzer.lock"
             print(f"[StaticAnalyzer] 🔍 Analyzing {self.binary_path} (Whole-Program)...")
-            # Load project with minimal overhead
-            self.project = angr.Project(self.binary_path, auto_load_libs=False)
             
-            # Build CFG (Fast mode is usually sufficient for our needs)
-            self.cfg = self.project.analyses.CFGFast()
+            with open(lock_file, 'w') as lf:
+                print(f"[StaticAnalyzer] 🔒 Waiting for global analyzer lock...")
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                
+                # Load project with minimal overhead
+                self.project = angr.Project(self.binary_path, auto_load_libs=False)
+                
+                # Build CFG (Fast mode is usually sufficient for our needs)
+                self.cfg = self.project.analyses.CFGFast()
+                
+                # Extract basic info
+                self._extract_branches()
+                self._map_bbs_to_functions()
+                
+                fcntl.flock(lf, fcntl.LOCK_UN)
             
-            # Extract basic info
-            self._extract_branches()
-            self._map_bbs_to_functions()
+            # 🔥 Performance: Clear large angr objects after data extraction
+            self.project = None
+            self.cfg = None
+            import gc
+            gc.collect()
             
             print(f"[StaticAnalyzer] ✅ Analysis complete. Found {len(self.branches)} potential branches.")
             return True
         except Exception as e:
             print(f"[StaticAnalyzer] ❌ Analysis failed: {e}")
+            self.project = None
+            self.cfg = None
             return False
 
     def _extract_branches(self):

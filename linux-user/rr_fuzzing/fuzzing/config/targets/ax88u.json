@@ -1,0 +1,23 @@
+{
+    "target_name": "ax88u_httpd",
+    "architecture": "arm",
+    "word_size": 32,
+    "qemu_binary": "build/qemu-arm",
+    "qemu_args": [
+        "-E",
+        "HTTPD_NO_DAEMONIZE=1",
+        "-E",
+        "LD_PRELOAD=/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Asus/RT-AX88U/asus_hook.so"
+    ],
+    "target_binary": "lib/ld-linux.so.3",
+    "target_args": [
+        "usr/sbin/httpd"
+    ],
+    "rootfs_path": "tests/images/Asus/RT-AX88U/sim_root",
+    "trace_file": "tests/images/Asus/RT-AX88U/traces/ax88u_init",
+    "env": {
+        "QEMU_LD_PREFIX": "tests/images/Asus/RT-AX88U/sim_root"
+    },
+    "dictionary": "fuzzing/config/dicts/http.dict",
+    "network_port": 8080
+}

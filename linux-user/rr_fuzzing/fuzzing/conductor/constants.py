@@ -24,13 +24,15 @@ FUZZ_CMD_OVERWRITE_AT_OFFSET = 11    # Overwrite at specific offset
 
 # ===== 共享内存常量 (必须与rr_constants.h匹配) =====
 FUZZ_MAGIC = 0x46555A5A             # "FUZZ" - 共享内存魔数
-FUZZ_MAX_INSTRUCTIONS = 32          # 最大指令队列长度
-FUZZ_MAX_VARIANTS = 10              # 最大变体数量 (对应FuzzSharedMemory.variants[10])
-FUZZ_INSTRUCTION_DATA = 256         # 每条指令的数据负载大小
-# Shared memory configuration - must match C-side rr_constants.h
-# Total size: Header(36B) + instructions[32](8960B) + variants[10](89640B) = 98636B
-# Aligned to 128KB for future-proofing and page alignment
-FUZZ_SHM_SIZE = 128 * 1024          
+FUZZ_MAX_INSTRUCTIONS = 16          # 🔥 Reduced for 4K payloads
+FUZZ_MAX_VARIANTS = 5               # 🔥 Reduced to keep SHM < 1MB
+FUZZ_INSTRUCTION_DATA = 4096         # 🔥 Expanded to 4K
+# Shared memory configuration - must match C-side include/rr_framework.h
+# New SHM structure size: 
+# Header(40B) + instructions[16]*(24+4096) + variants[5]*(4+16*(24+4096))
+# = 40 + 16*4120 + 5*(4+16*4120) = 40 + 65920 + 329620 = ~395KB
+# Set to 1MB for ample room and page alignment
+FUZZ_SHM_SIZE = 1024 * 1024          
 
 # Coverage feedback constants
 COVERAGE_MAP_SIZE = 64 * 1024       

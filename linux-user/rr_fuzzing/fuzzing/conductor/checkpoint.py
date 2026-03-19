@@ -66,6 +66,10 @@ class CheckpointManager:
             # 4. Save metadata (timestamp, iteration count)
             self._save_metadata(core_instance)
             
+            # 5. Save TracePool Manifest (Key for Phase 4)
+            if hasattr(core_instance, 'trace_pool') and core_instance.trace_pool:
+                core_instance.trace_pool.save_manifest()
+            
             elapsed = time.time() - start_time
             alog(f"✅ Checkpoint saved in {elapsed:.2f}s", "CHECKPOINT", "INFO")
             
@@ -109,6 +113,12 @@ class CheckpointManager:
             
             # 4. Load metadata
             metadata = self._load_metadata()
+            
+            # 5. Load TracePool Manifest (Key for Phase 4)
+            if hasattr(core_instance, 'trace_pool') and core_instance.trace_pool:
+                # Need trace_manager to link Trace objects
+                if hasattr(core_instance, 'trace_manager'):
+                    core_instance.trace_pool.load_manifest(core_instance.trace_manager)
             
             elapsed = time.time() - start_time
             alog(f"✅ Checkpoint loaded in {elapsed:.2f}s", "CHECKPOINT", "INFO")

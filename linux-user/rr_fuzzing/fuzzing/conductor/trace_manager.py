@@ -24,6 +24,7 @@ class TraceMetadata:
     energy: float = 1.0
     exec_count: int = 0
     new_coverage_count: int = 0
+    generation: int = 0
 
 # Trace Object representing a recorded execution.
 @dataclass

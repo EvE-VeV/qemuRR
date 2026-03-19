@@ -50,6 +50,9 @@ class WorkerConfig:
     enable_pathfinder: bool = True
     enable_persistence: bool = False
     target_args: str = ""        # ✅ Target program arguments
+    dictionary_file: Optional[str] = None # ✅ Dictionary file path
+    ld_prefix: Optional[str] = None       # ✅ QEMU LD Prefix
+    manual_fork_point: Optional[int] = None # ✅ Force specific fork point
 
 
 @dataclass
@@ -95,7 +98,10 @@ class FuzzMaster:
         recipe_file: Optional[str] = None,
         master_timeout: Optional[int] = None,
         enable_pathfinder: bool = True,
-        enable_persistence: bool = False
+        enable_persistence: bool = False,
+        dictionary_file: Optional[str] = None,
+        ld_prefix: Optional[str] = None,
+        manual_fork_point: Optional[int] = None
     ):
         """
         Initialize FuzzMaster
@@ -124,6 +130,9 @@ class FuzzMaster:
         self.master_timeout = master_timeout
         self.enable_pathfinder = enable_pathfinder
         self.enable_persistence = enable_persistence
+        self.dictionary_file = dictionary_file
+        self.ld_prefix = ld_prefix
+        self.manual_fork_point = manual_fork_point
         
         # Worker management
         self.workers: List[mp.Process] = []
@@ -206,7 +215,10 @@ class FuzzMaster:
             mutator_type=self.mutator_type,
             recipe_file=self.recipe_file,
             enable_pathfinder=self.enable_pathfinder,
-            enable_persistence=self.enable_persistence
+            enable_persistence=self.enable_persistence,
+            dictionary_file=self.dictionary_file,
+            ld_prefix=self.ld_prefix,
+            manual_fork_point=self.manual_fork_point
         )
     
     @staticmethod
@@ -246,7 +258,8 @@ class FuzzMaster:
             if config.mutator_type == "smart":
                 mutator = SmartMutator(
                     trace_file=config.initial_trace,
-                    recipe_file=config.recipe_file
+                    recipe_file=config.recipe_file,
+                    dictionary_file=config.dictionary_file
                 )
             else:
                 mutator = BaseMutator()
@@ -285,7 +298,11 @@ class FuzzMaster:
                 use_energy_scheduler=False,  # ✅ MP mode uses TraceManager instead of SeedManagerAdapter
                 target_args=config.target_args, # ✅ Pass target_args
                 initial_stats=initial_stats, # ✅ Pass restored stats
-                shared_coverage=shared_coverage  # ✅ Multi-process coverage sync
+                shared_coverage=shared_coverage,  # ✅ Multi-process coverage sync
+                sync_dir=str(config.sync_dir), # ✅ Enable seed loopback
+                worker_id=worker_id,            # ✅ Identifying worker
+                ld_prefix=config.ld_prefix,      # ✅ Pass LD Prefix
+                manual_fork_point=config.manual_fork_point # ✅ Force specific fork point
             )
             
             print(f"[Worker{worker_id}] FuzzingCore initialized")
@@ -484,7 +501,7 @@ class FuzzMaster:
         total_paths = sum(w.paths_found for w in stats_list)
         total_crashes = sum(w.crashes_found for w in stats_list)
         total_timeouts = sum(w.timeouts for w in stats_list)
-        avg_speed = sum(w.exec_speed for w in stats_list)
+        total_speed = sum(w.exec_speed for w in stats_list)
         
         # Read global coverage from shared memory (real-time)
         try:
@@ -504,7 +521,7 @@ class FuzzMaster:
         print(f"{'=' * 70}")
         print(f"Workers:       {self.num_workers} active")
         print(f"Total execs:   {total_execs}")
-        print(f"Exec speed:    {avg_speed:.1f} exec/s")
+        print(f"Exec speed:    {total_speed:.1f} exec/s")
         print(f"Elapsed:       {elapsed:.0f}s")
         print(f"")
         print(f"Corpus size:   {trace_count} traces")
@@ -670,6 +687,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RR-Fuzz Multi-Process Master")
     parser.add_argument("--qemu", required=True, help="Path to QEMU executable")
     parser.add_argument("--target", required=True, help="Path to target binary")
+    parser.add_argument("--target-args", help="Arguments for target binary")
     parser.add_argument("--trace", required=True, help="Path to initial seed trace")
     parser.add_argument("-n", "--workers", type=int, help="Number of workers (default: CPU count)")
     parser.add_argument("--sync-dir", default="sync_dir", help="Sync directory")
@@ -677,6 +695,10 @@ if __name__ == "__main__":
     parser.add_argument("--smart", action="store_true", help="Enable smart mutation")
     parser.add_argument("--recipe", help="Recipe file for smart mutation")
     parser.add_argument("--no-pathfinder", action="store_false", dest="pathfinder", help="Disable PathFinder")
+    parser.add_argument("--architecture", help="Target architecture (e.g., mipsel, arm)")
+    parser.add_argument("--dictionary", help="Path to dictionary file")
+    parser.add_argument("--ld-prefix", help="QEMU LD Prefix (RootFS)")
+    parser.add_argument("--fork-point", type=int, help="Manual fork point index")
     parser.set_defaults(pathfinder=True)
     
     args = parser.parse_args()
@@ -685,13 +707,17 @@ if __name__ == "__main__":
     master = FuzzMaster(
         qemu_path=args.qemu,
         target_binary=args.target,
+        target_args=args.target_args,
         initial_trace=args.trace,
         num_workers=args.workers,
         sync_dir=args.sync_dir,
         mutator_type="smart" if args.smart else "base",
         recipe_file=args.recipe,
         master_timeout=args.timeout,
-        enable_pathfinder=args.pathfinder
+        enable_pathfinder=args.pathfinder,
+        dictionary_file=args.dictionary,
+        ld_prefix=args.ld_prefix,
+        manual_fork_point=args.fork_point
     )
     
     master.run()

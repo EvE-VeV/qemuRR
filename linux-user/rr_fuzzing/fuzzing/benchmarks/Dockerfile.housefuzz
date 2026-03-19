@@ -1,0 +1,4 @@
+FROM kenshin123/housefuzz
+RUN apt-get update && apt-get install -y python3-pip ninja-build && pip3 install meson
+RUN cd /Housefuzz/housefuzz/qemu_mode/qemuafl && ./configure --target-list=arm-linux-user && make -j$(nproc)
+RUN cp /Housefuzz/housefuzz/qemu_mode/qemuafl/build/qemu-arm /Housefuzz/housefuzz/artifacts/fuzz_bins/bin/afl-qemu-trace
