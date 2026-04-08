@@ -446,8 +446,8 @@ void rr_fuzz_mutate_aux_data(CPUArchState *env, syscall_record_t *record,
             continue;
         }
         
-        // Locate the corresponding aux_data (convert arg_index to arg_mask)
-        uint8_t arg_mask = (1 << instr->arg_index);
+        /* Locate aux_data: records store arg_mask as raw arg_index (0,1,2...) not (1<<n) */
+        uint8_t arg_mask = instr->arg_index;
         rr_aux_data_t *aux = find_aux_data_by_arg_mask(record->aux_data, arg_mask);
         if (!aux) {
             RR_VERBOSE("FUZZ_AUX: No aux_data for arg[%u] (mask=0x%02x)", 

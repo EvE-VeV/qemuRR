@@ -171,10 +171,16 @@ class CrashDetector:
         crash_dir = Path(self.output_dir) / "crashes"
         crash_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate crash hash - include signal and mutation count to distinguish different triggers
-        # For even better deduplication, one could include basic block trace or stack trace
-        mutation_str = str([(m.syscall_index, m.cmd) for m in mutations])
-        crash_data = f"{result.status}_{result.qemu_exit_code}_{result.signal_number}_{mutation_str}"
+        # Generate crash hash based on PC + signal for deduplication.
+        # Including mutation content caused every variant to be a "unique" crash.
+        pc = getattr(result, 'pc', 0) or 0
+        # Normalize garbage PCs: SHM field is 8 bytes, but 32-bit targets only write
+        # the lower 4 bytes — upper 32 bits are uninitialized junk causing every
+        # crash to look unique. Any PC > 4GB is treated as invalid; collapse to 0
+        # (signal-only grouping), matching CrashAnalyzer._compute_crash_hash logic.
+        if pc > 0x100000000:
+            pc = 0
+        crash_data = f"{pc}_{result.signal_number}"
         crash_hash = hashlib.md5(crash_data.encode()).hexdigest()[:8]
         
         # Check if duplicate
@@ -235,7 +241,7 @@ class CrashDetector:
         
         self.crashes.append(crash_id)
         print(f"[CrashDetector] 💥 New crash saved: {crash_id}")
-        return True
+        return crash_id  # return crash_id so callers can reference the saved file
 
 
 class FuzzingCore:
@@ -271,7 +277,10 @@ class FuzzingCore:
         sync_dir: Optional[str] = None, # ✅ Sync directory for seed exchange
         worker_id: int = 0,      # ✅ Worker ID for identifying own seeds
         ld_prefix: Optional[str] = None, # ✅ QEMU LD Prefix (RootFS)
-        manual_fork_point: Optional[int] = None # ✅ Force specific fork point
+        manual_fork_point: Optional[int] = None, # ✅ Force specific fork point
+        enable_dfc: bool = True,         # ✅ Ablation: disable DynamicForkController
+        auth_boundary: int = 0,          # ✅ Post-auth boundary syscall index
+        extra_seed_traces: Optional[List[str]] = None,  # Additional traces for corpus rotation
     ):
         # """
         alog(f"[FuzzingCore] __init__ called. _HAS_PATH_FINDER={_HAS_PATH_FINDER}, PathFinder class={(PathFinder.__name__ if PathFinder else 'None')}", "CORE")
@@ -282,9 +291,25 @@ class FuzzingCore:
         self.logger = AsyncLogger(log_file=os.path.join(output_dir, "fuzzing.log"), console=True)
         self.logger.start()
         alog(f"Initializing... ld_prefix={ld_prefix}", "CORE", "INFO")
-        
+
         # ✅ FIX: Store ld_prefix for stable restarts
         self.ld_prefix = ld_prefix
+
+        # Auto-detect auth_boundary from the seed trace if caller didn't specify one.
+        # auth_boundary = index of the first accept() / socketcall(SYS_ACCEPT) in the trace.
+        # Pre-auth syscalls (ld.so loading, libc init, TCP bind/listen) are excluded from
+        # the mutable candidate pool — they cannot be influenced by a remote attacker.
+        if auth_boundary == 0 and initial_trace:
+            try:
+                import conductor.trace_analyzer as _ta_mod
+                _ta = _ta_mod.TraceAnalyzer(initial_trace, arch=self._derive_arch(qemu_path))
+                _detected = _ta.get_auth_boundary()
+                if _detected > 0:
+                    auth_boundary = _detected
+                    alog(f"auth_boundary auto-detected: {auth_boundary}", "CORE", "INFO")
+            except Exception as _e:
+                alog(f"auth_boundary auto-detection failed: {_e}", "CORE", "WARN")
+        self.auth_boundary = auth_boundary  # ✅ Persist for SmartMutator recreation
 
         # 🔥 2026-03-10: Clean up orphaned shared memory from previous crashed runs
         from .shared_memory import FuzzSharedMemory
@@ -308,7 +333,21 @@ class FuzzingCore:
             alog("📝 Using legacy TraceManager", "CORE", "INFO")
         alog("TraceManager initialized", "CORE", "DEBUG")
 
-        
+        # ── Multi-seed corpus rotation ──────────────────────────────────────
+        # Register any extra seed traces so the energy scheduler / trace_manager
+        # can select among them. The primary trace is already registered above.
+        self._all_seed_traces: List[str] = [initial_trace] + (extra_seed_traces or [])
+        self._seed_cursor: int = 0          # round-robin cursor for forced rotation
+        self._seed_rotate_every: int = 200  # rotate every N iterations if no new cov
+        if extra_seed_traces:
+            for extra_trace in extra_seed_traces:
+                try:
+                    if os.path.exists(extra_trace):
+                        self.trace_manager.add_trace(extra_trace)
+                        alog(f"Extra seed trace registered: {extra_trace}", "CORE", "INFO")
+                except Exception as _e:
+                    alog(f"Failed to register extra seed {extra_trace}: {_e}", "CORE", "WARN")
+
         # Layer 2: Core Components
         self.mutator = mutator if mutator else BaseMutator()
         # ✅ Multi-process: Pass shared_coverage to CoverageTracker
@@ -323,18 +362,7 @@ class FuzzingCore:
         else:
             alog("🚀 Using Fresh Execution Mode (One process per task)", "CORE", "INFO")
         # Derive target architecture from QEMU path
-        self.arch = 'auto'
-        qemu_name = os.path.basename(qemu_path).lower()
-        if 'aarch64' in qemu_name:
-            self.arch = 'arm64'
-        elif 'arm' in qemu_name:
-            self.arch = 'arm'
-        elif 'mips' in qemu_name:
-            self.arch = 'mips'
-        elif 'x86_64' in qemu_name:
-            self.arch = 'x86_64'
-        elif 'i386' in qemu_name:
-            self.arch = 'i386'
+        self.arch = FuzzingCore._derive_arch(qemu_path)
         
         self.execution_engine = QEMUExecutor(
             qemu_path, 
@@ -413,7 +441,7 @@ class FuzzingCore:
         self.min_cfg_analysis_interval = 5.0 # Minimum seconds between analyses even if new coverage
         
         self.trace_analyzer_cache = {} # {trace_file: TraceAnalyzer}
-        self.max_trace_cache_size = 30 # 🔥 2026-03-10: Reduced from 100 to 30 to support 15 concurrent campaigns
+        self.max_trace_cache_size = 5  # 🔥 2026-03-19: Reduced from 30 to 5; each TraceAnalyzer can hold 200MB+
     
         self.last_cfg_analysis_time = time.time()
         self.last_cfg_analysis_iter = 0
@@ -464,7 +492,7 @@ class FuzzingCore:
         self.realtime_viz_thread = None  # For reading visualizer output
         
         self.dynamic_fork_controller = None
-        if _HAS_DYNAMIC_FORK and DynamicForkController is not None:
+        if enable_dfc and _HAS_DYNAMIC_FORK and DynamicForkController is not None:
             try:
                 # Pre-load analyzer for initial trace to share among components
                 initial_analyzer = self._get_analyzer(initial_trace)
@@ -474,9 +502,10 @@ class FuzzingCore:
                      self.mutator.analyzer = initial_analyzer
                 
                 # ✅ Layer 6: Evolutionary Promotion Engine (Must be init before DFC)
-                self.evolution_engine = EvolutionEngine(output_dir)
-                self.target_profile: Optional[TargetProfile] = None 
-                self._init_re_recorder(output_dir)
+                if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
+                    self.evolution_engine = EvolutionEngine(output_dir)
+                    self.target_profile = None
+                    self._init_re_recorder(output_dir)
 
                 self.dynamic_fork_controller = DynamicForkController(
                     executor=self.execution_engine,
@@ -488,24 +517,36 @@ class FuzzingCore:
                     fuzzing_stats=self.stats,
                     mutation_graph=self.mutation_graph,
                     crash_detector=self.crash_detector,
-                    crash_analyzer=self.layer5_crash_analyzer, # ✅ Pass Layer 5 Analyzer
+                    crash_analyzer=self.layer5_crash_analyzer,
                     analyzer=initial_analyzer,
                     evolution_engine=self.evolution_engine,
                     manual_fork_point=manual_fork_point,
-                    arch=self.arch  # ✅ Pass architecture
+                    auth_boundary=self.auth_boundary,  # ✅ FIX: DFC knows auth boundary
+                    arch=self.arch
                 )
 
                 if manual_fork_point is not None:
                     alog(f"🎯 Manual Fork Point OVERRIDE: {manual_fork_point}", "CORE", "INFO")
                     self.dynamic_fork_controller.manual_fork_point = manual_fork_point
+                self.dynamic_fork_controller.triage_callback = self._triage_crash_online
                 alog(f"DynamicForkController enabled (Depth-First mode)", "CORE", "INFO")
             except Exception as e:
                 alog(f"⚠️ DynamicForkController initialization failed: {e}", "CORE", "WARN")
                 import traceback
                 traceback.print_exc()
                 self.dynamic_fork_controller = None
+        elif not enable_dfc:
+            alog(f"[Ablation] DynamicForkController DISABLED (--disable-dfc)", "CORE", "INFO")
+            if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
+                self.evolution_engine = EvolutionEngine(output_dir)
+                self.target_profile = None
+                self._init_re_recorder(output_dir)
         else:
             alog(f"⚠️ DynamicForkController unavailable", "CORE", "WARN")
+            if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
+                self.evolution_engine = EvolutionEngine(output_dir)
+                self.target_profile = None
+                self._init_re_recorder(output_dir)
 
         # ✅ Initialize Watchdog (Phase 1 Fix: Tighten timeout for performance)
         self.watchdog = FuzzingWatchdog(
@@ -562,17 +603,27 @@ class FuzzingCore:
 
             # 2. Syscall Tree Loading (Phase 9: Closing Analysis Loop)
             tree_file = None
-            # Check common locations based on trace name or default C outputs
+            # Check common locations — prefer JSON (canonical C export) over HTML
             potential_trees = [
+                str(self.initial_trace) + ".tree.json",
                 str(self.initial_trace) + ".tree.html",
+                str(Path(self.initial_trace).with_suffix('')) + ".tree.json",
                 str(Path(self.initial_trace).with_suffix('')) + ".tree.html",
-                "/tmp/syscall_tree.html",  # C default bundle
-                f"/tmp/syscall_tree_{os.getpid()}.html" # PID-specific C output
+                "/tmp/syscall_tree.json",
+                "/tmp/syscall_tree.html",
+                f"/tmp/syscall_tree_{os.getpid()}.json",
+                f"/tmp/syscall_tree_{os.getpid()}.html",
             ]
             for pt in potential_trees:
                 if os.path.exists(pt):
                     tree_file = pt
                     break
+            # Glob fallback: pick most recent tree from a previous run
+            if tree_file is None:
+                import glob as _glob
+                json_files = _glob.glob("/tmp/syscall_tree_*.json")
+                if json_files:
+                    tree_file = max(json_files, key=os.path.getctime)
             
             if tree_file:
                 alog(f"🌳 Found Syscall Tree: {tree_file}, performing precise mapping...", "CORE", "INFO")
@@ -743,6 +794,18 @@ class FuzzingCore:
         random_points = sorted(random.sample(range(max(1, limit)), min(count, limit)))
         return random_points
 
+    @staticmethod
+    def _derive_arch(qemu_path: str) -> str:
+        """Derive architecture string from QEMU binary name."""
+        name = os.path.basename(qemu_path).lower()
+        if 'aarch64' in name:   return 'arm64'
+        if 'arm' in name:       return 'arm'
+        if 'mipsel' in name:    return 'mips'   # little-endian MIPS → use mips map
+        if 'mips' in name:      return 'mips'
+        if 'x86_64' in name:    return 'x86_64'
+        if 'i386' in name:      return 'i386'
+        return 'auto'
+
     def _get_analyzer(self, trace_file: str):
         """Get or create TraceAnalyzer for a trace file (per-process cache)"""
         if trace_file in self.trace_analyzer_cache:
@@ -819,6 +882,96 @@ class FuzzingCore:
         alog(f"Last path:   {time_since_last:.1f}s ago", "STATS", "INFO")
         alog(f"{'━' * 60}", "STATS", "INFO")
     
+    def _triage_crash_online(self, trace, mutations: list, result, crash_id: str = '') -> str:
+        """
+        Immediately re-run the crash with two mutation subsets to determine exploitability.
+
+        Variants:
+          net_only  — only mutations on network socket fds (attacker-controlled data)
+          file_only — only mutations on file fds (not attacker-controlled)
+
+        Verdict:
+          NETWORK-EXPLOITABLE  — net_only crashes → real vulnerability
+          FILE-FD-ONLY         — file_only crashes → config/NVRAM dependency, not remote
+          COMBINED-STATE       — only all_muts crashes → fuzzer artifact, false positive
+          NOT-REPRODUCED       — nothing crashes (flaky or state-sensitive)
+
+        The verdict is appended to the crash JSON so verify_crashes.py need not be
+        re-run later.
+        """
+        if not mutations:
+            return 'UNKNOWN'
+
+        # Online triage blocks the main fuzzing loop and causes watchdog stalls (46s timeout).
+        # Crash is already saved to disk; use batch_triage.py for offline analysis instead.
+        return 'DEFERRED-OFFLINE'
+
+        network_fd_map = getattr(self.mutator, 'syscall_network_fd_map', {})
+        net_instrs  = [m for m in mutations if network_fd_map.get(getattr(m, 'syscall_index', -1), False)]
+        file_instrs = [m for m in mutations if not network_fd_map.get(getattr(m, 'syscall_index', -1), False)]
+
+        trace_file = trace.file_path if hasattr(trace, 'file_path') else str(trace)
+
+        def _run(instrs, label):
+            if not instrs:
+                return False
+            try:
+                r = self.execution_engine.execute(trace_file, instrs)
+                return getattr(r, 'crashed', False)
+            except Exception as e:
+                alog(f"_triage_crash_online({label}) error: {e}", "CORE", "WARN")
+                return False
+
+        crashed_net  = _run(net_instrs,  'net_only')
+        crashed_file = _run(file_instrs, 'file_only')
+
+        if crashed_net:
+            verdict = 'NETWORK-EXPLOITABLE'
+        elif crashed_file:
+            verdict = 'FILE-FD-ONLY'
+        elif result.crashed:
+            verdict = 'COMBINED-STATE'
+        else:
+            verdict = 'NOT-REPRODUCED'
+
+        print(f"[FuzzingCore] 🔍 Crash triage: net_only={crashed_net} file_only={crashed_file} → {verdict}")
+
+        # Patch verdict into the crash .meta file on disk
+        try:
+            import glob, json
+            crash_dir = os.path.join(self.output_dir, "crashes")
+            # Prefer exact match by crash_id; fallback to most recently modified .meta
+            if crash_id:
+                files = glob.glob(os.path.join(crash_dir, f"{crash_id}.meta"))
+            else:
+                files = []
+            if not files:
+                all_metas = sorted(
+                    glob.glob(os.path.join(crash_dir, "crash_w*.meta")),
+                    key=os.path.getmtime, reverse=True
+                )
+                files = all_metas[:1]
+            for f in files:
+                try:
+                    d = json.loads(open(f).read())
+                    d['triage'] = {
+                        'verdict': verdict,
+                        'crashed_net_only': crashed_net,
+                        'crashed_file_only': crashed_file,
+                        'net_syscall_indices': [getattr(m, 'syscall_index', -1) for m in net_instrs],
+                        'file_syscall_indices': [getattr(m, 'syscall_index', -1) for m in file_instrs],
+                    }
+                    tmp = f + '.tmp'
+                    with open(tmp, 'w') as fh:
+                        json.dump(d, fh, indent=2)
+                    os.replace(tmp, f)
+                except Exception:
+                    pass
+        except Exception as e:
+            alog(f"_triage_crash_online patch-meta failed: {e}", "CORE", "WARN")
+
+        return verdict
+
     def _perform_cfg_analysis(self, trace: Trace, has_new_coverage: bool, trigger_reason: str, iteration_id: int):
         """Performs unified CFG/PathFinder analysis"""
         if not self.path_finder:
@@ -863,8 +1016,17 @@ class FuzzingCore:
             import os
             from pathlib import Path
             
-            # Search order: 1. Output Dir (Latest), 2. /tmp (Legacy/Default)
+            # Request a fresh tree dump from the live fork server parent before searching.
+            # This is the only way to get an up-to-date tree during a long fuzzing session
+            # (the C-side only exports at process exit otherwise).
+            if hasattr(self, 'execution_engine') and self.execution_engine._qemu_ready:
+                fresh_path = self.execution_engine.request_tree_export()
+                if fresh_path:
+                    alog(f"[FuzzingCore] Requested live tree export → {fresh_path}", "CORE")
+
+            # Search order: 1. Per-process live export (freshest), 2. Output Dir, 3. /tmp legacy
             search_paths = [
+                "/tmp/syscall_tree_*.json",   # per-process live exports from 'T' command
                 os.path.join(self.output_dir, "latest_syscall_tree.html"),
                 "/tmp/syscall_tree_*.html",
                 "/tmp/syscall_tree.json"
@@ -1032,10 +1194,12 @@ class FuzzingCore:
                     trace_file=trace.file_path,
                     target_binary=self.target_binary,
                     path_finder=self.path_finder,
-                    analyzer=analyzer
+                    analyzer=analyzer,
+                    auth_boundary=self.auth_boundary  # ✅ FIX: preserve auth_boundary across trace switches
                 )
                 if self.dynamic_fork_controller:
                     self.dynamic_fork_controller.analyzer = analyzer
+                    self.dynamic_fork_controller.mutator = self.mutator  # ✅ FIX: keep DFC mutator in sync
         # Step 2: Depth-First Exploration - Intelligent Fork Point Selection (Dynamic Fork Integration)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         
@@ -1161,7 +1325,7 @@ class FuzzingCore:
                     continue
 
                 # ✅ FIX: Map result back to its corresponding mutation
-                mutations = mutations_list[result_idx] if result_idx < len(mutations_list) else None
+                mutations = mutations_list[result_idx] if result_idx < len(mutations_list) else []
                 node_id = node_ids[result_idx] if result_idx < len(node_ids) else None
 
                 self.stats.total_execs += 1
@@ -1243,9 +1407,50 @@ class FuzzingCore:
                     exec_time=getattr(result, 'exec_time', 0.0)
                 )
                 
-                # ❌ REMOVED: Duplicate crash detection (already handled in step 6 around line 917)
-                # Original code was redundant and caused double-counting
-        
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # Step 6: Crash Detection and Saving
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                if result.crashed:
+                    saved_id = self.crash_detector.save_crash(result, trace, mutations)
+                    if saved_id:
+                        self.stats.crashes_found += 1
+                        crashes_found_count += 1
+                        print(f"[FuzzingCore] 💥 NEW UNIQUE CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
+                        self._triage_crash_online(trace, mutations, result, crash_id=saved_id)
+                    else:
+                        print(f"[FuzzingCore] 💥 Duplicate crash ignored (Stats consistency)")
+
+                    if self.layer5_crash_analyzer:
+                        qemu_status = {
+                            'signal': result.signal_number,
+                            'exit_code': result.qemu_exit_code,
+                            'pc': getattr(result, 'pc', 0),
+                            'fault_address': getattr(result, 'fault_address', None),
+                            'backtrace': getattr(result, 'backtrace', [])
+                        }
+                        m_inst = mutations
+                        if isinstance(m_inst, list) and len(m_inst) > 0:
+                            sc_idx = getattr(m_inst[0], 'syscall_index', -1)
+                            m_str_list = [str(m) for m in m_inst]
+                        else:
+                            sc_idx = getattr(m_inst, 'syscall_index', -1) if m_inst else -1
+                            m_str_list = [str(m_inst)] if m_inst else []
+                        mutation_recipe = {'syscall_index': sc_idx, 'mutations': m_str_list}
+                        try:
+                            crash_info = self.layer5_crash_analyzer.analyze_crash(
+                                qemu_status=qemu_status,
+                                mutation_recipe=mutation_recipe,
+                                iteration=self.stats.total_execs
+                            )
+                            self.layer5_crash_analyzer.save_crash(crash_info)
+                            if self.trace_pool:
+                                self.trace_pool.save_manifest()
+                        except Exception as e:
+                            alog(f"⚠️ Layer5 Analysis failed (Core): {e}", "CORE", "ERROR")
+
+                if result.timeout:
+                    self.stats.timeouts += 1
+
         # ═════════════════════════════════════════════════════════════════
         # CFG-guided Fuzzing (Critical Fix!)
         # 🔥 Fix: Remove has_new_coverage dependency, allow proactive CFG analysis
@@ -1369,61 +1574,6 @@ class FuzzingCore:
                         new_coverage=0
                     )
         
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # Step 6: Crash Detection and Saving
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                if result.crashed:
-                    # ✅ Corrected counting logic: only increment if unique
-                    is_unique = self.crash_detector.save_crash(result, trace, mutations)
-                    
-                    if is_unique:
-                        self.stats.crashes_found += 1
-                        crashes_found_count += 1
-                        print(f"[FuzzingCore] 💥 NEW UNIQUE CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
-                    else:
-                        print(f"[FuzzingCore] 💥 Duplicate crash ignored (Stats consistency)")
-
-                    # ✅ Always notify Layer 5
-                    if self.layer5_crash_analyzer:
-                        qemu_status = {
-                            'signal': result.signal_number,
-                            'exit_code': result.qemu_exit_code,
-                            'pc': getattr(result, 'pc', 0),
-                            'fault_address': getattr(result, 'fault_address', None),
-                            'backtrace': getattr(result, 'backtrace', [])
-                        }
-                        
-                        m_inst = mutations
-                        if isinstance(m_inst, list) and len(m_inst) > 0:
-                            sc_idx = getattr(m_inst[0], 'syscall_index', -1)
-                            m_str_list = [str(m) for m in m_inst]
-                        else:
-                            sc_idx = getattr(m_inst, 'syscall_index', -1) if m_inst else -1
-                            m_str_list = [str(m_inst)] if m_inst else []
-
-                        mutation_recipe = {
-                            'syscall_index': sc_idx,
-                            'mutations': m_str_list
-                        }
-                        
-                        try:
-                            crash_info = self.layer5_crash_analyzer.analyze_crash(
-                                qemu_status=qemu_status,
-                                mutation_recipe=mutation_recipe,
-                                iteration=self.stats.total_execs
-                            )
-                            # ✅ deduplicate across processes using the shared DB
-                            self.layer5_crash_analyzer.save_crash(crash_info)
-                            # ✅ Sync manifest for realtime observability on crash
-                            if self.trace_pool:
-                                self.trace_pool.save_manifest()
-                        except Exception as e:
-                            alog(f"⚠️ Layer5 Analysis failed (Core): {e}", "CORE", "ERROR")
-
-                # Handle timeouts
-                if result.timeout:
-                    self.stats.timeouts += 1
-
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 7: Statistics Update and Display
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1769,6 +1919,35 @@ class FuzzingCore:
                 # ✅ Task #2: Promotion - Periodically attempt promotion
                 if iteration > 0 and iteration % 100 == 0:
                     self._perform_evolution_step()
+
+                # 🧹 Periodic SHM cleanup — sweep leaked /dev/shm/rr_fuzz_* files
+                if iteration > 0 and iteration % 10 == 0:
+                    from .shared_memory import FuzzSharedMemory
+                    FuzzSharedMemory.cleanup_orphaned_shm()
+
+                # 🧹 Periodic orphan QEMU cleanup — kill any stray qemu child processes
+                if iteration > 0 and iteration % 50 == 0:
+                    import subprocess, os
+                    my_pid = os.getpid()
+                    try:
+                        _pgrep = subprocess.run(
+                            ['pgrep', '-f', 'qemu-mips|qemu-arm|qemu-mipsel'],
+                            capture_output=True, text=True
+                        )
+                        qemu_pids = [int(p) for p in _pgrep.stdout.split() if p.strip()]
+                        killed = 0
+                        for qpid in qemu_pids:
+                            try:
+                                ppid = int(open(f'/proc/{qpid}/status').read().split('PPid:')[1].split()[0])
+                                if ppid == 1:  # orphan adopted by init
+                                    os.kill(qpid, 9)
+                                    killed += 1
+                            except Exception:
+                                pass
+                        if killed:
+                            alog(f"🧹 Killed {killed} orphaned QEMU processes", "CORE", "WARN")
+                    except Exception:
+                        pass
                 
                 if result and result.is_failure():
                     alog(f"⚠️  Iteration {iteration} failed: {result}", "CORE", "WARN")

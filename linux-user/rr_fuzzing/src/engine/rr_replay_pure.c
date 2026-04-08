@@ -115,11 +115,22 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
 #ifdef TARGET_NR_writev
         case TARGET_NR_writev:
 #endif
-#if defined(TARGET_NR_write) || defined(TARGET_NR_writev)
+#ifdef TARGET_NR_send
+        case TARGET_NR_send:
+#endif
+#ifdef TARGET_NR_sendto
+        case TARGET_NR_sendto:
+#endif
+#ifdef TARGET_NR_sendmsg
+        case TARGET_NR_sendmsg:
+#endif
+#if defined(TARGET_NR_write) || defined(TARGET_NR_writev) || defined(TARGET_NR_send) || defined(TARGET_NR_sendto) || defined(TARGET_NR_sendmsg)
         {
-            /* Output syscalls not supported in Pure Replay; must execute to maintain I/O state */
-            RR_VERBOSE("PURE_REPLAY: Output syscall write/writev, falling back to real execution");
-            return -1; /* Let hybrid mode execute real syscall */
+            /* Pure replay: return recorded retval, skip real syscall.
+             * Real execution would EBADF (accept() was pure-replayed → no real kernel fd),
+             * polluting coverage with error-handling paths absent from production traffic. */
+            RR_VERBOSE("PURE_REPLAY: write/send syscall %d returning recorded retval=%ld", num, record->retval);
+            return record->retval;
         }
 #endif
 
@@ -190,14 +201,7 @@ abi_long rr_replay_syscall_pure(CPUArchState *env, int num, abi_long *args,
         }
 #endif
 
-#ifdef TARGET_NR_send
-        case TARGET_NR_send:
-        case TARGET_NR_sendto:
-        case TARGET_NR_sendmsg:
-            /* Output syscalls not supported in Pure Replay; must execute */
-            RR_VERBOSE("PURE_REPLAY: Output syscall send/sendto/sendmsg, falling back to real execution");
-            return -1;
-#endif
+/* send/sendto/sendmsg handled in write/send block above */
 
 #ifdef TARGET_NR_ioctl
         case TARGET_NR_ioctl: {

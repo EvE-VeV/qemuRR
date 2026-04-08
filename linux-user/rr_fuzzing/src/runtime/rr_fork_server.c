@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "rr_framework.h"
+#include "rr_syscall_tree.h"    /* rr_tree_export_json() for 'T' command */
 #include "rr_constants.h"
 #include "rr_coverage.h"
 #include "rr_syscall_info.h"  /* Syscall classification */
@@ -93,6 +94,122 @@ static void rr_child_crash_handler(int sig)
     // Reset to default and re-raise to ensure core dump if enabled
     signal(sig, SIG_DFL);
     raise(sig);
+}
+
+static void rr_child_close_ipc_fds(void)
+{
+    if (g_rr_framework->cmd_pipe_fd >= 0) {
+        close(g_rr_framework->cmd_pipe_fd);
+        g_rr_framework->cmd_pipe_fd = -1;
+    }
+    if (g_rr_framework->status_pipe_fd >= 0) {
+        close(g_rr_framework->status_pipe_fd);
+        g_rr_framework->status_pipe_fd = -1;
+    }
+}
+
+static void rr_child_rewind_stdin(void)
+{
+    if (lseek(STDIN_FILENO, 0, SEEK_SET) == (off_t)-1) {
+        if (errno != ESPIPE) {
+            fprintf(stderr, "[DEBUG-CHILD] Child: lseek(stdin) failed: %s\n", strerror(errno));
+        }
+    } else {
+        fprintf(stderr, "[DEBUG-CHILD] Child: stdin rewound to 0\n");
+    }
+}
+
+static int rr_child_start_replay_from_path(const char *trace_path, bool make_absolute,
+                                           int variant_idx, const char *context)
+{
+    char resolved_path[1024];
+    const char *path_to_open = trace_path;
+
+    if (g_trace_file) {
+        fclose(g_trace_file);
+        g_trace_file = NULL;
+    }
+
+    if (!trace_path) {
+        RR_ERROR("%s: No trace path available", context);
+        return -1;
+    }
+
+    if (make_absolute && trace_path[0] != '/') {
+        if (!getcwd(resolved_path, sizeof(resolved_path))) {
+            RR_ERROR("%s: Failed to get current working directory", context);
+            return -1;
+        }
+        size_t len = strlen(resolved_path);
+        snprintf(resolved_path + len, sizeof(resolved_path) - len, "/%s", trace_path);
+        path_to_open = resolved_path;
+    }
+
+    if (rr_start_replay(path_to_open) < 0) {
+        RR_ERROR("%s: Failed to initialize replay system with path: %s", context, path_to_open);
+        return -1;
+    }
+
+    RR_INFO("%s %d: Reopened trace file independently", context, variant_idx);
+    return 0;
+}
+
+static int rr_child_reload_variant_instructions(int variant_idx)
+{
+    if (!g_rr_framework->shared_memory) {
+        RR_WARN("Child %d: No shared memory available for instruction loading", variant_idx);
+        return -1;
+    }
+
+    RR_INFO("Child %d: Reloading fuzz instructions from shared memory", variant_idx);
+    if (rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory, variant_idx) < 0) {
+        RR_ERROR("Child %d: Failed to reload fuzz instructions!", variant_idx);
+        return -1;
+    }
+
+    RR_INFO("Child %d: Reloaded %zu fuzz instructions", variant_idx, g_instruction_count);
+    return 0;
+}
+
+static void rr_child_install_crash_handlers(FuzzVariant *variant)
+{
+    g_child_variant_ptr = variant;
+    if (g_child_variant_ptr) {
+        g_child_variant_ptr->crash_pc = 0;
+    }
+
+    signal(SIGSEGV, rr_child_crash_handler);
+    signal(SIGBUS, rr_child_crash_handler);
+    signal(SIGILL, rr_child_crash_handler);
+    signal(SIGABRT, rr_child_crash_handler);
+    signal(SIGFPE, rr_child_crash_handler);
+}
+
+static void rr_classify_wait_status(int status, int *result_status,
+                                    int *exit_code, int *signal_number)
+{
+    *result_status = STATUS_NORMAL_EXIT;
+    *exit_code = 0;
+    *signal_number = 0;
+
+    if (WIFEXITED(status)) {
+        *exit_code = WEXITSTATUS(status);
+        if (*exit_code == 134 || *exit_code == 139 || *exit_code == 135 || *exit_code == 132) {
+            *result_status = STATUS_CRASH;
+        }
+        return;
+    }
+
+    if (WIFSIGNALED(status)) {
+        *signal_number = WTERMSIG(status);
+        if (*signal_number == SIGSEGV || *signal_number == SIGABRT ||
+            *signal_number == SIGBUS || *signal_number == SIGILL ||
+            *signal_number == SIGFPE) {
+            *result_status = STATUS_CRASH;
+        } else {
+            *result_status = STATUS_OTHER_SIGNAL;
+        }
+    }
 }
 
 /**
@@ -463,35 +580,52 @@ int rr_fork_server_loop(void)
                         if (pid == 0) {
                             /* ═══ Child Process ═══ */
                             
-                            /* 🔥 CRITICAL FIX: Rewind stdin to ensure child reads input from start */
-                            if (lseek(STDIN_FILENO, 0, SEEK_SET) == (off_t)-1) {
-                                // If stdin is a pipe, lseek might fail with ESPIPE, which is normal for pipe redirection
-                                if (errno != ESPIPE) {
-                                    fprintf(stderr, "[DEBUG-CHILD] Child: lseek(stdin) failed: %s\n", strerror(errno));
-                                }
-                            } else {
-                                fprintf(stderr, "[DEBUG-CHILD] Child: stdin rewound to 0\n");
-                            }
-
-                            /* Close IPC FDs */
-                            if (g_rr_framework->cmd_pipe_fd >= 0) {
-                                close(g_rr_framework->cmd_pipe_fd);
-                                g_rr_framework->cmd_pipe_fd = -1;
-                            }
-                            if (g_rr_framework->status_pipe_fd >= 0) {
-                                close(g_rr_framework->status_pipe_fd);
-                                g_rr_framework->status_pipe_fd = -1;
-                            }
+                            rr_child_rewind_stdin();
+                            rr_child_close_ipc_fds();
                             
                             /* Reset trace state */
                             RR_INFO("Child variant %d: Re-opening trace", variant_idx);
-                            if (g_trace_file) { fclose(g_trace_file); g_trace_file = NULL; }
-                            rr_start_replay(g_rr_trace_path);
-                            g_rr_framework->replay_index = 0;
-                            
+                            rr_child_start_replay_from_path(g_rr_trace_path, false, variant_idx, "Child");
+
                             if (g_current_record) {
                                 rr_record_dispose(g_current_record);
                                 g_current_record = NULL;
+                            }
+
+                            /* Fast-forward trace file to fork_point (same as 'C' command fix).
+                             * After reopening the trace the file pointer is at the beginning,
+                             * but the CPU state is already at fork_point.  We must advance the
+                             * file pointer so that the first syscall the child executes reads
+                             * the correct record (index >= fork_point), not record 0. */
+                            {
+                                uint32_t b_fork_point = shm->fork_point;
+                                if (b_fork_point > 0) {
+                                    RR_INFO("Child variant %d: Fast-forwarding trace to fork_point %u",
+                                            variant_idx, b_fork_point);
+                                    syscall_record_t *tmp_rec = NULL;
+                                    int seek_count = 0;
+                                    while (1) {
+                                        tmp_rec = read_next_record();
+                                        if (!tmp_rec) {
+                                            RR_ERROR("Child %d: EOF before reaching fork_point %u (skipped %d)",
+                                                     variant_idx, b_fork_point, seek_count);
+                                            break;
+                                        }
+                                        if (tmp_rec->index >= b_fork_point) {
+                                            g_current_record = tmp_rec;
+                                            RR_INFO("Child %d: Kept record index=%u (>= fork_point=%u)",
+                                                    variant_idx, tmp_rec->index, b_fork_point);
+                                            break;
+                                        }
+                                        rr_record_dispose(tmp_rec);
+                                        seek_count++;
+                                    }
+                                    RR_INFO("  -> Discarded %d records, next index >= %u",
+                                            seek_count, b_fork_point);
+                                    g_rr_framework->replay_index = b_fork_point;
+                                } else {
+                                    g_rr_framework->replay_index = 0;
+                                }
                             }
                             
                             /* FIX: Keep dynamic trace enabled in child process */
@@ -527,8 +661,32 @@ int rr_fork_server_loop(void)
                             }
 
                             RR_INFO("Child variant %d ready (PID=%d)", variant_idx, getpid());
+
+                            /* Install crash handlers (consistent with 'C' command) */
+                            if (g_rr_framework->shared_memory) {
+                                FuzzSharedMemory *crash_shm = (FuzzSharedMemory *)g_rr_framework->shared_memory;
+                                rr_child_install_crash_handlers(&crash_shm->variants[variant_idx]);
+                            }
+
+                            /* Reset fatal signal handlers so QEMU handles crashes, not guest handlers */
+                            for (int sig = 1; sig <= TARGET_NSIG; sig++) {
+                                if (sig == TARGET_SIGSEGV || sig == TARGET_SIGABRT ||
+                                    sig == TARGET_SIGBUS  || sig == TARGET_SIGILL) {
+                                    struct target_sigaction sa_reset;
+                                    memset(&sa_reset, 0, sizeof(sa_reset));
+                                    sa_reset._sa_handler = TARGET_SIG_DFL;
+                                    do_sigaction(sig, &sa_reset, NULL, 0);
+                                }
+                            }
+
+                            /* Flush TB cache so child generates coverage-instrumented TBs */
+                            if (current_cpu) {
+                                queue_tb_flush(current_cpu);
+                                RR_INFO("Child variant %d: Queued TB flush for coverage instrumentation", variant_idx);
+                            }
+
                             return 1;  // Continue execution
-                            
+
                         } else if (pid > 0) {
                             /* Parent Process */
                             child_pids[variant_idx] = pid;
@@ -558,23 +716,9 @@ int rr_fork_server_loop(void)
                         int exit_code = 0;
                         int sig = 0;
 
-                        if (WIFEXITED(status)) {
-                            exit_code = WEXITSTATUS(status);
-                            if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
-                                result_status = STATUS_CRASH;
-                                RR_INFO("Crash: Child variant %d exited with code %d", i, exit_code);
-                            } else {
-                                result_status = STATUS_NORMAL_EXIT;
-                            }
-                        } else if (WIFSIGNALED(status)) {
-                            sig = WTERMSIG(status);
-                            if (sig == SIGSEGV || sig == SIGABRT || sig == SIGBUS || 
-                                sig == SIGILL || sig == SIGFPE) {
-                                result_status = STATUS_CRASH;
-                                RR_INFO("Crash: Child variant %d crashed with signal %d", i, sig);
-                            } else {
-                                result_status = STATUS_OTHER_SIGNAL;
-                            }
+                        rr_classify_wait_status(status, &result_status, &exit_code, &sig);
+                        if (result_status == STATUS_CRASH) {
+                            RR_INFO("Crash: Child variant %d exit_code=%d signal=%d", i, exit_code, sig);
                         }
                         
                         /* Send status (one for each child) */
@@ -625,23 +769,10 @@ int rr_fork_server_loop(void)
                     
                     if (pid == 0) {
                         /* Child Process: Close inherited IPC FDs to avoid interference */
-                        if (g_rr_framework->cmd_pipe_fd >= 0) {
-                            close(g_rr_framework->cmd_pipe_fd);
-                            g_rr_framework->cmd_pipe_fd = -1;
-                        }
-                        if (g_rr_framework->status_pipe_fd >= 0) {
-                            close(g_rr_framework->status_pipe_fd);
-                            g_rr_framework->status_pipe_fd = -1;
-                        }
+                        rr_child_close_ipc_fds();
                         
                         /* 🔥 CRITICAL FIX: Rewind stdin to ensure child reads input from start */
-                        if (lseek(STDIN_FILENO, 0, SEEK_SET) == (off_t)-1) {
-                            if (errno != ESPIPE) {
-                                fprintf(stderr, "[DEBUG-CHILD] Child: lseek(stdin) failed: %s\n", strerror(errno));
-                            }
-                        } else {
-                            fprintf(stderr, "[DEBUG-CHILD] Child: stdin rewound to 0\n");
-                        }
+                        rr_child_rewind_stdin();
                         
                         /* 🔥 CRITICAL FIX: Child process re-opens trace file to ensure independent offset */
                         RR_INFO("Child: Re-opening trace file for independent offset");
@@ -649,14 +780,9 @@ int rr_fork_server_loop(void)
                                 getpid(), g_rr_trace_path ? g_rr_trace_path : "NULL");
                         fflush(stderr);
 
-                        if (g_trace_file) {
-                            fclose(g_trace_file);
-                            g_trace_file = NULL;
-                        }
                         if (g_rr_trace_path) {
-                            if (rr_start_replay(g_rr_trace_path) < 0) {
+                            if (rr_child_start_replay_from_path(g_rr_trace_path, false, 0, "Child") < 0) {
                                 fprintf(stderr, "[DEBUG-CHILD] rr_start_replay failed!\n");
-                                RR_ERROR("Child: Failed to start replay");
                             } else {
                                 fprintf(stderr, "[DEBUG-CHILD] rr_start_replay success.\n");
                             }
@@ -681,29 +807,9 @@ int rr_fork_server_loop(void)
                         /* 🔥 CRITICAL FIX: Child process reloads Fuzz instructions */
                         if (g_rr_framework->shared_memory) {
                             FuzzSharedMemory *shm = (FuzzSharedMemory *)g_rr_framework->shared_memory;
-                            
-                            /* ✅ Set global pointer for crash PC capture (always variant 0 for 'F' cmd) */
-                            g_child_variant_ptr = &shm->variants[0];
-                            g_child_variant_ptr->crash_pc = 0; // Initialize
-                            
-                            /* ✅ Register signal handler for crash PC capture */
-                            signal(SIGSEGV, rr_child_crash_handler);
-                            signal(SIGBUS, rr_child_crash_handler);
-                            signal(SIGILL, rr_child_crash_handler);
-                            signal(SIGABRT, rr_child_crash_handler);
-                            signal(SIGFPE, rr_child_crash_handler);
-
-                            RR_INFO("Child: Reloading fuzz instructions from shared memory");
-                            int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory, 0);
-                            if (load_result < 0) {
-                                RR_ERROR("Child: Failed to reload fuzz instructions!");
-                            } else {
-                                RR_INFO("🎉 Child: Successfully reloaded %zu fuzz instructions", g_instruction_count);
-                                
-                                // DEBUG: Immediately verify status after reload
-                                /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] PID=%d, IMMEDIATELY after reload:\\n\", getpid());\n                                fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\\n\", \n                                        g_instruction_count, &g_instruction_count);\n                                if (g_instruction_count > 0) {\n                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\\n\",\n                                            g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);\n                                } */
-                                fflush(stderr);
-                            }
+                            rr_child_install_crash_handlers(&shm->variants[0]);
+                            rr_child_reload_variant_instructions(0);
+                            fflush(stderr);
                         }
                         
                         /* Continue Fuzzing execution */
@@ -744,7 +850,24 @@ int rr_fork_server_loop(void)
                          * Coverage is automatically collected (shared memory bitmap).
                          */
                         RR_INFO("Child: Returning to execute syscalls with mutations (PID=%d)", getpid());
-                        
+
+                        /* Reset fatal signal handlers (consistent with 'C' command) */
+                        for (int sig = 1; sig <= TARGET_NSIG; sig++) {
+                            if (sig == TARGET_SIGSEGV || sig == TARGET_SIGABRT ||
+                                sig == TARGET_SIGBUS  || sig == TARGET_SIGILL) {
+                                struct target_sigaction sa_reset;
+                                memset(&sa_reset, 0, sizeof(sa_reset));
+                                sa_reset._sa_handler = TARGET_SIG_DFL;
+                                do_sigaction(sig, &sa_reset, NULL, 0);
+                            }
+                        }
+
+                        /* Flush TB cache for coverage-instrumented re-translation */
+                        if (current_cpu) {
+                            queue_tb_flush(current_cpu);
+                            RR_INFO("Child (F cmd): Queued TB flush for coverage instrumentation (PID=%d)", getpid());
+                        }
+
                         return 1; // Return 1 indicating child should continue execution
                         
                     } else if (pid > 0) {
@@ -1043,48 +1166,15 @@ int rr_fork_server_loop(void)
                             /* ═══ Child Process ═══ */
                             
                             
-                            fprintf(stderr, "[RR-FORK-DEBUG] Child started! PID: %d, Mode: %d, FSActive: %d\n", 
-                                    getpid(), g_rr_config.mode, g_rr_framework->fork_server_active);
-                            
-                            if (g_rr_framework->cmd_pipe_fd >= 0) {
-                                close(g_rr_framework->cmd_pipe_fd);
-                                g_rr_framework->cmd_pipe_fd = -1;
-                            }
-                            if (g_rr_framework->status_pipe_fd >= 0) {
-                                close(g_rr_framework->status_pipe_fd);
-                                g_rr_framework->status_pipe_fd = -1;
-                            }
+                            RR_VERBOSE("Child started PID=%d mode=%d", getpid(), g_rr_config.mode);
+                            rr_child_close_ipc_fds();
                             
                             /* Each child reopens trace file for full isolation */
                             if (g_trace_file != NULL && g_rr_trace_path) {
-                                // Close inherited FILE*
-                                fclose(g_trace_file);
-                                g_trace_file = NULL;  // Set to NULL to avoid dangling pointers
-
-                                // 🔥 Construct absolute path to ensure child process can find the file
-                                char abs_trace_path[1024];
-                                if (g_rr_trace_path[0] == '/') {
-                                    // Use absolute path
-                                    strncpy(abs_trace_path, g_rr_trace_path, sizeof(abs_trace_path) - 1);
-                                    abs_trace_path[sizeof(abs_trace_path) - 1] = '\0';
-                                } else {
-                                    // Build absolute path
-                                    if (!getcwd(abs_trace_path, sizeof(abs_trace_path))) {
-                                        RR_ERROR("Checkpoint child %d: Failed to get current working directory", variant_idx);
-                                        _exit(1);
-                                    }
-                                    size_t len = strlen(abs_trace_path);
-                                    snprintf(abs_trace_path + len, sizeof(abs_trace_path) - len, "/%s", g_rr_trace_path);
-                                }
-
-                                /* Re-initialize replay system (reopens trace file) */
-                                // extern int rr_start_replay(const char *trace_file);
-                                if (rr_start_replay(abs_trace_path) < 0) {
-                                    RR_ERROR("Checkpoint child %d: Failed to initialize replay system with path: %s", variant_idx, abs_trace_path);
+                                if (rr_child_start_replay_from_path(g_rr_trace_path, true, variant_idx,
+                                                                    "Checkpoint child") < 0) {
                                     _exit(1);
                                 }
-
-                                RR_INFO("Child %d: Reopened trace file independently and reset replay state", variant_idx);
                             }
                             
                             /* Strace replay needs to re-initialize trace parser */
@@ -1122,27 +1212,8 @@ int rr_fork_server_loop(void)
 
 
                             /* Reload Fuzz instructions for child process (Checkpoint fork) */
-                            if (g_rr_framework->shared_memory) {
-                                RR_INFO("Child %d: Reloading fuzz instructions from shared memory", variant_idx);
-                                int load_result = rr_fuzz_load_from_shared_memory(g_rr_framework->shared_memory, variant_idx);
-                                if (load_result < 0) {
-                                    RR_ERROR("Child %d: Failed to reload fuzz instructions!", variant_idx);
-                                } else {
-                                    RR_INFO("🎉 Child %d: Successfully reloaded %zu fuzz instructions", variant_idx, g_instruction_count);
-
-                                    // DEBUG: Immediately verify state after reload
-                                    /* fprintf(stderr, "[DEBUG-CHILD-RELOAD] Child %d PID=%d, IMMEDIATELY after reload:\n", variant_idx, getpid());
-                                    fprintf(stderr, "[DEBUG-CHILD-RELOAD]   g_instruction_count=%zu (address=%p)\n",
-                                            g_instruction_count, &g_instruction_count);
-                                    if (g_instruction_count > 0) {
-                                        fprintf(stderr, "[DEBUG-CHILD-RELOAD]   First instruction: syscall_idx=%u, cmd=%d\n",
-                                                g_fuzz_instructions[0].syscall_index, g_fuzz_instructions[0].cmd);
-                                    } */
-                                    fflush(stderr);
-                                }
-                            } else {
-                                RR_WARN("Child %d: No shared memory available for instruction loading", variant_idx);
-                            }
+                            rr_child_reload_variant_instructions(variant_idx);
+                            fflush(stderr);
 
                             /* True mid-point fork implementation: Sync File Pointer */
                             if (fork_point > 0) {
@@ -1153,32 +1224,38 @@ int rr_fork_server_loop(void)
                                 
                                 syscall_record_t *tmp_rec = NULL;
                                 int seek_count = 0;
-                                
-                                /* Read and discard records until we reach fork_point */
-                                while (seek_count < fork_point) {
-                                    /* Extern read_next_record(void) declared in rr_framework.h */
+
+                                /* Advance trace file until the next unread record has index >= fork_point.
+                                 * We must advance by record INDEX (not by count), because trace records
+                                 * have explicit index fields and may be non-contiguous (gaps exist when
+                                 * syscalls are executed but not saved to the trace). */
+                                while (1) {
                                     tmp_rec = read_next_record();
 
-                                    if (tmp_rec) {
-                                        /* record_sys_nr unused but kept for potential debug */
-                                        (void)tmp_rec->syscall_nr; 
-                                    }
-                                    
                                     if (!tmp_rec) {
-                                        RR_ERROR("Child %d: Failed to sync trace - EOF at %d / %u", 
-                                                 variant_idx, seek_count, fork_point);
+                                        RR_ERROR("Child %d: Failed to sync trace - EOF before reaching fork_point %u (skipped %d records)",
+                                                 variant_idx, fork_point, seek_count);
                                         break;
                                     }
+
+                                    if (tmp_rec->index >= fork_point) {
+                                        /* This record belongs at or after the fork point: keep it */
+                                        g_current_record = tmp_rec;
+                                        RR_INFO("Child %d: Kept record index=%u (>= fork_point=%u) as first record",
+                                                variant_idx, tmp_rec->index, fork_point);
+                                        break;
+                                    }
+
                                     rr_record_dispose(tmp_rec);
                                     seek_count++;
                                 }
-                                
-                                RR_INFO("  → Synced file pointer by skipping %d records", seek_count);
-                                
+
+                                RR_INFO("  → Synced file pointer by discarding %d records (next record index >= %u)", seek_count, fork_point);
+
                                 /* FORCE reset replay_index to match fork_point */
                                 /* rr_start_replay() likely resets it to 0, which mismatches CPU state */
                                 g_rr_framework->replay_index = fork_point;
-                                RR_INFO("  → Forced replay_index to %u", g_rr_framework->replay_index);
+                                RR_INFO("  → Forced replay_index to %u (g_current_record reset to NULL)", g_rr_framework->replay_index);
                                 fflush(stderr);
                                 
                                 g_rr_framework->silent_replay_mode = false;
@@ -1206,16 +1283,7 @@ int rr_fork_server_loop(void)
                             g_rr_framework->mode = RR_MODE_FUZZING;
                             RR_INFO("✅ Child %d: Switched to FUZZING mode for mutation application", variant_idx);
 
-                            /* ✅ Set global pointer for crash PC capture */
-                            g_child_variant_ptr = &shm->variants[variant_idx];
-                            g_child_variant_ptr->crash_pc = 0; // Initialize
-
-                            /* ✅ Register signal handler for crash PC capture */
-                            signal(SIGSEGV, rr_child_crash_handler);
-                            signal(SIGBUS, rr_child_crash_handler);
-                            signal(SIGILL, rr_child_crash_handler);
-                            signal(SIGABRT, rr_child_crash_handler);
-                            signal(SIGFPE, rr_child_crash_handler);
+                            rr_child_install_crash_handlers(&shm->variants[variant_idx]);
 
                             /* 🔥 PERFORMANCE FIX: Silence child output to avoid pipe/terminal contention */
                             if (g_rr_debug.level < RR_DEBUG_INFO) {
@@ -1312,23 +1380,9 @@ int rr_fork_server_loop(void)
                             int exit_code = 0;
                             int signal_number = 0;
                             
-                            if (WIFEXITED(status)) {
-                                exit_code = WEXITSTATUS(status);
-                                if (exit_code == 134 || exit_code == 139 || exit_code == 135 || exit_code == 132) {
-                                    result_status = STATUS_CRASH;
-                                    RR_INFO("Crash: Child %d exited with code %d", i, exit_code);
-                                } else {
-                                    result_status = STATUS_NORMAL_EXIT;
-                                }
-                            } else if (WIFSIGNALED(status)) {
-                                signal_number = WTERMSIG(status);
-                                if (signal_number == SIGSEGV || signal_number == SIGABRT || 
-                                    signal_number == SIGILL || signal_number == SIGBUS || signal_number == SIGFPE) {
-                                    result_status = STATUS_CRASH;
-                                    RR_INFO("Crash: Child %d crashed with signal %d", i, signal_number);
-                                } else {
-                                    result_status = STATUS_OTHER_SIGNAL;
-                                }
+                            rr_classify_wait_status(status, &result_status, &exit_code, &signal_number);
+                            if (result_status == STATUS_CRASH) {
+                                RR_INFO("Crash: Child %d exit_code=%d signal=%d", i, exit_code, signal_number);
                             }
                             
                             // Send crash status including exit_code and signal
@@ -1344,6 +1398,17 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Fork completed: %d variants", num_variants);
                     g_rr_framework->child_pid = 0;
+                }
+                break;
+
+            case 'T': // Tree export command — dump syscall tree to JSON for PathFinder
+                {
+                    char tree_path[256];
+                    snprintf(tree_path, sizeof(tree_path),
+                             "/tmp/syscall_tree_%d.json", getpid());
+                    rr_tree_export_json(tree_path);
+                    RR_INFO("Syscall tree exported to %s", tree_path);
+                    rr_ipc_send_status(8); // 8 = tree exported
                 }
                 break;
 

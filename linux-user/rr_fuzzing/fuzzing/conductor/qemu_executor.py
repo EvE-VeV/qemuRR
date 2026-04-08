@@ -256,6 +256,12 @@ class QEMUExecutor:
     
     def _setup_ipc(self):
         """Setup IPC channels (pipes and shared memory)"""
+        # 诊断：记录当前进程 RSS 和 /dev/shm 使用量
+        import resource
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        shm_count = len([f for f in os.listdir('/dev/shm') if f.startswith('rr_fuzz_')])
+        print(f"[DIAG] _setup_ipc #{self.total_executions}: RSS={rss_mb:.0f}MB, SHM_files={shm_count}", flush=True)
+
         # 🔥 FIX: Cleanup old IPC resources before creating new ones to avoid leaks
         self._cleanup_ipc()
         
@@ -266,12 +272,6 @@ class QEMUExecutor:
         # Move pipes to high FDs to avoid collision with target program FDs
         # QEMU's align_fd_state might clobber low FDs if not relocated
         try:
-            self.cmd_pipe_read = os.dup(r1) 
-            # We don't control the target FD number easily in Python without os.dup2 to a specific int
-            # But just duping usually finds the lowest available.
-            # We want SPECIFIC high FDs.
-            
-            # Let's try to dup2 to 100, 101, 102, 103 manually
             TARGET_FD_BASE = 150
             
             os.dup2(r1, TARGET_FD_BASE)
@@ -299,10 +299,37 @@ class QEMUExecutor:
         self.shm = FuzzSharedMemory(shm_name, fallback_dir=str(self._ipc_fallback_dir))
         self.shm.create()
     
+    def request_tree_export(self) -> str:
+        """
+        Send 'T' command to the fork server parent to export the live syscall tree.
+
+        The tree is written to /tmp/syscall_tree_<pid>.json by the parent process.
+        Returns the path to the exported file, or '' on failure.
+        """
+        with self._lock:
+            if not self._qemu_ready or self.cmd_pipe_write is None:
+                return ''
+            try:
+                os.write(self.cmd_pipe_write, b'T')
+                # Wait for status=8 (tree exported) with a short timeout
+                import select
+                if self.status_pipe_read is not None:
+                    r, _, _ = select.select([self.status_pipe_read], [], [], 2.0)
+                    if r:
+                        raw = os.read(self.status_pipe_read, 4)
+                        if raw:
+                            import struct
+                            status = struct.unpack('<I', raw[:4])[0] if len(raw) >= 4 else int(raw[0])
+                            if status == 8:
+                                return f"/tmp/syscall_tree_{self.qemu_process.pid}.json"
+            except Exception as e:
+                alog(f"request_tree_export failed: {e}", "EXEC", "WARN")
+        return ''
+
     def stop_persistent_qemu(self):
         """
         Stop persistent QEMU fork server gracefully
-        
+
         This should be called when fuzzing campaign finishes.
         """
         with self._lock:
@@ -328,6 +355,16 @@ class QEMUExecutor:
                 self._terminate_qemu()
             finally:
                 self._qemu_ready = False
+                # Kill any surviving fork children in the process group.
+                # When QEMU exits gracefully (via 'Q'), its forked children are
+                # orphaned and must be explicitly killed here.
+                _pgid = getattr(self, '_qemu_pgid', None)
+                if _pgid is not None:
+                    try:
+                        os.killpg(_pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                    self._qemu_pgid = None
                 # Now cleanup IPC
                 self._cleanup_ipc()
     
@@ -345,16 +382,16 @@ class QEMUExecutor:
             
             # Cleanup shared memory
             if self.shm:
-                shm_descriptor = None
+                shm_name = getattr(self.shm, 'shm_name', None) or getattr(self.shm, '_name', 'unknown')
                 try:
-                    shm_descriptor = self.shm.get_env_value()
                     self.shm.close()
                     self.shm.unlink()
-                except Exception:
-                    pass
+                    print(f"[DIAG] SHM unlinked: {shm_name}", flush=True)
+                    alog(f"Cleaned IPC shared memory: {shm_name}", "EXEC", "INFO")
+                except Exception as e:
+                    print(f"[DIAG] SHM unlink FAILED ({shm_name}): {e}", flush=True)
+                    alog(f"⚠️ SHM cleanup error ({shm_name}): {e}", "EXEC", "WARN")
                 finally:
-                    if shm_descriptor:
-                        alog(f"Cleaned IPC shared memory: {shm_descriptor}", "EXEC", "INFO")
                     self.shm = None
             
             # Delete per-execution BB trace file (written by QEMU, never read back)
@@ -502,12 +539,34 @@ class QEMUExecutor:
                 except Exception as e:
                     alog(f"⚠️ Failed to open log file {self.log_file}: {e}. Falling back to terminal.", "EXEC", "WARN")
 
+            def _qemu_preexec():
+                os.setpgrp()  # New process group; allows killpg to reach fork children
+                import ctypes
+                import signal as _signal
+                import resource as _resource
+                try:
+                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                    PR_SET_PDEATHSIG = 1
+                    libc.prctl(PR_SET_PDEATHSIG, _signal.SIGKILL)
+                except Exception:
+                    pass  # Non-Linux fallback: setpgrp is still effective
+                # Limit each QEMU process virtual memory: 32-bit MIPS/ARM guests require
+                # QEMU to reserve a contiguous 4GB host VA window for the guest address space.
+                # Set limit to 6GB: allows normal operation (4GB guest VA + ~1GB QEMU overhead)
+                # while preventing runaway allocations that caused 28GB OOM crashes.
+                try:
+                    _QEMU_MEM_LIMIT = 6 * 1024 ** 3
+                    _resource.setrlimit(_resource.RLIMIT_AS, (_QEMU_MEM_LIMIT, _QEMU_MEM_LIMIT))
+                except Exception:
+                    pass
+
             self.qemu_process = subprocess.Popen(
                 cmd,
                 env=env,
                 pass_fds=[child_cmd_pipe, child_status_pipe],
                 stdout=stdout_dest,
-                stderr=stderr_dest
+                stderr=stderr_dest,
+                preexec_fn=_qemu_preexec
             )
             
             # Close file handle in parent process immediately (Popen has enabled it for child)
@@ -516,6 +575,10 @@ class QEMUExecutor:
                 self._log_file_handle = None
             
             self.qemu_pid = self.qemu_process.pid
+            # Store PGID immediately while process is alive.
+            # _qemu_preexec() calls os.setpgrp() so PGID == PID.
+            # Must save now — querying after unexpected death returns ESRCH.
+            self._qemu_pgid = self.qemu_process.pid
             
         except Exception as e:
             # ✅ FIX: Ensure we don't leak pipe fds on failure
@@ -807,46 +870,63 @@ class QEMUExecutor:
             )
     
     def _terminate_qemu(self):
-        """Terminate QEMU process and ensure no zombie"""
+        """Terminate QEMU process group and ensure no zombies/orphans"""
         if not self.qemu_process:
             return
-        
+
         try:
             # Check if already exited
             if self.qemu_process.poll() is not None:
-                # Already exited, just wait to collect zombie
                 try:
                     self.qemu_process.wait(timeout=0.1)
                 except:
                     pass
                 return
-            
-            # Try graceful termination first
+
+            # Use stored PGID (saved at fork time, while process was alive).
+            # Querying getpgid() here may fail if QEMU already died unexpectedly.
+            saved_pgid = getattr(self, '_qemu_pgid', None)
+
+            # Kill entire process group with SIGTERM first (includes all DFC fork children)
+            if saved_pgid is not None:
+                try:
+                    os.killpg(saved_pgid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
             try:
                 self.qemu_process.terminate()
+            except:
+                pass
+
+            try:
                 self.qemu_process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                # Force kill if not terminated
+                pass
+
+            # Always SIGKILL the whole group to reap any surviving fork children.
+            # This is critical: children inherit PGID and survive parent death otherwise.
+            if saved_pgid is not None:
                 try:
-                    self.qemu_process.kill()
-                    self.qemu_process.wait(timeout=1.0)  # Must wait after kill
-                except:
+                    os.killpg(saved_pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
                     pass
-            except Exception:
-                # If terminate fails, try kill
-                try:
-                    self.qemu_process.kill()
-                    self.qemu_process.wait(timeout=1.0)  # ✅ FIX: Must wait
-                except:
-                    pass
+            try:
+                self.qemu_process.kill()
+            except:
+                pass
+            try:
+                self.qemu_process.wait(timeout=1.0)
+            except:
+                pass
+            self._qemu_pgid = None
         finally:
-            # Final attempt to reap zombie if still exists
+            # Final attempt to reap zombie
             if self.qemu_process:
                 try:
                     self.qemu_process.wait(timeout=0.1)
                 except:
                     pass
-            
+
             self.qemu_process = None
             self.qemu_pid = None
     
@@ -939,7 +1019,9 @@ class QEMUExecutor:
                 # Timeout or unexpected exit
                 self.total_timeouts += 1
                 self._terminate_qemu()
-                
+                self._cleanup_ipc()  # Prevent SHM leak on timeout path
+                self._qemu_ready = False  # Force re-init on next execute()
+
                 return ExecutionResult(
                     status=STATUS_TIMEOUT,
                     status_name="timeout",
@@ -1050,19 +1132,17 @@ class QEMUExecutor:
                 self._trace_file = trace_file
                 
                 print(f"[QEMUExecutor] ⏳ Waiting for READY status...")
-                try:
-                    status_data = self._wait_for_status(timeout=20.0)
-                    if status_data is None or status_data[0] != STATUS_READY:
-                        print(f"[DEBUG-EXEC] ❌ QEMU init failed (data={status_data})")
-                        raise RuntimeError(f"QEMU init failed (status={status_data})")
-                    
-                    print(f"[QEMUExecutor] ✅ QEMU ready!")
-                    self._qemu_ready = True
-                except Exception as e:
-                    print(f"[QEMUExecutor] ❌ QEMU startup error: {e}, cleaning up IPC...")
+                status_data = self._wait_for_status(timeout=20.0)
+                if status_data is None or status_data[0] != STATUS_READY:
+                    print(f"[DEBUG-EXEC] ❌ QEMU init failed (data={status_data})")
+                    alog(f"❌ QEMU init failed in execute_fork (data={status_data})", "EXEC", "ERROR")
                     self._qemu_ready = False
-                    self.stop_persistent_qemu()
-                    raise
+                    self._terminate_qemu()
+                    self._cleanup_ipc()
+                    return []
+
+                print(f"[QEMUExecutor] ✅ QEMU ready!")
+                self._qemu_ready = True
             
             if mutation_variants is None:
                 mutation_variants = [[]]
@@ -1102,9 +1182,10 @@ class QEMUExecutor:
                              print(f"[QEMUExecutor] ℹ️  QEMU Exited Cleanly (Execution Finished due to Early Exit in Mutation)")
                         else:
                              print(f"[QEMUExecutor] ❌ QEMU disconnected unexpectedly (EOF), setting _qemu_ready=False")
-                        
+
                         self._qemu_ready = False
                         self._terminate_qemu()
+                        self._cleanup_ipc()
                         break
                     
                     # Unpack status and crash details

@@ -197,6 +197,37 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
                 }
                 break;
 
+            case FUZZ_CMD_MUTATE_FLAGS:
+                if (instr->data_len >= sizeof(uint64_t)) {
+                    uint64_t flag_mask = *(uint64_t *)instr->data;
+                    if (instr->arg_index != 0xFF && instr->arg_index < 6) {
+                        abi_long old_val = args[instr->arg_index];
+                        args[instr->arg_index] = old_val ^ (abi_long)flag_mask;
+                        g_fuzz_stats.arg_mutations++;
+                        FUZZ_DEBUG_LOG("[MUTATE_FLAGS] arg[%u]: 0x%lx ^ 0x%lx = 0x%lx\n",
+                            instr->arg_index, (unsigned long)old_val,
+                            (unsigned long)flag_mask,
+                            (unsigned long)args[instr->arg_index]);
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_BOUNDARY_VALUE:
+                if (instr->data_len >= sizeof(int64_t)) {
+                    int64_t boundary = *(int64_t *)instr->data;
+                    if (instr->arg_index != 0xFF && instr->arg_index < 6) {
+                        args[instr->arg_index] = (abi_long)boundary;
+                        g_fuzz_stats.boundary_tests++;
+                    } else if (instr->arg_index == 0xFF) {
+                        g_retval_override = (abi_long)boundary;
+                        g_has_retval_override = true;
+                        g_fuzz_stats.boundary_tests++;
+                    }
+                    FUZZ_DEBUG_LOG("[BOUNDARY_VALUE] arg[%u] = %ld\n",
+                        instr->arg_index, (long)boundary);
+                }
+                break;
+
             default:
                 break;
         }

@@ -27,6 +27,7 @@ rr_fuzz_sources = files(
   
   # Utils - 工具模块
   'src/common/rr_mapping_manager.c',
+  'src/common/rr_mock_ioctls.c',
   'src/syscall/rr_syscall_info.c',
   'src/syscall/rr_syscall_dispatch.c',
   'src/syscall/rr_syscallparser.c',
@@ -38,8 +39,6 @@ rr_fuzz_sources = files(
   'src/runtime/rr_nested_fork.c',      # ✅ autonomous nested fork
   'src/syscall/rr_syscall_tree.c',     # ✅ C-Tree-P2: syscall tree builder
   
-  # Mocking - 模拟模块 (新)
-  'rr_mock_ioctls.c',
 )
 
 # RR-Fuzz configuration option

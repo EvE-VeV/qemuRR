@@ -42,7 +42,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         
         case TARGET_NR_read: {
             /* read(fd, buf, count) - buf at arg[1] */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1)); // arg[1]
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1); /* arg[1]: stored as raw index */
             if (aux && aux->data && aux->size > 0) {
                 /* Write mutated data to guest memory */
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
@@ -60,7 +60,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
 #ifdef TARGET_NR_pread64
         case TARGET_NR_pread64: {
             /* pread64(fd, buf, count, offset) - buf at arg[1] */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
                     RR_INFO("PURE_REAPPLY: pread64() - reapplied %u bytes", aux->size);
@@ -73,7 +73,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
         
         case TARGET_NR_getrandom: {
             /* getrandom(buf, buflen, flags) - buf at arg[0] */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 0)); // arg[0]
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 0); /* arg[0]: stored as raw index */
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[0], aux->data, aux->size, 1) == 0) {
                     RR_INFO("PURE_REAPPLY: getrandom() - reapplied %u bytes of mutated random data", 
@@ -87,7 +87,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
 #ifdef TARGET_NR_recv
         case TARGET_NR_recv: {
             /* recv(sockfd, buf, len, flags) - buf at arg[1] */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
                     RR_INFO("PURE_REAPPLY: recv() - reapplied %u bytes of mutated network data", 
@@ -102,7 +102,7 @@ abi_long rr_replay_syscall_pure_reapply(CPUArchState *env, int num,
 #ifdef TARGET_NR_recvfrom
         case TARGET_NR_recvfrom: {
             /* recvfrom(sockfd, buf, len, flags, src_addr, addrlen) - buf at arg[1] */
-            rr_aux_data_t *aux = rr_aux_find(record->aux_data, (1 << 1));
+            rr_aux_data_t *aux = rr_aux_find(record->aux_data, 1);
             if (aux && aux->data && aux->size > 0) {
                 if (cpu_memory_rw_debug(env_cpu(env), args[1], aux->data, aux->size, 1) == 0) {
                     RR_INFO("PURE_REAPPLY: recvfrom() - reapplied %u bytes", aux->size);

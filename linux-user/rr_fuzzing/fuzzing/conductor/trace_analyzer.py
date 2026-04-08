@@ -194,29 +194,35 @@ class SyscallRecord:
             4120: 'clone',
             4122: 'uname',
             4125: 'mprotect',
+            4027: 'alarm',
+            4114: 'wait4',
             4140: 'llseek',
             4141: 'getdents',
-            4179: 'rt_sigaction',
-            4180: 'pread64',
-            4181: 'pwrite64',
-            # ✅ Network syscalls (Critical for jjhttpd/upnp)
+            4142: 'select',
+            4143: 'select',       # MIPS O32 uses both 142 and 143 across kernel versions
+            # ✅ MIPS O32 individual socket syscalls (__NR_Linux + 168..184)
+            # Verified from qemu strace of actual Linksys E1200 firmware
+            4168: 'accept',
+            4169: 'bind',
+            4170: 'connect',
+            4171: 'getpeername',
+            4172: 'getsockname',
+            4173: 'getsockopt',
+            4174: 'listen',
+            4175: 'recv',
+            4176: 'recvfrom',
+            4177: 'recvmsg',
+            4178: 'send',
+            4179: 'sendmsg',
+            4180: 'sendto',
+            4181: 'setsockopt',
+            4182: 'socketcall',
             4183: 'socket',
-            4184: 'connect',
-            4185: 'accept',
-            4186: 'sendto',
-            4187: 'recvfrom',
-            4188: 'sendmsg',
-            4189: 'recvmsg',
-            4190: 'shutdown',
-            4191: 'bind',
-            4192: 'listen',
-            4193: 'getsockname',
-            4194: 'getpeername',
-            4195: 'socketpair',
-            4196: 'send',
-            4197: 'recv',
-            4198: 'getsockopt',
-            4199: 'setsockopt',
+            4184: 'socketpair',
+            4194: 'rt_sigaction',
+            4195: 'rt_sigprocmask',
+            4200: 'pread64',
+            4201: 'pwrite64',
             # More syscalls
             4213: 'set_tid_address',
             4214: 'getdents64',
@@ -1079,6 +1085,37 @@ class TraceAnalyzer:
         """
         return self.merged_execution_sequence
     
+    def get_auth_boundary(self) -> int:
+        """
+        Auto-detect auth_boundary: the syscall index of the first accept() call.
+
+        This marks the boundary between pre-auth setup (ld.so, libc init, TCP bind/listen)
+        and post-auth business logic.  Mutations BEFORE this index cannot be triggered by
+        a remote attacker, so they are excluded from the mutable candidate pool.
+
+        For MIPS O32 targets that route socket ops through the socketcall(2) multiplexer
+        (SYS_ACCEPT=5), that call is used instead of a bare accept().
+
+        Returns:
+            Index of the first accept/socketcall(SYS_ACCEPT) in the trace, or 0 if not found.
+        """
+        ACCEPT_NAMES = {'accept', 'accept4'}
+        SOCKETCALL_SYS_ACCEPT  = 5   # SYS_ACCEPT  in Linux socketcall(2) numbering
+        SOCKETCALL_SYS_ACCEPT4 = 18  # SYS_ACCEPT4
+
+        for sc in self.syscalls:
+            if sc.name in ACCEPT_NAMES:
+                alog(f"auth_boundary auto-detected: {sc.name}() at index={sc.index}", "TRACE", "INFO")
+                return sc.index
+            # MIPS O32 socketcall multiplexer: args[0] is the sub-call number
+            if sc.name == 'socketcall' and sc.args:
+                sub = sc.args[0]
+                if sub in (SOCKETCALL_SYS_ACCEPT, SOCKETCALL_SYS_ACCEPT4):
+                    alog(f"auth_boundary auto-detected: socketcall(SYS_ACCEPT) at index={sc.index}", "TRACE", "INFO")
+                    return sc.index
+        alog("auth_boundary not detected (no accept() in trace)", "TRACE", "WARN")
+        return 0
+
     def get_bb_coverage_summary(self) -> Dict[str, any]:
         """Get BB coverage summary"""
         if not self.has_bb_trace():

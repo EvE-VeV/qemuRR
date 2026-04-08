@@ -18,12 +18,19 @@
 #include "rr_syscall_tree.h"
 #include <sys/mman.h>
 #include <unistd.h>
+
 #include <sys/mman.h>
 #include <stdint.h>
 #include "rr_syscall_dispatch.h"
 
 FILE *g_trace_file = NULL;  // Accessible by fork_server
 syscall_record_t *g_current_record = NULL;  // Accessible by fork_server
+/* Pending parent wait4 record saved during child-record skipping in silent_replay_mode.
+ * When fork is suppressed, child records are skipped in the trace file until the
+ * parent's wait4(retval=child_pid) is found. That wait4 record is saved here so
+ * the parent application's wait4 call consumes the correct record on the next
+ * rr_replay_syscall() invocation. */
+static syscall_record_t *g_child_skip_pending_record = NULL;
 char *g_rr_trace_path = NULL;  // Saves trace file path for child processes
 
 /* Flag: Indicates if the current syscall has been consumed from trace and index incremented */
@@ -490,6 +497,13 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     /* Maintain global index synchronization - core requirement from design.md */
     RR_VERBOSE("REPLAY_SYSCALL: replay_index=%u, g_current_record=%p", g_rr_framework->replay_index, g_current_record);
     if (g_rr_framework->replay_index == 0 || !g_current_record) {
+        if (g_child_skip_pending_record) {
+            /* Inject the parent wait4 record saved during child-record skipping. */
+            g_current_record = g_child_skip_pending_record;
+            g_child_skip_pending_record = NULL;
+            fprintf(stderr, "[DEBUG-REPLAY] PID=%d injecting saved parent-wait4 record idx=%u nr=%d\n",
+                    getpid(), g_current_record->index, g_current_record->syscall_nr);
+        } else {
         fprintf(stderr, "[DEBUG-REPLAY] PID=%d reading record for index %u\n", getpid(), g_rr_framework->replay_index);
         g_current_record = read_next_record();
         
@@ -534,7 +548,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
                 g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
         RR_VERBOSE("REPLAY_SYSCALL: Got record index=%u, syscall=%d, ret=%d",
                    g_current_record->index, g_current_record->syscall_nr, (int)g_current_record->retval);
-                   
+        } /* end else (no pending record) */
     }
 
     /* 🔥 GAP FIX: Handle unrecorded syscalls (Gap in trace) */
@@ -548,8 +562,12 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         return -1; /* Execute natively */
     }
 
-    /* Smart synchronization - if syscall doesn't match, continue reading until a match is found */
-    while (g_current_record && g_current_record->syscall_nr != num) {
+    /* Smart synchronization - if syscall doesn't match, continue reading until a match is found.
+     * NOTE: Disabled in silent_replay_mode (parent advancing to fork_point): HYBRID divergence
+     * causes NR mismatches that would exhaust the trace before reaching fork_point.
+     * The post-sync catch-all below handles the mismatch case for silent_replay_mode. */
+    while (!g_rr_framework->silent_replay_mode &&
+           g_current_record && g_current_record->syscall_nr != num) {
         RR_VERBOSE("⚠️ [REPLAY-SYNC] MISMATCH at index %u: recorded_nr=%d (%s), actual_nr=%d (%s). Skipping record.",
                 g_current_record->index,
                 g_current_record->syscall_nr, rr_get_syscall_name_fast(g_current_record->syscall_nr),
@@ -658,8 +676,16 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
     }
 
     if (g_current_record->syscall_nr != num) {
-        RR_ERROR("REPLAY_SYSCALL: Could not find matching syscall for %d", num);
-        return -1;
+        if (g_rr_framework->silent_replay_mode) {
+            /* In silent_replay_mode, NR mismatch after disabled sync loop is expected
+             * due to HYBRID divergence. Consume record in order, return recorded retval. */
+            RR_VERBOSE("REPLAY: silent_replay_mode NR-mismatch at idx=%u: recorded=%d actual=%d — consuming in order",
+                       g_current_record->index, g_current_record->syscall_nr, num);
+            /* Fall through to abi_long ret declaration and post-sync catch-all below */
+        } else {
+            RR_ERROR("REPLAY_SYSCALL: Could not find matching syscall for %d", num);
+            return -1;
+        }
     }
 
     RR_VERBOSE("REPLAY_SYSCALL: FOUND MATCH - syscall=%d at record index=%u",
@@ -686,6 +712,38 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 #endif
 
     abi_long ret = g_current_record->retval;
+
+    /* ── SILENT-REPLAY CATCH-ALL ──────────────────────────────────────────────
+     * When parent is advancing to fork_point (silent_replay_mode=true), HYBRID
+     * divergence can cause the actual syscall NR to differ from the recorded NR.
+     * The sync loop above skips records looking for a matching NR and can exhaust
+     * the trace (→ exit(0)) before we reach fork_point.
+     *
+     * After the sync loop, g_current_record may now point to a record with a
+     * different NR than `num` only if we exited the loop early. But the real
+     * problem is when the sync loop SKIPS records: we handle that here by
+     * detecting that the MATCHED record has a different NR (loop didn't match
+     * anything useful). Actually the sync loop already advanced past the mismatch.
+     *
+     * Simpler guard: if we are in silent_replay_mode AND g_current_record->syscall_nr
+     * still doesn't match `num` after the sync loop, we force-consume the record
+     * and return the recorded retval to keep the parent advancing.
+     * ────────────────────────────────────────────────────────────────────────── */
+    if (g_rr_framework->silent_replay_mode && g_current_record &&
+        g_current_record->syscall_nr != num) {
+        RR_VERBOSE("REPLAY: silent_replay_mode NR-mismatch at idx=%u: recorded=%d actual=%d — returning 0 (safe default)",
+                   g_current_record->index, g_current_record->syscall_nr, num);
+        /* Return 0 (universal "success/no-data") for NR-mismatched syscalls in
+         * silent_replay_mode. Using the recorded retval of the WRONG syscall is unsafe:
+         * a large retval (e.g., 131074 from fcntl) returned for accept() would be treated
+         * as a huge fd number, causing FD_SET overflow → stack corruption → SIGSEGV.
+         * 0 is safe: fstat returns 0=success, close/setsockopt return 0=success,
+         * read returns 0=EOF (application closes connection cleanly), etc.
+         * Syscalls that return fds (open/accept/socket) also get 0 (fd=0=stdin-reuse),
+         * which may cause cert loading to fail but httpd continues and reaches accept/read. */
+        ret = 0;
+        goto replay_success;
+    }
 
     /* Special Case 1: Output Syscalls */
     /* Output syscalls must be executed to maintain I/O state, but record must be consumed */
@@ -769,7 +827,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 //                      num == TARGET_NR_read ||
 #endif
 #ifdef TARGET_NR_write
-                      num == TARGET_NR_write ||
+//                    num == TARGET_NR_write ||  // REMOVED: write goes pure replay to avoid EBADF coverage noise
 #endif
 #ifdef TARGET_NR_open
                       num == TARGET_NR_open ||
@@ -801,10 +859,34 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 #ifdef TARGET_NR_mmap2
                       num == TARGET_NR_mmap2 ||
 #endif
+                      /* brk must be HYBRID: pure replay returns wrong address without
+                       * adjusting QEMU guest heap, causing SIGSEGV when accessing newly
+                       * "allocated" memory. HYBRID lets QEMU execute real brk and return
+                       * the actual new heap address. */
+#ifdef TARGET_NR_brk
+                      num == TARGET_NR_brk ||
+#endif
                       0);
         if (is_io) {
             goto try_hybrid;
         }
+    }
+
+    /* In silent_replay_mode, force HYBRID for read-like syscalls that have aux_data.
+     * Pure replay would write recorded data to the application's buffer using the
+     * application's CURRENT arg pointers. After fork suppression and NR-mismatch
+     * catch-alls, the parent's buffer pointers may be invalid → SIGSEGV in pure replay.
+     * HYBRID executes the real read; if the fd is invalid it returns -EBADF safely. */
+    if (g_rr_framework->silent_replay_mode && g_current_record->has_aux_data) {
+#ifdef TARGET_NR_read
+        if (num == TARGET_NR_read) { goto try_hybrid; }
+#endif
+#ifdef TARGET_NR_readv
+        if (num == TARGET_NR_readv) { goto try_hybrid; }
+#endif
+#ifdef TARGET_NR_pread64
+        if (num == TARGET_NR_pread64) { goto try_hybrid; }
+#endif
     }
 
     if (g_current_record->has_aux_data) {
@@ -833,7 +915,7 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 //            if (num == TARGET_NR_read) is_io_syscall = true;
 #endif
 #ifdef TARGET_NR_write
-            if (num == TARGET_NR_write) is_io_syscall = true;
+//            if (num == TARGET_NR_write) is_io_syscall = true;  // REMOVED: write goes pure replay to avoid EBADF coverage noise
 #endif
 #ifdef TARGET_NR_open
             if (num == TARGET_NR_open) is_io_syscall = true;
@@ -865,6 +947,86 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         ret = rr_replay_syscall_pure(env, num, args, g_current_record);
         
         if (ret == -1) {
+            /* In FUZZING mode: bypass hybrid for syscalls that operate on virtual fds.
+             * After accept() is pure-replayed (no real kernel fd created), any subsequent
+             * syscall on that fd (flock, fcntl, select, etc.) would return EBADF in hybrid
+             * mode, driving the binary into error-handling paths and skipping the mutation
+             * surface (e.g. HTTP read). Return recorded retval directly instead. */
+            if (g_rr_framework->mode == RR_MODE_FUZZING) {
+#ifdef TARGET_NR_flock
+                if (num == TARGET_NR_flock) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING flock() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_fcntl
+                if (num == TARGET_NR_fcntl) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING fcntl() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_fcntl64
+                if (num == TARGET_NR_fcntl64) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING fcntl64() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_select
+                if (num == TARGET_NR_select) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING select() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR__newselect
+                if (num == TARGET_NR__newselect) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING _newselect() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_poll
+                if (num == TARGET_NR_poll) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING poll() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_ppoll
+                if (num == TARGET_NR_ppoll) {
+                    ret = g_current_record->retval;
+                    RR_VERBOSE("REPLAY: FUZZING ppoll() bypass, retval=%d", (int)ret);
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_socket
+                if (num == TARGET_NR_socket) {
+                    ret = g_current_record->retval;
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_bind
+                if (num == TARGET_NR_bind) {
+                    ret = g_current_record->retval;
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_listen
+                if (num == TARGET_NR_listen) {
+                    ret = g_current_record->retval;
+                    goto replay_success;
+                }
+#endif
+#ifdef TARGET_NR_sendmsg
+                if (num == TARGET_NR_sendmsg) {
+                    ret = g_current_record->retval;
+                    goto replay_success;
+                }
+#endif
+            }
             /* Pure replay failed, use hybrid mode */
             RR_VERBOSE("REPLAY: Pure replay not supported for syscall %d, using hybrid", num);
             goto try_hybrid;
@@ -873,15 +1035,27 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
         /* Apply mutation to args and restored guest memory in fuzzing mode */
         if (g_rr_framework->mode == RR_MODE_FUZZING) {
             uint32_t syscall_index = g_current_record->index;
-            RR_INFO("🎯 FUZZING: Applying mutations AFTER aux_data restore for syscall %d at index %u", 
+            RR_INFO("🎯 FUZZING: Applying mutations AFTER aux_data restore for syscall %d at index %u",
                     num, syscall_index);
-            
-            /* Apply mutations to args and restored guest memory */
+
+            /* Step 2a: Apply instruction-based mutations (REPLACE_BUFFER, FLIP_BITS, MUTATE_ARG etc.) */
             int mutation_result = rr_fuzz_mutate_syscall(env, syscall_index, args, num);
-            
+
             if (mutation_result > 0) {
                 RR_INFO("🎯 FUZZING: Buffer mutation applied, overwrote aux_data");
                 g_rr_framework->last_syscall_mutated = true;
+            }
+
+            /* Step 2b: Apply aux_data mutations (MUTATE_AUX_BUFFER, INTERESTING_VALUES etc.)
+             * These modify aux->data in the C struct (format strings, cmd injection, path traversal...) */
+            rr_fuzz_mutate_aux_data(env, g_current_record, args, num);
+
+            /* Step 2c: Write mutated aux_data back to guest memory */
+            abi_long reapply_ret = rr_replay_syscall_pure_reapply(env, num, args, g_current_record);
+            if (reapply_ret >= 0) {
+                ret = reapply_ret;
+                g_rr_framework->last_syscall_mutated = true;
+                RR_INFO("🎯 FUZZING: Aux mutation reapplied to guest, new ret=%ld", (long)ret);
             }
         }
         
@@ -892,6 +1066,159 @@ abi_long rr_replay_syscall(CPUArchState *env, int num, abi_long *args)
 try_hybrid:
         /* Continue with existing hybrid logic */
         {}
+    }
+
+    /* No-aux-data path: In FUZZING mode, return recorded retval for fd-operating syscalls
+     * that would fail EBADF (accept was pure-replayed, no real kernel fd created).
+     * These syscalls have has_aux_data=False so they skip the block above entirely. */
+    if (!g_current_record->has_aux_data && g_rr_framework->mode == RR_MODE_FUZZING) {
+#ifdef TARGET_NR_flock
+        if (num == TARGET_NR_flock) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING flock() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_fcntl
+        if (num == TARGET_NR_fcntl) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING fcntl() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_fcntl64
+        if (num == TARGET_NR_fcntl64) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING fcntl64() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_select
+        if (num == TARGET_NR_select) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING select() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR__newselect
+        if (num == TARGET_NR__newselect) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING _newselect() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_poll
+        if (num == TARGET_NR_poll) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING poll() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_ppoll
+        if (num == TARGET_NR_ppoll) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING ppoll() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_setsockopt
+        if (num == TARGET_NR_setsockopt) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING setsockopt() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_getsockopt
+        if (num == TARGET_NR_getsockopt) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING getsockopt() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+        /* Network setup syscalls: return recorded values to avoid real socket creation.
+         * Creating real sockets during silent_replay_mode causes port conflicts and
+         * binary divergence (e.g., EADDRINUSE from bind → binary exits → parent exits
+         * before reaching fork_point, giving 0 results for deep fork_points like idx=505).
+         * All subsequent socket operations (accept, read, write) are handled by pure replay
+         * via aux_data, so no real socket infrastructure is needed. */
+#ifdef TARGET_NR_socket
+        if (num == TARGET_NR_socket) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING socket() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_bind
+        if (num == TARGET_NR_bind) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING bind() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_listen
+        if (num == TARGET_NR_listen) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING listen() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_recvmsg
+        if (num == TARGET_NR_recvmsg) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING recvmsg() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_sendmsg
+        if (num == TARGET_NR_sendmsg) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING sendmsg() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_accept
+        if (num == TARGET_NR_accept) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING accept() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_accept4
+        if (num == TARGET_NR_accept4) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING accept4() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+        /* ioctl with no aux_data: return recorded retval (e.g., ENOTTY=-25 for tty check on
+         * socket fd). Without bypass, HYBRID ioctl on a virtual fd returns EBADF which drives
+         * the binary into unexpected error-handling paths and blocks parent advancement to
+         * deep fork_points. All ioctl in this trace return -25 (ENOTTY), so bypass is safe. */
+#ifdef TARGET_NR_ioctl
+        if (num == TARGET_NR_ioctl) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING ioctl() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+        /* wait4/waitpid: in fork-per-request servers (uhttpd), the parent waits for each
+         * child after the HTTP request is handled. Without bypass, HYBRID wait4 would block
+         * waiting for the (suppressed) child PID, stalling parent advancement to fork_point.
+         * Return recorded retval (child PID or -ECHILD) without actually waiting. */
+#ifdef TARGET_NR_wait4
+        if (num == TARGET_NR_wait4) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING wait4() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
+#ifdef TARGET_NR_waitpid
+        if (num == TARGET_NR_waitpid) {
+            ret = g_current_record->retval;
+            RR_VERBOSE("REPLAY: FUZZING waitpid() no-aux bypass, retval=%d", (int)ret);
+            goto replay_success;
+        }
+#endif
     }
 
 #ifdef TARGET_NR_clone
@@ -971,6 +1298,72 @@ try_hybrid:
     /* Automatic snapshot management */
     rr_snapshot_auto_manage(num, g_rr_framework->replay_index);
 
+    /* Suppress fork/clone/vfork in silent_replay_mode and skip interleaved child records.
+     *
+     * In fork-per-request servers (e.g. uhttpd), the trace file interleaves child records
+     * immediately after each parent fork record.  File order:
+     *   [parent fork(ret=child_pid)] [child fork(ret=0)] [child sig...] ... [parent wait4(ret=child_pid)]
+     *
+     * Without skipping, the child records are consumed by the NR-mismatch catch-all but
+     * with incorrect replay_index accounting, causing the parent to diverge from its true
+     * syscall sequence and eventually crash (SIGSEGV) before reaching fork_point.
+     *
+     * Fix: after suppressing the parent fork, read ahead in the trace file, discarding
+     * child records, until the parent's wait4/waitpid with retval==child_pid is found.
+     * That wait4 record is saved in g_child_skip_pending_record so the parent application's
+     * subsequent wait4 call consumes the correct record. */
+    if (g_rr_framework->silent_replay_mode) {
+        bool is_fork_call = false;
+#ifdef TARGET_NR_fork
+        if (num == TARGET_NR_fork) is_fork_call = true;
+#endif
+#ifdef TARGET_NR_vfork
+        if (num == TARGET_NR_vfork) is_fork_call = true;
+#endif
+#ifdef TARGET_NR_clone
+        if (num == TARGET_NR_clone) is_fork_call = true;
+#endif
+        if (is_fork_call) {
+            /* Use recorded parent retval (child_pid); pure replay may have set ret=-1. */
+            abi_long child_pid = g_current_record ? (abi_long)g_current_record->retval : 0;
+            ret = child_pid;
+            fprintf(stderr, "[CHILD-SKIP] PID=%d fork suppressed at replay_idx=%u child_pid=%ld, skipping child records\n",
+                    getpid(), g_rr_framework->replay_index, (long)child_pid);
+
+            /* Skip child records until parent's wait4/waitpid(retval==child_pid). */
+            if (child_pid > 0) {
+                syscall_record_t *rec;
+                int skipped = 0;
+                while ((rec = read_next_record()) != NULL) {
+                    bool is_parent_wait = false;
+#ifdef TARGET_NR_wait4
+                    if (rec->syscall_nr == TARGET_NR_wait4 &&
+                        (abi_long)rec->retval == child_pid) is_parent_wait = true;
+#endif
+#ifdef TARGET_NR_waitpid
+                    if (rec->syscall_nr == TARGET_NR_waitpid &&
+                        (abi_long)rec->retval == child_pid) is_parent_wait = true;
+#endif
+                    if (is_parent_wait) {
+                        /* Save parent's wait4 for when the application calls wait4 next. */
+                        g_child_skip_pending_record = rec;
+                        fprintf(stderr, "[CHILD-SKIP] PID=%d found parent wait4(retval=%ld) after skipping %d child records\n",
+                                getpid(), (long)child_pid, skipped);
+                        break;
+                    }
+                    /* Discard child record. */
+                    skipped++;
+                    rr_record_dispose(rec);
+                }
+                if (!g_child_skip_pending_record) {
+                    fprintf(stderr, "[CHILD-SKIP] PID=%d WARNING: no wait4 found after %d skipped records (EOF?)\n",
+                            getpid(), skipped);
+                }
+            }
+            goto replay_success;
+        }
+    }
+
     /* 🔥 Hybrid Mode: All syscalls execute real calls, mappings handled by post_hook */
     /* Address mapping for special syscalls like mmap is completed in post_hook */
 
@@ -978,10 +1371,10 @@ try_hybrid:
     g_pending_post_record = g_current_record;
     g_current_record = NULL;
     g_rr_framework->replay_index++;
-    
+
     /* Set flag to notify post_hook not to double process */
     g_syscall_already_consumed = true;
-    
+
     /* Return -1 to let QEMU execute real syscall (with mutated arguments) */
     RR_VERBOSE("REPLAY_SYSCALL: Hybrid mode, record cleaned, executing real syscall %d", num);
     return -1;

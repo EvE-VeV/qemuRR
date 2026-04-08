@@ -526,21 +526,11 @@ static inline bool rr_should_skip_syscall(int syscall_nr)
 static inline bool rr_is_output_syscall(int syscall_nr)
 {
     switch (syscall_nr) {
-        case TARGET_NR_write:
-#ifdef TARGET_NR_writev
-        case TARGET_NR_writev:
-#endif
+        /* write/writev/send* removed: pure replay returns recorded retval to avoid
+         * EBADF on replayed fds (accept() pure-replayed → no real kernel fd created).
+         * Real write execution would hit EBADF and pollute coverage with error paths. */
 #ifdef TARGET_NR_pwrite64
         case TARGET_NR_pwrite64:
-#endif
-#ifdef TARGET_NR_send
-        case TARGET_NR_send:
-#endif
-#ifdef TARGET_NR_sendto
-        case TARGET_NR_sendto:
-#endif
-#ifdef TARGET_NR_sendmsg
-        case TARGET_NR_sendmsg:
 #endif
             return true;
             

@@ -93,6 +93,7 @@ class DynamicForkController:
                  analyzer=None,
                  evolution_engine=None,
                  manual_fork_point=None,
+                 auth_boundary: int = 0,  # ✅ Post-auth syscall boundary index
                  arch: str = 'auto'):  # ✅ Pass architecture
         """Initialize dynamic fork controller
         
@@ -122,8 +123,17 @@ class DynamicForkController:
         self.crash_analyzer = crash_analyzer # ✅ Layer 5 Analyzer
         self.analyzer = analyzer
         self.evolution_engine = evolution_engine # ✅ Layer 6 Engine
-        self.manual_fork_point = manual_fork_point # ✅ Force specific fork point
+        self.auth_boundary = auth_boundary  # ✅ Post-auth boundary: fork_point must be >= this
         self.arch = arch # ✅ Store architecture
+        self.triage_callback = None  # set by FuzzingCore to _triage_crash_online
+        # If auth_boundary is set and no manual_fork_point, use auth_boundary as the fork point.
+        # This ensures the parent advances to the real authenticated state before forking.
+        if manual_fork_point is not None:
+            self.manual_fork_point = manual_fork_point
+        elif auth_boundary > 0:
+            self.manual_fork_point = auth_boundary  # ✅ Fork at auth boundary by default
+        else:
+            self.manual_fork_point = None
         self.last_batch_execs = 0  # ✅ Track executions in last batch
         
         # Depth-first exploration mode configuration
@@ -325,9 +335,16 @@ class DynamicForkController:
             self._io_syscall_cache[cache_key] = io_syscalls
 
         # ✅ Manual Fork Point Override (Force specific entrance for authenticated fuzzing)
+        # IMPORTANT: keep the full post-auth IO list for deeper exploration levels.
+        # Only the ROOT fork point is forced to manual_fork_point; child levels continue
+        # from the next post-auth IO syscall so depth > 0 actually explores new ground.
         if self.manual_fork_point is not None:
-             alog(f"🎯 Applying Manual Fork Point Override: {self.manual_fork_point}", "DFC", "INFO")
-             io_syscalls = [self.manual_fork_point]
+            alog(f"🎯 Applying Manual Fork Point Override: {self.manual_fork_point}", "DFC", "INFO")
+            # Build the deeper exploration list: post-auth IO syscalls AFTER the fork point.
+            # These are used by _explore_at_checkpoint to recurse when new coverage is found.
+            post_auth_io = [idx for idx in io_syscalls if idx > self.manual_fork_point]
+            # Root entry: always start from manual_fork_point
+            io_syscalls = [self.manual_fork_point] + post_auth_io[:4]  # cap at 5 total
 
         if not io_syscalls:
             alog("No IO syscalls found, falling back to Havoc mode at fork point 0", "DFC", "WARN")
@@ -472,11 +489,18 @@ class DynamicForkController:
                                         trace_obj = None 
                                     
                                     # Log crash details to detector
+                                    _muts_i = mutations[i] if i < len(mutations) else mutations[0]
                                     is_unique = self.crash_detector.save_crash(
                                         result=result,
                                         trace=trace_obj,
-                                        mutations=mutations[i] if i < len(mutations) else mutations[0]
+                                        mutations=_muts_i
                                     )
+                                    if is_unique and self.triage_callback and trace_obj:
+                                        _muts_list = _muts_i if isinstance(_muts_i, list) else [_muts_i]
+                                        try:
+                                            self.triage_callback(trace_obj, _muts_list, result, crash_id=is_unique)
+                                        except Exception as _te:
+                                            alog(f"triage_callback error: {_te}", "DFC", "WARN")
 
                                 if is_unique and self.fuzzing_stats:
                                     self.fuzzing_stats.crashes_found += 1
@@ -671,11 +695,18 @@ class DynamicForkController:
                     # ✅ Update global counter for UI ONLY IF NOT DUPLICATE
                     is_unique = False
                     if self.crash_detector:
+                        _ck_trace = checkpoint.trace_file if isinstance(checkpoint.trace_file, Trace) else self.current_trace
                         is_unique = self.crash_detector.save_crash(
                             result=result,
-                            trace=checkpoint.trace_file if isinstance(checkpoint.trace_file, Trace) else self.current_trace,
+                            trace=_ck_trace,
                             mutations=next_mutation
                         )
+                        if is_unique and self.triage_callback and _ck_trace:
+                            _muts_list = next_mutation if isinstance(next_mutation, list) else [next_mutation]
+                            try:
+                                self.triage_callback(_ck_trace, _muts_list, result, crash_id=is_unique)
+                            except Exception as _te:
+                                alog(f"triage_callback error (ck): {_te}", "DFC", "WARN")
 
                     if is_unique and self.fuzzing_stats:
                         self.fuzzing_stats.crashes_found += 1
@@ -894,16 +925,35 @@ class DynamicForkController:
         # ✅ Collect IO syscalls and their metadata
         io_candidates = []
 
+        # Build network_fd_map once for filtering (avoids re-attr lookup in inner loop)
+        _net_fd_map = getattr(self.mutator, 'syscall_network_fd_map', None) or {}
+
         for sc in analyzer.syscalls:
             # Only consider IO syscalls
             if sc.name in PRIMARY_IO_SYSCALLS:
+                # Skip reads on non-network fds (e.g. cert/key file reads) when we have
+                # fd tracking data.  These give 0 results as fork_points because the QEMU
+                # fork mechanism only reliably replays from network-socket reads post-auth.
+                if _net_fd_map and sc.name in ('read', 'recv', 'recvfrom', 'readv'):
+                    if not _net_fd_map.get(sc.index, True):
+                        continue  # file-fd read — unreliable as fork_point
+
                 # ✅ Calculate priority score
                 priority_score = 0
-                
-                # Penalize early syscalls (initialization phase) instead of strictly skipping them
+
+                # Penalize early syscalls (initialization phase)
                 if sc.index < len(analyzer.syscalls) * 0.1:
                     priority_score -= 20
 
+                # ✅ auth_boundary-aware scoring:
+                # Syscalls after auth_boundary are the primary target — huge bonus.
+                # Syscalls before auth_boundary are allowed but penalized heavily
+                # (they are pre-auth and mutating them breaks authentication).
+                if self.auth_boundary > 0:
+                    if sc.index <= self.auth_boundary:
+                        priority_score -= 500  # Effectively excluded when auth_boundary set
+                    else:
+                        priority_score += 300  # Strong preference for post-auth
 
                 # 1. Syscall type priority
                 if sc.name in ['read', 'recv', 'recvfrom']:

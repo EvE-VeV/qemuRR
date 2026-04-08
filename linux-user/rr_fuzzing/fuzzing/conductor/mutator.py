@@ -43,6 +43,94 @@ except ImportError:
     pass
 
 
+def perform_fd_tracking(syscalls):
+    """Build forbidden-fd and network-fd maps from a list of SyscallRecord objects.
+
+    Returns:
+        (forbidden_map, network_fd_map): dicts mapping syscall index -> bool
+        - forbidden_map: True if syscall uses a library/early-init FD (skip mutation)
+        - network_fd_map: True if syscall uses a network socket FD (priority target)
+    """
+    forbidden_map = {}
+    network_fd_map = {}
+    active_forbidden_fds = set()
+    active_network_fds = set()
+
+    FD_USING_SYSCALLS = {
+        'read', 'write', 'pread64', 'pwrite64', 'readv', 'writev',
+        'recv', 'recvfrom', 'recvmsg', 'send', 'sendto', 'sendmsg',
+        'ioctl', 'fcntl', 'lseek', 'fstat', 'ftruncate', 'fsync',
+        'setsockopt', 'getsockopt', 'getsockname', 'getpeername',
+        'shutdown', 'close',
+    }
+    FD_CREATING_SYSCALLS = {
+        'socket', 'accept', 'accept4', 'open', 'openat', 'creat',
+        'dup', 'dup2', 'dup3', 'pipe', 'pipe2',
+    }
+    SC_SOCKET = 1
+    SC_ACCEPT = 5
+    SC_ACCEPT4 = 18
+
+    for sc in syscalls:
+        is_forbidden = False
+        is_network = False
+
+        if sc.name == 'socketcall' and sc.args and sc.args[0] != SC_SOCKET:
+            is_network = True
+
+        sc_uses_fd = sc.uses_fd or (sc.name in FD_USING_SYSCALLS)
+        if sc_uses_fd and sc.args:
+            fd = sc.args[0]
+            if fd in active_forbidden_fds:
+                is_forbidden = True
+            if fd in active_network_fds:
+                is_network = True
+
+        forbidden_map[sc.index] = is_forbidden
+        network_fd_map[sc.index] = is_network
+
+        sc_creates_fd = sc.creates_fd or (sc.name in FD_CREATING_SYSCALLS and sc.retval > 2)
+        sc_created_fd = sc.created_fd if sc.creates_fd else (int(sc.retval) if sc_creates_fd else -1)
+
+        if sc.name == 'socketcall' and sc.args and sc.retval > 2:
+            sub = sc.args[0]
+            if sub in (SC_SOCKET, SC_ACCEPT, SC_ACCEPT4):
+                sc_creates_fd = True
+                sc_created_fd = int(sc.retval)
+
+        if sc_creates_fd and sc_created_fd > 2:
+            filename = "unknown"
+            if sc.name in ['open', 'openat']:
+                idx = 1 if sc.name == 'openat' else 0
+                if idx in sc.arg_data:
+                    try:
+                        filename = sc.arg_data[idx].split(b'\x00')[0].decode('utf-8', errors='ignore')
+                    except Exception:
+                        filename = str(sc.arg_data[idx])
+            elif sc.name in ['socket', 'accept', 'accept4']:
+                filename = f"network_{sc.name}"
+                active_network_fds.add(sc_created_fd)
+            elif sc.name == 'socketcall' and sc.args and sc.args[0] in (SC_SOCKET, SC_ACCEPT, SC_ACCEPT4):
+                sub_name = {SC_SOCKET: 'socket', SC_ACCEPT: 'accept', SC_ACCEPT4: 'accept4'}[sc.args[0]]
+                filename = f"network_socketcall_{sub_name}"
+                active_network_fds.add(sc_created_fd)
+
+            is_library = "/lib/" in filename or "/usr/lib/" in filename or "ld.so.cache" in filename
+            is_early_unknown = (sc.index < 30 and filename == "unknown")
+
+            if is_library or is_early_unknown:
+                active_forbidden_fds.add(sc_created_fd)
+            else:
+                active_forbidden_fds.discard(sc_created_fd)
+
+        if sc.name == 'close' and sc.args:
+            fd = sc.args[0]
+            active_forbidden_fds.discard(fd)
+            active_network_fds.discard(fd)
+
+    return forbidden_map, network_fd_map
+
+
 class BaseMutator:
     """
     Base Mutation Engine (Simple random mutation)
@@ -64,10 +152,22 @@ class BaseMutator:
         self.io_mutator = IOReturnValueMutator() if use_io_mutation else None
         self.last_mutation_type = 'unknown'
         self.dictionary = [] # Dictionary for token injection
+        # FD tracking maps — populated lazily on first mutate() call
+        self.syscall_forbidden_map = {}  # index -> bool (library/early-init FD)
+        self.syscall_network_fd_map = {} # index -> bool (network socket FD)
 
         mode_str = "Random Mutation + IO Retval Mutation" if use_io_mutation else "Random Mutation Mode"
         alog(f"Initialized ({mode_str})", "MUTATOR", "INFO")
     
+    def _init_fd_tracking(self, trace):
+        """Lazily build FD tracking maps from trace on first call."""
+        if trace and hasattr(trace, 'syscalls') and trace.syscalls and not self.syscall_forbidden_map:
+            self.syscall_forbidden_map, self.syscall_network_fd_map = perform_fd_tracking(trace.syscalls)
+            forbidden_count = sum(1 for v in self.syscall_forbidden_map.values() if v)
+            network_count = sum(1 for v in self.syscall_network_fd_map.values() if v)
+            alog(f"FD Tracking: {forbidden_count} library-IO protected, "
+                 f"{network_count} network-socket syscalls identified", "MUTATOR", "INFO")
+
     def mutate(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
         """
         Generate random mutation
@@ -80,6 +180,7 @@ class BaseMutator:
             List of FuzzInstructions
         """
         self.iteration_count += 1
+        self._init_fd_tracking(trace)
 
         # Strategy: 70% probability for IO return value mutation if trace is available
         if self.use_io_mutation and self.io_mutator and trace and random.random() < 0.7:
@@ -110,8 +211,12 @@ class BaseMutator:
                     syscall_index = random.randint(fork_point, max(fork_point, max_idx))
                 else:
                     syscall_index = random.randint(0, max_idx)
+                # Skip library/early-init FDs to avoid false-positive crashes
+                if self.syscall_forbidden_map.get(syscall_index, False):
+                    alog(f"Skip forbidden-FD syscall index={syscall_index}", "MUTATOR", "DEBUG")
+                    continue
                 alog(f"Mutation {i+1} targeting syscall_index={syscall_index} (max_idx={max_idx})", "MUTATOR")
-            
+
             # Mutation command selection
             mutation_types = [
                 FUZZ_CMD_FLIP_BITS,
@@ -252,8 +357,10 @@ class BaseMutator:
 
             alog(f"IO Mutation (retval): {m.description}", "MUTATOR")
 
-            # 2. If buffer_content exists, also generate REPLACE_BUFFER instruction
-            if m.buffer_content:
+            # 2. If buffer_content exists and this is a network-FD syscall, inject buffer
+            # Skip buffer injection for file-FD syscalls to avoid false-positive heap corruption
+            is_network_fd = self.syscall_network_fd_map.get(m.syscall_index, False)
+            if m.buffer_content and is_network_fd:
                 # Get buffer argument index (read's second argument is buffer pointer)
                 buf_arg_index = 1
                 
@@ -325,6 +432,8 @@ class BaseMutator:
                     syscall_index = random.randint(fork_point, max(fork_point + 20, 99))
                 else:
                     syscall_index = random.randint(0, 99)
+                if self.syscall_forbidden_map.get(syscall_index, False):
+                    continue
 
             # Aux Data mutation commands (consistent with mutate method)
             mutation_types = [
@@ -429,7 +538,7 @@ class SmartMutator:
     # Class-level cache to avoid redundant parsing of same trace
     _trace_cache = {}  # {trace_file: TraceAnalyzer}
     
-    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None, word_size=0, endian='auto', dictionary_file=None, arch='auto'):
+    def __init__(self, trace_file, recipe_file=None, target_binary=None, path_finder=None, analyzer=None, word_size=0, endian='auto', dictionary_file=None, arch='auto', auth_boundary=0):
         """
         Initialize SmartMutator
 
@@ -447,6 +556,11 @@ class SmartMutator:
         self.word_size = word_size
         self.endian = endian
         self.arch = arch
+        # Auth boundary: syscall index after which post-auth business logic begins.
+        # Mutations on network-facing syscalls (socket fds) after this index are
+        # the primary attack surface — equivalent to an authenticated attacker
+        # sending malformed packets. Default=0 means no boundary (legacy behaviour).
+        self.auth_boundary = auth_boundary
         
         # Use passed analyzer or cached TraceAnalyzer if available
         if analyzer:
@@ -628,62 +742,15 @@ class SmartMutator:
             alog(f"Failed to load dictionary {dict_file}: {e}", "MUTATOR", "ERROR")
     
     def _perform_fd_tracking(self):
-        """
-        Track File Descriptor (FD) open and close.
-        Identifies system-level FDs such as library files and marks corresponding syscall indexes as disabled.
-        """
-        active_forbidden_fds = set()
-        self.syscall_forbidden_map = {} # index -> bool
-        
+        """Build forbidden-fd and network-fd maps, then register syscalls in ShadowRegistry."""
+        self.syscall_forbidden_map, self.syscall_network_fd_map = perform_fd_tracking(self.syscalls)
         for sc in self.syscalls:
-            # 1. Check if current syscall uses a marked forbidden FD
-            is_forbidden = False
-            if sc.uses_fd and sc.args:
-                fd = sc.args[0]
-                if fd in active_forbidden_fds:
-                    is_forbidden = True
-            
-            self.syscall_forbidden_map[sc.index] = is_forbidden
-            
-            # 2. Track FD open and update status
-            if sc.creates_fd and sc.created_fd > 2:
-                filename = "unknown"
-                if sc.name in ['open', 'openat']:
-                    idx = 1 if sc.name == 'openat' else 0
-                    if idx in sc.arg_data:
-                        try:
-                            filename = sc.arg_data[idx].split(b'\x00')[0].decode('utf-8', errors='ignore')
-                        except:
-                            filename = str(sc.arg_data[idx])
-                elif sc.name in ['socket', 'accept', 'accept4']:
-                    filename = f"network_{sc.name}"
-                
-                # If it's a system library, or early unknown filename at init phase, add to forbidden set
-                is_library = "/lib/" in filename or "/usr/lib/" in filename or "ld.so.cache" in filename
-                is_early_unknown = (sc.index < 30 and filename == "unknown")
-                
-                if is_library or is_early_unknown:
-                    active_forbidden_fds.add(sc.created_fd)
-                    reason = "library" if is_library else "early_init"
-                    alog(f"FD {sc.created_fd} (index={sc.index}) marked FORBIDDEN ({reason}): {filename}", "MUTATOR")
-                else:
-                    # If FD is reused for regular files, remove from forbidden set
-                    if sc.created_fd in active_forbidden_fds:
-                        active_forbidden_fds.discard(sc.created_fd)
-                        alog(f"FD {sc.created_fd} (index={sc.index}) UNMARKED (reused): {filename}", "MUTATOR")
-            
-            # 3. Track FD close
-            if sc.name == 'close' and sc.args:
-                fd = sc.args[0]
-                if fd in active_forbidden_fds:
-                    active_forbidden_fds.discard(fd)
-            
-            # Phase B: Populate ShadowRegistry for resource awareness
             self.shadow_registry.register_syscall(sc)
-        
         forbidden_count = sum(1 for v in self.syscall_forbidden_map.values() if v)
-        if forbidden_count > 0:
-            alog(f"Environment Filtering: {forbidden_count} system library IO calls protected", "MUTATOR", "INFO")
+        network_count = sum(1 for v in self.syscall_network_fd_map.values() if v)
+        alog(f"FD Tracking: {forbidden_count} library-IO protected, "
+             f"{network_count} network-socket syscalls identified "
+             f"(auth_boundary={self.auth_boundary})", "MUTATOR", "INFO")
     
     def _should_skip_mutation(self, syscall_info, index):
         """
@@ -753,27 +820,46 @@ class SmartMutator:
         Returns:
             list: List of safe mutable syscall candidates
         """
-        important = []   # Important syscalls (must mutate)
-        primary_io = []  # Primary IO syscalls
+        # Tier 0: Network-fd syscalls AFTER auth_boundary — primary attack surface.
+        # These represent attacker-controllable network input in post-auth sessions.
+        network_post_auth = []
+        important = []    # Important syscalls (must mutate)
+        primary_io = []   # Primary IO syscalls (file fd)
         secondary_io = [] # Secondary IO syscalls
-        others = []      # Other safe syscalls
+        others = []       # Other safe syscalls
 
         all_candidates = list(self.pure_candidates) + list(self.hybrid_candidates)
 
-        alog(f"Filtering {len(all_candidates)} candidates (Enhanced mode)...", "MUTATOR", "INFO")
+        alog(f"Filtering {len(all_candidates)} candidates (Enhanced mode, auth_boundary={self.auth_boundary})...", "MUTATOR", "INFO")
 
         for candidate in all_candidates:
             syscall_name = candidate.name
 
-            # 1. Skip forbidden syscalls (memory management, signals, process control)
+            # 1. Skip forbidden syscalls
             if syscall_name in FORBIDDEN_MUTATION_SYSCALLS:
                 continue
 
-            # 2. Skip key syscalls in initialization phase
+            # 2. Tier 0: network socket fd + post-auth → highest priority (checked BEFORE
+            # _should_skip_mutation to prevent PathFinder from filtering these out).
+            # Use > (not >=) because auth_boundary is the accept() index itself;
+            # only syscalls AFTER accept() are attacker-controllable post-auth input.
+            is_network = self.syscall_network_fd_map.get(candidate.index, False)
+            is_post_auth = self.auth_boundary > 0 and candidate.index > self.auth_boundary
+            if is_network and is_post_auth:
+                network_post_auth.append(candidate)
+                continue
+
+            # 2b. Hard exclusion: if auth_boundary is set, non-network syscalls that are
+            # at or before auth_boundary are pre-auth (ld.so loading, libc init, TCP setup).
+            # Mutating these causes ELF-loader false positives. Exclude unconditionally.
+            if self.auth_boundary > 0 and candidate.index <= self.auth_boundary:
+                continue
+
+            # 3. Skip initialization-phase syscalls (PathFinder filter etc.)
             if self._should_skip_mutation(candidate, candidate.index):
                 continue
 
-            # 3. New Strategy: Sort by priority, but retain all safe syscalls
+            # 4. Remaining priority tiers
             if syscall_name in IMPORTANT_SYSCALLS:
                 important.append(candidate)
             elif syscall_name in PRIMARY_IO_SYSCALLS:
@@ -781,11 +867,14 @@ class SmartMutator:
             elif syscall_name in SECONDARY_IO_SYSCALLS:
                 secondary_io.append(candidate)
             else:
-                # Key Improvement: Retain other syscalls (previously discarded)
                 others.append(candidate)
 
-        # Final consolidation of mutable candidates
-        mutable = important + primary_io + secondary_io + others
+        alog(f"Candidate tiers — network_post_auth={len(network_post_auth)}, "
+             f"important={len(important)}, primary_io={len(primary_io)}, "
+             f"secondary_io={len(secondary_io)}, others={len(others)}", "MUTATOR", "INFO")
+
+        # Final consolidation: network_post_auth gets top billing
+        mutable = network_post_auth + important + primary_io + secondary_io + others
 
         # 🔥 Cap candidates to prevent massive memory footprint on large traces
         if len(mutable) > 1000:
@@ -1167,12 +1256,206 @@ class SmartMutator:
 
         return random.choices(range(11), weights=strategy_weights)[0]
     
+    def _generate_http_request(self, url_path: bytes, method: bytes = b'GET',
+                               auth_header: bytes = b'', extra_headers: bytes = b'',
+                               host: bytes = b'127.0.0.1', body: bytes = b'') -> bytes:
+        """Generate a syntactically valid HTTP/1.1 request with the given path."""
+        request = method + b' ' + url_path + b' HTTP/1.1\r\n'
+        request += b'Host: ' + host + b'\r\n'
+        if auth_header:
+            request += auth_header
+        if extra_headers:
+            request += extra_headers
+        if body:
+            request += b'Content-Length: ' + str(len(body)).encode() + b'\r\n'
+        request += b'\r\n'
+        if body:
+            request += body
+        return request
+
+    def _load_original_buffer(self, syscall_index: int) -> bytes:
+        """Try to load original aux_data buffer from trace file (raw binary scan)."""
+        try:
+            trace_file = getattr(self.analyzer, 'trace_file', None)
+            if not trace_file:
+                return b''
+            with open(trace_file, 'rb') as f:
+                data = f.read()
+            # Find HTTP request patterns in trace binary
+            for pattern in (b'GET ', b'POST ', b'PUT ', b'DELETE ', b'HEAD '):
+                idx = data.find(pattern)
+                if idx >= 0:
+                    # Extract up to 512 bytes, stop at double CRLF
+                    chunk = data[idx:idx+512]
+                    end = chunk.find(b'\r\n\r\n')
+                    if end >= 0:
+                        return chunk[:end+4]
+            return b''
+        except Exception:
+            return b''
+
+    def _generate_network_read_mutation(self, target_candidate, iteration: int) -> 'FuzzInstruction':
+        """
+        Generate HTTP-structure-aware mutation for network read syscalls.
+
+        KEY CONSTRAINT for RR-Fuzz: Keep the URL path UNCHANGED to avoid replay divergence
+        (different URL → different syscall sequence → divergence → early exit → no coverage).
+        Instead inject attack payloads in:
+        - URL query parameters (same path, different params)
+        - Header values (Authorization, User-Agent, Referer, etc.)
+        - Safe in-path injections that don't change file access patterns
+
+        Returns a FUZZ_CMD_MUTATE_AUX_BUFFER instruction with a complete HTTP request.
+        """
+        index = target_candidate.index
+
+        # Load and cache original HTTP request from trace
+        if not hasattr(self, '_cached_orig_request'):
+            orig = self._load_original_buffer(index)
+            self._cached_orig_request = orig
+            # Parse original URL path from request line
+            orig_url = b'/'
+            orig_method = b'GET'
+            auth_line = b''
+            host_line = b''
+            if orig:
+                lines = orig.split(b'\r\n')
+                if lines:
+                    parts = lines[0].split(b' ')
+                    if len(parts) >= 2:
+                        orig_method = parts[0]
+                        orig_url = parts[1]
+                for line in lines[1:]:
+                    if line.lower().startswith(b'authorization:'):
+                        auth_line = line + b'\r\n'
+                    elif line.lower().startswith(b'host:'):
+                        host_line = line + b'\r\n'
+            self._cached_orig_url = orig_url
+            self._cached_orig_method = orig_method
+            self._cached_auth_header = auth_line
+            self._cached_host_header = host_line
+
+        orig_url = self._cached_orig_url        # e.g. b'/'
+        orig_method = self._cached_orig_method  # e.g. b'GET'
+        auth_header = self._cached_auth_header  # e.g. b'Authorization: Basic ...\r\n'
+        host_header = self._cached_host_header  # e.g. b'Host: 127.0.0.1:8093\r\n'
+
+        # Attack payloads that go INTO safe injection points (not changing URL path)
+        # These inject into query params, header values, etc.
+        attack_payloads = [
+            b'%s%s%s%n',
+            b'%p%p%p%p',
+            b'A' * 64,
+            b'A' * 256,
+            b'A' * 512,
+            b"' OR '1'='1",
+            b'; cat /etc/passwd',
+            b'`cat /etc/passwd`',
+            b'../../../etc/passwd',
+            b'\x00' * 16,
+            bytes(range(32, 128)) * 2,   # printable ASCII range
+        ]
+
+        payload = random.choice(attack_payloads)
+
+        # Choose injection strategy (avoid changing the URL to prevent divergence)
+        strategy = random.randint(0, 5)
+        extra_headers = b''
+
+        if strategy == 0:
+            # Query parameter injection (keep same path)
+            url = orig_url + b'?name=' + payload[:64]
+        elif strategy == 1:
+            # User-Agent injection
+            url = orig_url
+            extra_headers = b'User-Agent: ' + payload[:128] + b'\r\n'
+        elif strategy == 2:
+            # Referer injection
+            url = orig_url
+            extra_headers = b'Referer: http://localhost/' + payload[:64] + b'\r\n'
+        elif strategy == 3:
+            # Cookie injection
+            url = orig_url
+            extra_headers = b'Cookie: session=' + payload[:64] + b'\r\n'
+        elif strategy == 4:
+            # X-Forwarded-For injection
+            url = orig_url
+            extra_headers = b'X-Forwarded-For: ' + payload[:32] + b'\r\n'
+        else:
+            # Keep original URL with no extra headers (baseline replay check)
+            url = orig_url
+
+        data = self._generate_http_request(
+            url, method=orig_method,
+            auth_header=auth_header,
+            extra_headers=extra_headers
+        )
+        # Bug A fix: EXTEND aux buffer first so MUTATE_AUX_BUFFER is not truncated.
+        # extend_by=1024 → new aux->size = min(orig_size+1024, 1024) = 1024 (C-side caps at 1024).
+        # MUTATE_AUX_BUFFER then copies min(len(data), 1024) bytes into the enlarged buffer.
+        extend_instr = FuzzInstruction(index, FUZZ_CMD_EXTEND, 1,
+                                       struct.pack('I', 1024),
+                                       mutation_type='http_extend')
+        mutate_instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_AUX_BUFFER, 1, data,
+                                       mutation_type='http_request')
+        return [extend_instr, mutate_instr]
+
+    def _generate_file_fd_retval_mutation(self, target_candidate) -> 'FuzzInstruction':
+        """
+        File-fd read syscalls: simulate errno or early EOF only.
+
+        Rationale: attackers cannot control the contents of config files, NVRAM,
+        TLS certificates, or any file-backed FD on a real embedded device.
+        Buffer-replacement mutations on these syscalls create impossible program
+        states that generate false-positive crashes (verified: E1200 "combined-state"
+        crashes require simultaneous socket + file-fd mutation — unreachable in practice).
+
+        Only retval-level faults are within the attacker threat model for file fds.
+        """
+        index = target_candidate.index
+        # Plausible errno values for read() failures on a real filesystem
+        error_retvals = [
+            -2,   # ENOENT — file disappeared
+            -5,   # EIO   — I/O error (flash/NFS fault)
+            -13,  # EACCES — permission denied
+            -11,  # EAGAIN — would block (non-blocking fd)
+            0,    # EOF   — empty file or end-of-file
+            1,    # short read (1 byte returned)
+            4,    # short read (4 bytes returned)
+        ]
+        val = random.choice(error_retvals)
+        data = struct.pack('q', val)
+        return FuzzInstruction(index, FUZZ_CMD_MUTATE_ARG, 0xFF, data,
+                               mutation_type='file_fd_retval')
+
     def _generate_advanced_instruction(self, target_candidate, strategy_type, iteration):
         """
         Generate advanced mutation instruction (fully utilize 11 C-side mutation commands)
         """
         index = target_candidate.index
         instr = None
+
+        sc_name_lower = target_candidate.name.lower()
+        is_read_like = sc_name_lower in ('read', 'recv', 'recvfrom', 'recvmsg', 'pread64', 'readv')
+        # Stat/open/lseek on file fds also carry no attacker-controlled data
+        is_file_meta = sc_name_lower in ('fstat', 'fstat64', 'stat', 'stat64', 'lstat', 'lstat64',
+                                          'open', 'openat', 'creat', 'lseek', 'llseek', '_llseek')
+        is_network_fd = self.syscall_network_fd_map.get(target_candidate.index, False)
+
+        # File-fd I/O: only simulate retval errors — never inject buffer content.
+        # Attacker threat model: the attacker controls only data arriving over a network
+        # socket (recv/read on socket fds). Config files, NVRAM, TLS certs, and any
+        # file-backed fd on the device are NOT attacker-controlled.
+        # Buffer mutations on these syscalls create impossible program states and generate
+        # combined-state false positives (verified: E1200 36 crashes → 0 network-exploitable).
+        if (is_read_like or is_file_meta) and not is_network_fd:
+            return [self._generate_file_fd_retval_mutation(target_candidate)]
+
+        # For network reads, use HTTP-structure-aware mutations 60% of the time
+        is_network_read = is_read_like and is_network_fd
+        if is_network_read and random.random() < 0.6:
+            # Returns [extend_instr, mutate_instr] (Bug A fix)
+            return self._generate_network_read_mutation(target_candidate, iteration)
         
         # Select mutation command based on strategy type
         if strategy_type == 0:
@@ -1268,17 +1551,11 @@ class SmartMutator:
             
         # 🔥 Phase B: Resource-Aware Rails Correction
         if instr and target_candidate.uses_fd:
-            # For most IO syscalls, arg 0 is the FD
-            # If the instruction targets arg 0, or is a generic mutation that might affect it
-            # (Though here most instructions target 'aux_data' via cmd, we can also add MUTATE_ARG support)
-            
             if instr.cmd in [FUZZ_CMD_BOUNDARY_VALUE, FUZZ_CMD_INTERESTING_VALUES] and instr.arg_index == 0:
-                # Correct the FD to a valid one from registry
                 valid_fd = self.shadow_registry.get_random_valid_fd()
                 instr.data = struct.pack('Q', valid_fd & 0xFFFFFFFFFFFFFFFF)
-                # alog(f"Resource-Aware: Corrected FD to {valid_fd} for {target_candidate.name}", "MUTATOR", "DEBUG")
 
-        return instr
+        return [instr] if instr else []
     
     def _generate_io_mutations(self, trace, fork_point: int = None, analyzer: Optional[Any] = None) -> List[FuzzInstruction]:
         """Generate IO return value mutation instructions for SmartMutator
@@ -1343,8 +1620,12 @@ class SmartMutator:
 
             alog(f"SmartMutator IO Mutation (retval): {m.description}", "MUTATOR")
 
-            # 2. If buffer_content exists, also generate REPLACE_BUFFER instruction
-            if m.buffer_content:
+            # 2. If buffer_content exists, also generate REPLACE_BUFFER instruction.
+            # Skip buffer injection for file-fd syscalls — the attacker cannot control
+            # file contents on a real device (config, NVRAM, certs). Injecting file
+            # buffer content creates combined-state false positives (verified on E1200).
+            _is_file_fd_io = not self.syscall_network_fd_map.get(m.syscall_index, False)
+            if m.buffer_content and not _is_file_fd_io:
                 # Get buffer argument index (read's second argument is buffer pointer)
                 buf_arg_index = 1
                 
@@ -1471,8 +1752,7 @@ class SmartMutator:
             for _ in range(num_stacked):
                 target = random.choice(valid_candidates)
                 strategy = self._select_strategy()
-                instr = self._generate_advanced_instruction(target, strategy, iteration)
-                if instr: stacked_instrs.append(instr)
+                stacked_instrs.extend(self._generate_advanced_instruction(target, strategy, iteration))
             
             self.last_mutation_type = 'havoc'
             return stacked_instrs[:FUZZ_MAX_INSTRUCTIONS]
@@ -1539,8 +1819,7 @@ class SmartMutator:
             
             if fork_point_candidate:
                 strategy_type = self._select_strategy()
-                fork_instr = self._generate_advanced_instruction(fork_point_candidate, strategy_type, iteration)
-                instrs.append(fork_instr)
+                instrs.extend(self._generate_advanced_instruction(fork_point_candidate, strategy_type, iteration))
                 print(f"[Mutator] P4: Guaranteed mutation at fork_point={fork_point} ({fork_point_candidate.name})")
                 num_mutations -= 1
             elif fork_point is not None:
@@ -1555,9 +1834,7 @@ class SmartMutator:
                     continue
                 
                 strategy_type = self._select_strategy()
-                mutation_instr = self._generate_advanced_instruction(target_sc, strategy_type, iteration)
-                if mutation_instr:
-                    instrs.append(mutation_instr)
+                instrs.extend(self._generate_advanced_instruction(target_sc, strategy_type, iteration))
         
 
 

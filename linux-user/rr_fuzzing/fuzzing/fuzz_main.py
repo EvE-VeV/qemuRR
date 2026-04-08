@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 import sys
 import os
+import signal
 import argparse
+import resource
 from pathlib import Path
+
+# Hard memory limit: 12GB per fuzzer process — prevent OOM killer from hitting unrelated processes
+try:
+    _MEM_LIMIT = 12 * 1024 ** 3
+    resource.setrlimit(resource.RLIMIT_AS, (_MEM_LIMIT, _MEM_LIMIT))
+except Exception:
+    pass
 
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
@@ -11,11 +20,29 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 from conductor.fuzzing_core import FuzzingCore
 from conductor.mutator import SmartMutator
 
+_fuzzing_core_ref = None
+
+def _sigterm_handler(signum, frame):
+    """Ensure QEMU children are killed when timeout(1) sends SIGTERM."""
+    if _fuzzing_core_ref is not None:
+        try:
+            _fuzzing_core_ref.cleanup()
+        except Exception:
+            pass
+    sys.exit(128 + signum)
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
 def main():
     parser = argparse.ArgumentParser(description="RR-Fuzz: Universal QEMU Fuzzer")
     parser.add_argument("--qemu", required=True, help="Path to QEMU binary")
     parser.add_argument("--target", required=True, help="Path to target binary")
-    parser.add_argument("--trace", required=True, help="Path to initial trace file")
+    parser.add_argument("--trace", default="", help="Path to initial trace file (single seed)")
+    parser.add_argument("--traces", nargs="+", metavar="TRACE",
+                        help="One or more seed trace files (multi-seed corpus mode). "
+                             "Overrides --trace. The fuzzer rotates through all seeds.")
+    parser.add_argument("--trace-dir", metavar="DIR",
+                        help="Directory of *.trace files to use as seeds (auto-discovered).")
     parser.add_argument("--output", default="fuzzing_output", help="Output directory")
     parser.add_argument("--iterations", type=int, default=1000, help="Max iterations")
     parser.add_argument("--infinite", action="store_true", help="Run indefinitely")
@@ -31,45 +58,65 @@ def main():
     parser.add_argument("--fork-point", type=int, help="Manual fork point index (overrides DFC logic)")
     
     # Ablation Study Flags
+    parser.add_argument("--disable-dfc", action="store_true", help="Disable DynamicForkController (ablation V0/V1)")
     parser.add_argument("--disable-smartdict", action="store_true", help="Disable SmartMutator (use BaseMutator instead)")
     parser.add_argument("--disable-pathfinder", action="store_true", help="Disable PathFinder guided execution")
+    parser.add_argument("--auth-boundary", type=int, default=0,
+                        help="Syscall index marking end of auth phase. Mutations on network-fd "
+                             "syscalls after this index are prioritised as the primary attack "
+                             "surface (post-auth network input). Default=0 (disabled).")
     
     args = parser.parse_args()
-    
+
+    # ── Resolve seed traces ──────────────────────────────────────────────────
+    # Priority: --traces > --trace-dir > --trace
+    all_traces: list[str] = []
+    if args.traces:
+        all_traces = [str(Path(t).resolve()) for t in args.traces if Path(t).exists()]
+    elif args.trace_dir:
+        d = Path(args.trace_dir)
+        all_traces = sorted(str(p) for p in d.glob("*.trace") if p.is_file())
+        if not all_traces:
+            print(f"[!] No *.trace files found in {args.trace_dir}", file=sys.stderr)
+            sys.exit(1)
+    elif args.trace:
+        all_traces = [args.trace]
+    else:
+        print("[!] Specify at least one of --trace, --traces, or --trace-dir", file=sys.stderr)
+        sys.exit(1)
+
+    primary_trace = all_traces[0]
+    if len(all_traces) > 1:
+        print(f"[*] Multi-seed mode: {len(all_traces)} traces loaded")
+        for i, t in enumerate(all_traces):
+            print(f"    [{i}] {t}")
+
+    global _fuzzing_core_ref
     fuzzing_core = None
     try:
-        # [NEW] Derive target architecture from QEMU path for consistent mapping
-        arch = 'auto'
-        qemu_name = os.path.basename(args.qemu).lower()
-        if 'aarch64' in qemu_name:
-            arch = 'arm64'
-        elif 'arm' in qemu_name:
-            arch = 'arm'
-        elif 'mips' in qemu_name:
-            arch = 'mips'
-        elif 'x86_64' in qemu_name:
-            arch = 'x86_64'
-        elif 'i386' in qemu_name:
-            arch = 'i386'
-            
+        # Use FuzzingCore._derive_arch() for consistent arch detection
+        arch = FuzzingCore._derive_arch(args.qemu)
+
         # Initialize Core
         if args.disable_smartdict:
             from conductor.mutator import BaseMutator
             mutator = BaseMutator()
         else:
             mutator = SmartMutator(
-                args.trace, 
+                primary_trace,
                 target_binary=args.target,
                 word_size=args.word_size,
                 endian=args.endian,
                 dictionary_file=args.dictionary,
-                arch=arch  # Pass derived arch
+                arch=arch,
+                auth_boundary=args.auth_boundary,
             )
-        
-        fuzzing_core = FuzzingCore(
+
+        fuzzing_core = _fuzzing_core_ref = FuzzingCore(
             qemu_path=args.qemu,
             target_binary=args.target,
-            initial_trace=args.trace,
+            initial_trace=primary_trace,
+            extra_seed_traces=all_traces[1:],   # additional seeds for rotation
             output_dir=args.output,
             mutator=mutator,
             use_fork_server=True,  # Internal design: high-speed fork server
@@ -77,7 +124,10 @@ def main():
             target_args=args.args,
             enable_tree_viz=args.tree,
             ld_prefix=args.ld_prefix,
-            manual_fork_point=args.fork_point
+            manual_fork_point=args.fork_point,
+            enable_dfc=not args.disable_dfc,
+            enable_pathfinder=not args.disable_pathfinder,
+            auth_boundary=args.auth_boundary  # ✅ FIX: pass through so FuzzingCore can preserve it
         )
         
         # Multi-Process Mode
