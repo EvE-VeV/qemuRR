@@ -51,6 +51,7 @@ extern char *g_rr_trace_path;
 #define STATUS_CRASH         4
 #define STATUS_OTHER_SIGNAL  5
 #define STATUS_TIMEOUT       6
+#define STATUS_NEED_RESTART  7  /* Parent overshot fork_point; Python must restart QEMU */
 
 // Fork point configuration
 static char *g_fork_syscall_name = NULL;      // Target syscall name
@@ -1132,10 +1133,16 @@ int rr_fork_server_loop(void)
                         /* Parent already at or past fork_point, fork immediately! */
                         RR_INFO("Parent already at fork_point %u, verifying consistency...", fork_point);
                         
-                        /* Ideally we should be exactly at fork_point. If > fork_point, we overshot. */
+                        /* If parent has already passed fork_point, we cannot replay backwards.
+                         * Signal Python to restart QEMU with a fresh replay from the start. */
                         if (current_index > fork_point) {
-                             RR_WARN("Parent overshot target! current=%u, target=%u. "
-                                     "Continuing anyway (may miss mutations)", current_index, fork_point);
+                            RR_WARN("Parent overshot fork_point (current=%u > target=%u). "
+                                    "Sending NEED_RESTART to Python.", current_index, fork_point);
+                            /* Send one NEED_RESTART per expected variant so Python drains correctly */
+                            for (int _i = 0; _i < num_variants; _i++) {
+                                rr_ipc_send_status(STATUS_NEED_RESTART);
+                            }
+                            break;
                         }
                     }
                     

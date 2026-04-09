@@ -197,6 +197,72 @@ static int apply_mutations_for_syscall(CPUArchState *env, uint32_t syscall_index
                 }
                 break;
 
+            case FUZZ_CMD_TRUNCATE:
+                /* Reduce retval to simulate a shorter read/recv, causing
+                 * the program to process fewer bytes than originally recorded. */
+                if (instr->data_len >= sizeof(int32_t)) {
+                    int32_t trunc_size = *(int32_t *)instr->data;
+                    if (trunc_size >= 0) {
+                        g_retval_override = (abi_long)trunc_size;
+                        g_has_retval_override = true;
+                        g_fuzz_stats.retval_mutations++;
+                        FUZZ_DEBUG_LOG("[TRUNCATE] retval → %d\n", trunc_size);
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_EXTEND:
+                /* Inflate retval to simulate more data received, potentially
+                 * causing the program to read past a legitimate buffer boundary. */
+                if (instr->data_len >= sizeof(int32_t)) {
+                    int32_t ext_size = *(int32_t *)instr->data;
+                    if (ext_size > 0) {
+                        g_retval_override = (abi_long)ext_size;
+                        g_has_retval_override = true;
+                        g_fuzz_stats.retval_mutations++;
+                        FUZZ_DEBUG_LOG("[EXTEND] retval → %d\n", ext_size);
+                    }
+                }
+                break;
+
+            case FUZZ_CMD_INTERESTING_VALUES:
+                /* Inject a boundary/magic value into an argument or retval.
+                 * Payload is a single int64_t (e.g. -1, 0, INT_MAX, UINT_MAX). */
+                if (instr->data_len >= sizeof(int64_t)) {
+                    int64_t interesting = *(int64_t *)instr->data;
+                    if (instr->arg_index == 0xFF) {
+                        g_retval_override = (abi_long)interesting;
+                        g_has_retval_override = true;
+                    } else if (instr->arg_index < 6) {
+                        args[instr->arg_index] = (abi_long)interesting;
+                    }
+                    g_fuzz_stats.arg_mutations++;
+                    FUZZ_DEBUG_LOG("[INTERESTING_VALUES] arg[%u] = %ld\n",
+                        instr->arg_index, (long)interesting);
+                }
+                break;
+
+            case FUZZ_CMD_LIGHT_MUTATION:
+                /* Flip a single byte at a given offset within the buffer —
+                 * minimal disturbance useful for coverage-guided refinement. */
+                {
+                    target_ulong addr = args[instr->arg_index];
+                    if (addr != 0 && instr->data_len >= 2) {
+                        uint32_t offset   = (uint32_t)instr->data[0];
+                        uint8_t flip_mask = instr->data[1];
+                        uint8_t orig_byte = 0;
+                        if (cpu_memory_rw_debug(env_cpu(env), addr + offset, &orig_byte, 1, 0) == 0) {
+                            orig_byte ^= flip_mask;
+                            if (cpu_memory_rw_debug(env_cpu(env), addr + offset, &orig_byte, 1, 1) == 0) {
+                                has_buffer_mutation = 1;
+                                g_fuzz_stats.buffer_mutations++;
+                                FUZZ_DEBUG_LOG("[LIGHT_MUTATION] byte@+%u ^= 0x%02x\n", offset, flip_mask);
+                            }
+                        }
+                    }
+                }
+                break;
+
             case FUZZ_CMD_MUTATE_FLAGS:
                 if (instr->data_len >= sizeof(uint64_t)) {
                     uint64_t flag_mask = *(uint64_t *)instr->data;

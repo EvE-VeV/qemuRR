@@ -32,6 +32,7 @@ STATUS_NORMAL_EXIT = 3
 STATUS_CRASH = 4
 STATUS_OTHER_SIGNAL = 5
 STATUS_TIMEOUT = 6
+STATUS_NEED_RESTART = 7  # Parent overshot fork_point; must restart QEMU
 
 
 @dataclass
@@ -1114,15 +1115,17 @@ class QEMUExecutor:
         with self._lock:
             start_time = time.time()
             
-            # 🔥 CRITICAL FIX: Each fork execution MUST use a fresh QEMU process
-            # ... (truncated comments for brevity in multi_replace, keeping logic)
+            # Reuse the running QEMU fork-server process across fork_point changes.
+            # The C-side 'C' handler advances replay_index to fork_point when
+            # current_index < fork_point, so no restart is needed in that case.
+            # Only restart when QEMU has died (poll() != None) or when the requested
+            # fork_point is behind the parent's current replay position (overshoot),
+            # which is detected by the C side returning STATUS_NEED_RESTART.
             if self._qemu_ready:
-                # ✅ OPTIMIZATION: Reuse QEMU if fork_point matches
-                if self._last_fork_point == fork_point:
-                     pass
-                else:
-                    print(f"[QEMUExecutor] 🔄 Restarting QEMU for fresh fork state (fork_point={fork_point}, depth={depth})")
+                if self.qemu_process and self.qemu_process.poll() is not None:
+                    alog(f"QEMU exited unexpectedly, restarting (fork_point={fork_point})", "EXEC", "WARN")
                     self.stop_persistent_qemu()
+                # else: keep alive — C fork-server loop handles the new fork_point
             
             # Initialize fork server (if not already initialized)
             if not self._qemu_ready:
@@ -1190,10 +1193,21 @@ class QEMUExecutor:
                     
                     # Unpack status and crash details
                     status, exit_code, signal_number = result_data
-                    
+
+                    # Parent overshot fork_point — drain remaining variants then restart
+                    if status == STATUS_NEED_RESTART:
+                        alog(f"NEED_RESTART received (fork_point={fork_point}): "
+                             f"draining {len(mutation_variants) - variant_idx - 1} remaining slots", "EXEC", "WARN")
+                        # Drain the remaining slots that C already sent NEED_RESTART for
+                        for _ in range(len(mutation_variants) - variant_idx - 1):
+                            self._wait_for_status(timeout=2.0)
+                        self.stop_persistent_qemu()
+                        self._qemu_ready = False
+                        break
+
                     # Read coverage
                     coverage_bitmap = self._read_coverage()
-                    
+
                     # Mapping status and creating result
                     status_map = {
                         STATUS_NORMAL_EXIT: "normal_exit",
@@ -1202,7 +1216,7 @@ class QEMUExecutor:
                         STATUS_AT_FORK_POINT: "fork_point_ready",
                         2: "batch_completed"
                     }
-                    
+
                     if status == 3:
                         status_name = "normal_exit"
                     else:
