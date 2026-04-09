@@ -310,6 +310,14 @@ class DynamicForkController:
 
         alog(f"🌊 Iteration {iteration_id}: Dynamic Multi-Fork on {trace.id}", "DFC", "INFO")
 
+        # Reset QEMU replay position at the start of each top-level sweep so
+        # the monotonically-increasing fork_point sweep (auth_boundary → deeper
+        # IO syscalls) never triggers a NEED_RESTART mid-sweep.
+        if hasattr(self.executor, '_qemu_replay_pos') and self.executor._qemu_replay_pos > 0:
+            alog(f"Resetting QEMU for fresh sweep (prev pos={self.executor._qemu_replay_pos})", "DFC", "DEBUG")
+            self.executor.stop_persistent_qemu()
+            self.executor._qemu_replay_pos = 0
+
         # Execute multiple mutations from root trace once
         alog("Starting multi-fork exploration from root trace", "DFC", "DEBUG")
         return self._start_depth_exploration(trace, iteration_id)

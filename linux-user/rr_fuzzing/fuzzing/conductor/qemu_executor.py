@@ -121,7 +121,8 @@ class QEMUExecutor:
         self.qemu_pid: Optional[int] = None
         self._qemu_ready = False  # Track if QEMU is in fork server loop
         self._trace_file = None   # Remember trace file for persistent mode
-        self._last_fork_point = -1 # Track last fork point for reuse optimization
+        self._last_fork_point = -1  # Track last fork point for reuse optimization
+        self._qemu_replay_pos = 0   # Estimated QEMU parent replay position after last fork
         
         # ✅ Thread safety: protect IPC and process state
         self._lock = threading.RLock()
@@ -1117,15 +1118,21 @@ class QEMUExecutor:
             
             # Reuse the running QEMU fork-server process across fork_point changes.
             # The C-side 'C' handler advances replay_index to fork_point when
-            # current_index < fork_point, so no restart is needed in that case.
-            # Only restart when QEMU has died (poll() != None) or when the requested
-            # fork_point is behind the parent's current replay position (overshoot),
-            # which is detected by the C side returning STATUS_NEED_RESTART.
+            # current_index < fork_point — no restart needed in that case.
+            # Proactively restart when fork_point goes backwards (avoid the slow
+            # NEED_RESTART round-trip: send 'C' → C detects overshoot → sends
+            # STATUS_NEED_RESTART back → Python restarts anyway).
             if self._qemu_ready:
                 if self.qemu_process and self.qemu_process.poll() is not None:
                     alog(f"QEMU exited unexpectedly, restarting (fork_point={fork_point})", "EXEC", "WARN")
                     self.stop_persistent_qemu()
-                # else: keep alive — C fork-server loop handles the new fork_point
+                    self._qemu_replay_pos = 0
+                elif fork_point < self._qemu_replay_pos:
+                    alog(f"fork_point {fork_point} < current pos {self._qemu_replay_pos}: "
+                         f"proactive restart (avoids NEED_RESTART round-trip)", "EXEC", "DEBUG")
+                    self.stop_persistent_qemu()
+                    self._qemu_replay_pos = 0
+                # else: fork_point >= current pos, QEMU advances in-place
             
             # Initialize fork server (if not already initialized)
             if not self._qemu_ready:
@@ -1161,7 +1168,9 @@ class QEMUExecutor:
                 iteration_id=iteration_id
             )
             
-            # Update last fork point
+            # Update last fork point and estimated replay position
+            # After forking at fork_point, the parent stays at fork_point in the trace.
+            self._qemu_replay_pos = fork_point
             self._last_fork_point = fork_point
             
             # Send unified command: 'C'
