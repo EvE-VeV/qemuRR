@@ -1130,8 +1130,13 @@ class QEMUExecutor:
                 elif fork_point < self._qemu_replay_pos:
                     alog(f"fork_point {fork_point} < current pos {self._qemu_replay_pos}: "
                          f"proactive restart (avoids NEED_RESTART round-trip)", "EXEC", "DEBUG")
+                    _wd = getattr(self, '_watchdog', None)
+                    if _wd:
+                        _wd.suppress()
                     self.stop_persistent_qemu()
                     self._qemu_replay_pos = 0
+                    if _wd:
+                        _wd.resume()
                 # else: fork_point >= current pos, QEMU advances in-place
             
             # Initialize fork server (if not already initialized)

@@ -42,6 +42,7 @@ class FuzzingWatchdog:
         self.running = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._suppressed = False  # Set True during intentional QEMU resets
         
     def start(self):
         """Start monitoring thread"""
@@ -71,11 +72,25 @@ class FuzzingWatchdog:
     def kick(self):
         """Kick the dog: update last activity time"""
         self.last_activity = time.time()
-        
+
+    def suppress(self):
+        """Temporarily suppress Watchdog during intentional QEMU resets."""
+        self._suppressed = True
+        self.kick()  # Reset activity timer so stall detector doesn't fire
+
+    def resume(self):
+        """Resume Watchdog after intentional QEMU reset completes."""
+        self._suppressed = False
+        self.kick()
+
     def _monitor_loop(self):
         """Monitoring loop"""
         while self.running and not self._stop_event.is_set():
             try:
+                if self._suppressed:
+                    self._stop_event.wait(self.interval)
+                    continue
+
                 # 1. Check if Executor process exists
                 if not self.check_func():
                     alog("⚠️ QEMU process died unexpectedly!", "WATCHDOG", "WARN")

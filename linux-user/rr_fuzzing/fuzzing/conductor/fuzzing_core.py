@@ -555,8 +555,13 @@ class FuzzingCore:
             timeout_seconds=45,  # Optimized: (2s exec + 0.5s overhead) * 8 Havoc stacked * 2 safety factor
             check_interval=2     # Increased frequency to 2s
         )
-        alog(f"  Watchdog: Enabled (Timeout=30s)", "CORE", "INFO")
-        
+        alog(f"  Watchdog: Enabled (Timeout=45s)", "CORE", "INFO")
+        # Wire watchdog into DFC and executor so they can suppress during intentional QEMU resets
+        if self.dynamic_fork_controller:
+            self.dynamic_fork_controller._watchdog = self.watchdog
+        if self.execution_engine:
+            self.execution_engine._watchdog = self.watchdog
+
         # ✅ State Persistence (Checkpoint System)
         self.enable_persistence = enable_persistence
         self.checkpoint_manager = CheckpointManager(output_dir) if enable_persistence else None
@@ -672,7 +677,11 @@ class FuzzingCore:
 
     def _check_executor_alive(self) -> bool:
         """Watchdog callback: Check if QEMU process is alive"""
-        if self.execution_engine and self.execution_engine.process:
+        if not self.execution_engine:
+            return True  # No engine yet, not an error
+        if not self.execution_engine._qemu_ready:
+            return True  # Intentionally between QEMU instances (transitioning)
+        if self.execution_engine.process:
             return self.execution_engine.process.poll() is None
         return False
 
@@ -697,6 +706,9 @@ class FuzzingCore:
         # 🔥 CRITICAL FIX: Update DynamicForkController with the NEW executor
         if self.dynamic_fork_controller:
             self.dynamic_fork_controller.executor = self.execution_engine
+        # Re-wire watchdog so new executor can suppress during transitions
+        if self.watchdog:
+            self.execution_engine._watchdog = self.watchdog
             
         alog("QEMU Engine restarted by Watchdog", "CORE", "INFO")
     
@@ -1929,6 +1941,21 @@ class FuzzingCore:
                 if iteration > 0 and iteration % 50 == 0:
                     import subprocess, os
                     my_pid = os.getpid()
+                    # Collect direct children of this process so we never kill them
+                    try:
+                        _my_children = set()
+                        for _child_pid_str in os.listdir('/proc'):
+                            if not _child_pid_str.isdigit():
+                                continue
+                            try:
+                                _stat = open(f'/proc/{_child_pid_str}/status').read()
+                                _ppid = int(_stat.split('PPid:')[1].split()[0])
+                                if _ppid == my_pid:
+                                    _my_children.add(int(_child_pid_str))
+                            except Exception:
+                                pass
+                    except Exception:
+                        _my_children = set()
                     try:
                         _pgrep = subprocess.run(
                             ['pgrep', '-f', 'qemu-mips|qemu-arm|qemu-mipsel'],
@@ -1937,7 +1964,19 @@ class FuzzingCore:
                         qemu_pids = [int(p) for p in _pgrep.stdout.split() if p.strip()]
                         killed = 0
                         for qpid in qemu_pids:
+                            # Never kill ourselves or our direct children
+                            if qpid == my_pid or qpid in _my_children:
+                                continue
                             try:
+                                # Only kill actual QEMU processes (executable name starts with qemu-)
+                                # This prevents accidentally killing other fuzz_main.py instances
+                                # whose cmdline contains "qemu-mipsel" as an argument
+                                try:
+                                    exe_name = os.readlink(f'/proc/{qpid}/exe').split('/')[-1]
+                                    if not exe_name.startswith('qemu-'):
+                                        continue  # Skip non-QEMU processes
+                                except Exception:
+                                    continue  # Can't verify, skip to be safe
                                 ppid = int(open(f'/proc/{qpid}/status').read().split('PPid:')[1].split()[0])
                                 if ppid == 1:  # orphan adopted by init
                                     os.kill(qpid, 9)
