@@ -686,6 +686,27 @@ int rr_fork_server_loop(void)
                                 RR_INFO("Child variant %d: Queued TB flush for coverage instrumentation", variant_idx);
                             }
 
+                            /* Install SIGALRM handler to ensure child exits after timeout.
+                             * Persistent server targets (e.g. www) never exit voluntarily;
+                             * alarm() guarantees the variant terminates so the parent can
+                             * collect coverage and move on.  SIGALRM is treated as normal
+                             * exit by rr_classify_wait_status (not a crash signal).
+                             * QEMU blocks SIGALRM via pthread_sigmask (signalfd pattern),
+                             * so unblock it explicitly before arming. */
+                            {
+                                const unsigned int CHILD_TIMEOUT_SECS = 10;
+                                struct sigaction sa_alrm;
+                                memset(&sa_alrm, 0, sizeof(sa_alrm));
+                                sa_alrm.sa_handler = SIG_DFL;
+                                sigaction(SIGALRM, &sa_alrm, NULL);
+                                sigset_t unblock;
+                                sigemptyset(&unblock);
+                                sigaddset(&unblock, SIGALRM);
+                                sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+                                alarm(CHILD_TIMEOUT_SECS);
+                                RR_INFO("Child variant %d: set SIGALRM timeout=%us (unblocked)", variant_idx, CHILD_TIMEOUT_SECS);
+                            }
+
                             return 1;  // Continue execution
 
                         } else if (pid > 0) {
@@ -1361,7 +1382,25 @@ int rr_fork_server_loop(void)
                             // extern bool rr_strace_replay_enabled(void);
                             bool strace_enabled = rr_strace_replay_enabled();
                             RR_INFO("🔍 DEBUG: Child %d strace_replay_enabled=%d", variant_idx, strace_enabled);
-                            
+
+                            /* Variant timeout: persistent server targets never exit voluntarily.
+                             * After mutations diverge from the trace, native select/poll would
+                             * block forever.  SIGALRM with SIG_DFL terminates the child.
+                             * QEMU blocks SIGALRM in the main thread (signalfd pattern), so we
+                             * must unblock it here before arming alarm(). */
+                            {
+                                const unsigned int CHILD_TIMEOUT_SECS = 10;
+                                struct sigaction sa_alrm;
+                                memset(&sa_alrm, 0, sizeof(sa_alrm));
+                                sa_alrm.sa_handler = SIG_DFL;
+                                sigaction(SIGALRM, &sa_alrm, NULL);
+                                sigset_t unblock;
+                                sigemptyset(&unblock);
+                                sigaddset(&unblock, SIGALRM);
+                                sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+                                alarm(CHILD_TIMEOUT_SECS);
+                            }
+
                             return 1;
                             
                         } else if (pid > 0) {

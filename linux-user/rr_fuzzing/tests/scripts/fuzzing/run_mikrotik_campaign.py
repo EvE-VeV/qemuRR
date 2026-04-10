@@ -2,14 +2,20 @@
 """
 MikroTik RouterOS 6.48.6 RRFuzz campaign launcher.
 
-Target : /nova/bin/www  (i386/x86-32, uClibc, web interface)
-Arch   : x86-32 (i386) — NEW architecture, extends paper cross-arch claim
-Trace  : tests/verified_targets/MikroTik_6.48.6/traces/init.txt.new (TRRR format)
+Target : /tmp/www_patched  (i386/x86-32, patched to bypass integrity checks)
+Arch   : x86-32 (i386)
+Trace  : tests/verified_targets/MikroTik_6.48.6/traces/http_seed.trace
+         Recorded with full Nova IPC + HTTP GET / -> 7184 bytes response
+         232 syscalls, 77KB — includes accept/recv/send for HTTP path
 
-Previous campaign: sync/crashes/ found c716a47b (ELF loader, file-FD, 1102 hits).
-This campaign runs longer with net-FD isolation to find network-exploitable bugs.
+Requirements:
+  - mock_supervisor.py must be running (handles Nova IPC handshake)
+  - www_patched must exist at /tmp/www_patched
 
 Usage:
+  # Start Nova mock in background first:
+  python3 tests/verified_targets/MikroTik_6.48.6/mock_supervisor.py &
+  # Then run campaign:
   cd rr_fuzzing/fuzzing
   python3 ../tests/scripts/fuzzing/run_mikrotik_campaign.py [--iterations N]
 """
@@ -23,19 +29,19 @@ FUZZING = ROOT / 'fuzzing'
 sys.path.insert(0, str(FUZZING))
 
 MIKRO_ROOT = Path('/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/MikroTik/system_pkg')
-BINARY     = str(MIKRO_ROOT / 'nova/bin/www')
+BINARY     = '/tmp/www_patched'   # patched binary (bypasses integrity checks)
 ROOTFS     = str(MIKRO_ROOT)
 QEMU       = str(ROOT / '../../build/qemu-i386')
 
-# Use the newer trace (init.txt.new, same size as init.txt but updated 2026-01-20)
-TRACE_FILE  = str(ROOT / 'tests/verified_targets/MikroTik_6.48.6/traces/init.txt.new')
-OUTPUT_DIR  = str(FUZZING / 'fuzz_output_mikrotik')
+# HTTP seed trace: full Nova handshake + GET / response (77KB, 232 syscalls)
+TRACE_FILE  = str(ROOT / 'tests/verified_targets/MikroTik_6.48.6/traces/http_seed.trace')
+OUTPUT_DIR  = str(FUZZING / 'fuzz_output_mikrotik_http')
 
 
 def check_prerequisites():
     errors = []
     if not Path(BINARY).exists():
-        errors.append(f'Binary not found: {BINARY}')
+        errors.append(f'www_patched not found: {BINARY} (copy patched binary here)')
     if not Path(QEMU).exists():
         errors.append(f'qemu-i386 not found: {QEMU}')
     if not Path(TRACE_FILE).exists():

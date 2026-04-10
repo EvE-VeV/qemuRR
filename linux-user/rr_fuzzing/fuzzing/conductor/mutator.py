@@ -230,6 +230,12 @@ class BaseMutator:
                 FUZZ_CMD_LIGHT_MUTATION
             ]
             cmd = random.choice(mutation_types)
+            # EXTEND/TRUNCATE violate read() contract on file fds (can't return > count).
+            # Restrict to network socket syscalls only to avoid false positives.
+            if cmd in (FUZZ_CMD_EXTEND, FUZZ_CMD_TRUNCATE) and \
+                    not self.syscall_network_fd_map.get(syscall_index, False):
+                cmd = random.choice([FUZZ_CMD_FLIP_BITS, FUZZ_CMD_INTERESTING_VALUES,
+                                     FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_LIGHT_MUTATION])
 
             # Generate random data + set mutation_type
             if cmd == FUZZ_CMD_FLIP_BITS:
@@ -443,6 +449,10 @@ class BaseMutator:
                 FUZZ_CMD_LIGHT_MUTATION
             ]
             cmd = random.choice(mutation_types)
+            if cmd in (FUZZ_CMD_EXTEND, FUZZ_CMD_TRUNCATE) and \
+                    not self.syscall_network_fd_map.get(syscall_index, False):
+                cmd = random.choice([FUZZ_CMD_FLIP_BITS, FUZZ_CMD_INTERESTING_VALUES,
+                                     FUZZ_CMD_REPLACE_BUFFER, FUZZ_CMD_LIGHT_MUTATION])
 
             if cmd == FUZZ_CMD_FLIP_BITS:
                 data = struct.pack('I', random.randint(1, 8))
