@@ -361,7 +361,6 @@ class DynamicForkController:
 
         if not io_syscalls:
             alog("No IO syscalls found, falling back to Havoc mode at fork point 0", "DFC", "WARN")
-            import time
             time.sleep(0.1) # small delay to prevent rapid spinning if execution fails
             io_syscalls = [0]
 
