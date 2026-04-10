@@ -69,16 +69,18 @@ class CrashInfo:
 class CrashAnalyzer:
     """Crash Analyzer"""
     
-    def __init__(self, output_dir: Path, worker_id: int = 0):
+    def __init__(self, output_dir: Path, worker_id: int = 0, target_name: str = ""):
         """
         Initialize Crash Analyzer
-        
+
         Args:
             output_dir: Output directory
             worker_id: Unique worker ID for naming
+            target_name: Target binary name (included in hash to prevent cross-target collisions)
         """
         self.output_dir = Path(output_dir)
         self.worker_id = worker_id
+        self.target_name = target_name
         self.crashes_dir = self.output_dir / "crashes"
         self.crashes_dir.mkdir(parents=True, exist_ok=True)
         
@@ -233,6 +235,7 @@ class CrashAnalyzer:
             effective_pc = 0  # signal-only grouping for ASLR heap overflows
 
         hash_components = [
+            f"target:{self.target_name}" if self.target_name else "target:unknown",
             f"sig:{signal}",
             f"pc:{effective_pc:#x}" if effective_pc else "pc:unknown",
         ]

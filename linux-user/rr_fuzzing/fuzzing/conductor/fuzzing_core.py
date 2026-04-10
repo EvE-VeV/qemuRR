@@ -447,7 +447,7 @@ class FuzzingCore:
             if _HAS_LAYER5_CRASH:
                 # In MP mode, use sync_dir for global deduplication
                 analyzer_dir = self.sync_dir if self.sync_dir else Path(output_dir)
-                self.layer5_crash_analyzer = Layer5CrashAnalyzer(analyzer_dir, worker_id=self.worker_id)
+                self.layer5_crash_analyzer = Layer5CrashAnalyzer(analyzer_dir, worker_id=self.worker_id, target_name=Path(self.target_binary).name)
                 alog(f"  ✅ CrashAnalyzer enabled (Target: {analyzer_dir})", "CORE", "INFO")
             else:
                 alog(f"  ⚠️  CrashAnalyzer unavailable (using basic CrashDetector)", "CORE", "WARN")

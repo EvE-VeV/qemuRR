@@ -1475,10 +1475,16 @@ class SmartMutator:
             instr = FuzzInstruction(index, FUZZ_CMD_TRUNCATE, 1, data, mutation_type='truncate')
         
         elif strategy_type == 3:
-            # EXTEND
-            extend_by = random.choice([1, 4, 16, 64, 256, 1024])
-            data = struct.pack('I', extend_by)
-            instr = FuzzInstruction(index, FUZZ_CMD_EXTEND, 1, data, mutation_type='extend')
+            # EXTEND — only valid for network fds (read() cannot return > count on file/pipe)
+            if not self.syscall_network_fd_map.get(index, False):
+                # Degrade to bitflip for non-network fds
+                num_flips = random.randint(1, 8)
+                data = struct.pack('I', num_flips)
+                instr = FuzzInstruction(index, FUZZ_CMD_FLIP_BITS, 1, data, mutation_type='bitflip')
+            else:
+                extend_by = random.choice([1, 4, 16, 64, 256, 1024])
+                data = struct.pack('I', extend_by)
+                instr = FuzzInstruction(index, FUZZ_CMD_EXTEND, 1, data, mutation_type='extend')
         
         elif strategy_type == 4:
             # LIGHT_MUTATION

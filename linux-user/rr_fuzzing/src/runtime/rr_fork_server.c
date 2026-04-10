@@ -558,9 +558,6 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Batch fork: %d variants", num_variants);
                     
-                    /* 🔥 ARCH-FIX: Reset coverage on C-side before batch fork */
-                    rr_coverage_reset();
-
                     /* Batch fork multiple child processes */
                     pid_t child_pids[RR_MAX_VARIANTS];
                     memset(child_pids, 0, sizeof(child_pids));
@@ -753,9 +750,10 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Batch fork completed");
                     g_rr_framework->child_pid = 0;
+                    rr_coverage_reset();
                 }
                 break;
-            
+
             case 'F': // Fork command
                 {
                     /* Read iteration_id from shared memory */
@@ -783,9 +781,6 @@ int rr_fork_server_loop(void)
                         RR_VERBOSE("No shared memory configured, running without mutations");
                     }
                     
-                    /* 🔥 ARCH-FIX: Reset coverage on C-side before fork */
-                    rr_coverage_reset();
-
                     /* Execute fork to create child process */
                     pid_t pid = fork();
                     
@@ -973,9 +968,10 @@ int rr_fork_server_loop(void)
                         
                         /* Reset fork point state for next iteration */
                         g_at_fork_point = false;
+                        rr_coverage_reset();
                         RR_VERBOSE("Reset fork point for next iteration");
                         RR_VERBOSE("Completed execution (child process finished)");
-                        
+
                     } else {
                         /* Fork failed */
                         RR_ERROR("fork() failed: %s", strerror(errno));
@@ -1009,7 +1005,6 @@ int rr_fork_server_loop(void)
                     }
                     
                     // Fork a child to execute the full baseline trace
-                    rr_coverage_reset();
                     rr_reset_trace_position();
                     
                     pid_t baseline_pid = fork();
@@ -1090,6 +1085,7 @@ int rr_fork_server_loop(void)
                         RR_INFO("Baseline execution completed");
                         rr_ipc_send_status(0);
                     }
+                    rr_coverage_reset();
                 }
                 break;
 
@@ -1176,9 +1172,6 @@ int rr_fork_server_loop(void)
                     bool parent_strace_enabled = rr_strace_replay_enabled();
                     RR_INFO("🔍 DEBUG: Parent strace_replay_enabled=%d before fork", parent_strace_enabled);
                     
-                    /* 🔥 ARCH-FIX: Reset coverage on C-side before batch checkpoint fork */
-                    rr_coverage_reset();
-
                     for (int variant_idx = 0; variant_idx < num_variants; variant_idx++) {
                         FuzzVariant *variant = &shm->variants[variant_idx];
                         size_t count = variant->instruction_count;
@@ -1444,6 +1437,8 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Fork completed: %d variants", num_variants);
                     g_rr_framework->child_pid = 0;
+                    /* Reset coverage after Python has read the bitmap (reset before next batch) */
+                    rr_coverage_reset();
                 }
                 break;
 
