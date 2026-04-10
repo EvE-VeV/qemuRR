@@ -880,8 +880,17 @@ class TraceAnalyzer:
                                sc.name = SyscallRecord._nr_to_name(sc.nr, 'x86_64', sc.word_size) # Pass word_size
                                sc.category = sc._categorize()
                  elif self.detected_word_size == 32:
-                      # Default to arm if unknown 32-bit (common in our targets)
-                      self.detected_arch = 'arm'
+                      # MIPS O32 syscall numbers are >= 4000 — detect early
+                      if syscall_nr >= 4000:
+                           self.detected_arch = 'mips'
+                           alog(f"[TraceAnalyzer] 🏛️ Detected architecture: MIPS O32 (at rec {rec_index}, nr={syscall_nr})", "TRACE", "INFO")
+                           for sc in self.syscalls:
+                               sc.arch = 'mips'
+                               sc.name = SyscallRecord._nr_to_name(sc.nr, 'mips', 32)
+                               sc.category = sc._categorize()
+                      else:
+                           # Default to arm for non-MIPS 32-bit (ARM is most common)
+                           self.detected_arch = 'arm'
 
             # Create Record
             record = SyscallRecord(
@@ -972,22 +981,6 @@ class TraceAnalyzer:
             # Add BB
             self.merged_execution_sequence.append(('bb', entry.pc))
     
-    def classify_syscalls(self, syscalls):
-        """Classify Syscalls"""
-        pure = [s for s in syscalls if s['has_aux_data']]
-        hybrid = [s for s in syscalls if not s['has_aux_data']]
-        return pure, hybrid
-
-    def get_pure_candidates(self):
-        if not self.syscalls:
-            self.analyze()
-        return self.pure_syscalls
-
-    def get_hybrid_candidates(self):
-        if not self.syscalls:
-            self.analyze()
-        return self.hybrid_syscalls
-
     def get_pure_syscalls(self) -> List[SyscallRecord]:
         """Get Pure Replay Syscalls"""
         return self.pure_syscalls
@@ -1065,26 +1058,6 @@ class TraceAnalyzer:
         """Check if BB trace data is available"""
         return self.bb_trace_available and self.bb_trace_parser is not None
     
-    def get_bb_sequence(self) -> List[int]:
-        """Get full BB execution sequence (list of PC addresses)"""
-        if not self.has_bb_trace():
-            return []
-        return self.bb_trace_parser.get_bb_sequence()
-    
-    def get_bb_between_syscalls(self, start_syscall_idx: int, end_syscall_idx: int) -> List[int]:
-        """Get BB sequence between two syscalls"""
-        if not self.has_bb_trace():
-            return []
-        return self.bb_trace_parser.get_bb_between_syscalls(start_syscall_idx, end_syscall_idx)
-    
-    def get_merged_execution_sequence(self) -> List[Tuple[str, any]]:
-        """
-        Get merged execution sequence
-        
-        Returns: [('bb', pc), ('syscall', SyscallRecord), ...]
-        """
-        return self.merged_execution_sequence
-    
     def get_auth_boundary(self) -> int:
         """
         Auto-detect auth_boundary: the syscall index of the first accept() call.
@@ -1116,43 +1089,6 @@ class TraceAnalyzer:
         alog("auth_boundary not detected (no accept() in trace)", "TRACE", "WARN")
         return 0
 
-    def get_bb_coverage_summary(self) -> Dict[str, any]:
-        """Get BB coverage summary"""
-        if not self.has_bb_trace():
-            return {'error': 'BB trace not available'}
-        return self.bb_trace_parser.get_coverage_summary()
-    
-    def export_bb_trace_to_json(self, output_file: str):
-        """Export BB trace to JSON format (for offline analysis)"""
-        if not self.has_bb_trace():
-            print("[TraceAnalyzer] ❌ No BB trace available")
-            return
-        
-        import json
-        
-        data = {
-            'trace_file': self.trace_file,
-            'bb_trace_file': str(self.trace_file) + ".bbl",
-            'stats': self.bb_trace_parser.stats,
-            'bb_sequence': [
-                {
-                    'pc': hex(entry.pc),
-                    'syscall_idx': entry.syscall_idx,
-                    'flags': entry.flags
-                }
-                for entry in self.bb_trace_parser.entries
-            ],
-            'syscall_bb_map': {
-                str(k): [hex(pc) for pc in v]
-                for k, v in self.bb_trace_parser.get_syscall_bb_map().items()
-            }
-        }
-        
-        with open(output_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"[TraceAnalyzer] ✅ BB trace exported to {output_file}")
-    
     def clear(self):
         """Release memory-intensive trace data"""
         self.syscalls = []

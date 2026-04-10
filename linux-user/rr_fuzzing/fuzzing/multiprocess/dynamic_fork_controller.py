@@ -33,10 +33,7 @@ else:
 from conductor.mutator import SmartMutator
 from conductor.coverage import CoverageTracker
 from conductor.trace_manager import TraceManager, Trace
-try:
-    from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
-except ImportError:
-    from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
+from conductor.dual_level_path_finder import DualLevelPathFinder as PathFinder
 from .recipe_pool import RecipePool
 from conductor.async_logger import alog
 from conductor.constants import PRIMARY_IO_SYSCALLS
@@ -180,10 +177,15 @@ class DynamicForkController:
             'new_paths_discovered': 0,
             'forks_this_period': 0,
             'total_checkpoints': 0,
-            'max_depth_reached': 0,
-            'snapshot_saves': 0,
-            'snapshot_restores': 0
+            'max_depth_reached': 0
         }
+
+        # Crash-aware steering: track duplicate crash counts per fork_point.
+        # When a fork_point accumulates too many duplicate crashes it is
+        # temporarily skipped so the fuzzer can explore other paths instead.
+        self._crashy_fork_points: dict = {}   # fork_point -> duplicate-crash count
+        self._CRASHY_SKIP_THRESHOLD = 20      # skip after this many duplicates
+        self._crashy_reset_iter = 0           # iteration when we last reset counts
 
         alog(f"Initialized (Depth-First Checkpoint Mode)", "DFC", "INFO")
         alog(f"  Max exploration depth: {self.max_depth}", "DFC", "INFO")
@@ -304,10 +306,6 @@ class DynamicForkController:
         # Save current trace for mutation use
         self.current_trace = trace
         self.current_trace_id = trace.id # ✅ Ensure ID is available for Evolution Engine
-        if not self.depth_first_mode:
-            # Compatibility: Use breadth-first mode if depth mode is not enabled
-            return self._explore_breadth_first(trace, iteration_id)
-
         alog(f"🌊 Iteration {iteration_id}: Dynamic Multi-Fork on {trace.id}", "DFC", "INFO")
 
         # Reset QEMU replay position at the start of each top-level sweep so
@@ -369,6 +367,26 @@ class DynamicForkController:
 
         alog(f"Found {len(io_syscalls)} IO syscalls: {io_syscalls[:10]}...", "DFC", "DEBUG")
 
+        # Ensure ascending order so _qemu_replay_pos never regresses mid-sweep,
+        # eliminating unnecessary proactive QEMU restarts.
+        io_syscalls = sorted(set(io_syscalls))
+
+        # Crash-aware steering: periodically reset counters (every 2000 iterations)
+        # so stale crash data doesn't permanently suppress exploration.
+        if iteration_id - self._crashy_reset_iter > 2000:
+            self._crashy_fork_points.clear()
+            self._crashy_reset_iter = iteration_id
+            alog("Crash-steering counters reset", "DFC", "DEBUG")
+
+        # Filter out fork_points that have accumulated too many duplicate crashes.
+        # Always keep the mandatory fork_point (manual_fork_point / auth_boundary).
+        mandatory = self.manual_fork_point
+        skipped = [fp for fp in io_syscalls
+                   if fp != mandatory and self._crashy_fork_points.get(fp, 0) >= self._CRASHY_SKIP_THRESHOLD]
+        if skipped:
+            alog(f"Crash-steering: skipping {len(skipped)} crashy fork_points {skipped}", "DFC", "INFO")
+        io_syscalls = [fp for fp in io_syscalls if fp not in skipped]
+
         # ✅ Store as instance variable for nested fork use
         self.current_io_syscalls = io_syscalls
 
@@ -393,9 +411,19 @@ class DynamicForkController:
         checkpoint_id = f"cp_{iteration_id}_{syscall_index}_{depth}"
         alog(f"📍 Creating checkpoint[{checkpoint_id}] @syscall[{syscall_index}] depth={depth}", "DFC", "DEBUG")
 
+        # Crash-aware steering for mandatory fork_point: reduce variant count when crashy
+        # (can't skip it entirely since it's the entry for all exploration).
+        crashy_count = self._crashy_fork_points.get(syscall_index, 0)
+        if crashy_count >= self._CRASHY_SKIP_THRESHOLD:
+            effective_variants = max(1, self.max_variants_per_checkpoint // 4)
+            alog(f"Crash-steering: reduced variants {self.max_variants_per_checkpoint}→{effective_variants} "
+                 f"at fork_point={syscall_index} (crashes={crashy_count})", "DFC", "DEBUG")
+        else:
+            effective_variants = self.max_variants_per_checkpoint
+
         mutations = []
         mutation_node_ids = []  # Track mutation node IDs in graph
-        for i in range(self.max_variants_per_checkpoint):
+        for i in range(effective_variants):
             # 🔥 Pass current trace object for IO mutation use
             # ✅ Robust mutation call (handle both BaseMutator and SmartMutator interfaces)
             try:
@@ -424,22 +452,6 @@ class DynamicForkController:
                 mutation_node_ids.append(node_id)
 
         alog(f"Generated {len(mutations)} mutations for checkpoint", "DFC", "DEBUG")
-
-        # Save current coverage state as checkpoint
-        coverage_snapshot = self._save_coverage_state()
-
-        # 🔥 FIX: Direct execution of all mutations without checkpoint queue
-        checkpoint = FuzzCheckpoint(
-            trace_file=trace_file,
-            syscall_index=syscall_index,
-            depth=depth,
-            coverage_state=coverage_snapshot,
-            unexplored_mutations=[],  
-            parent_checkpoint_id=parent_id,
-            checkpoint_id=checkpoint_id,
-            discovery_iteration=iteration_id,
-            mutation_node_ids=mutation_node_ids if mutation_node_ids else []
-        )
 
         # Execute all mutations in parallel (dynamic multi-fork)
         if mutations:
@@ -510,6 +522,11 @@ class DynamicForkController:
                                         trace=trace_obj,
                                         mutations=_muts_i
                                     )
+                                    # Crash-steering: count duplicate hits per fork_point.
+                                    if not is_unique:
+                                        self._crashy_fork_points[syscall_index] = (
+                                            self._crashy_fork_points.get(syscall_index, 0) + 1
+                                        )
                                     if is_unique and self.triage_callback and trace_obj:
                                         _muts_list = _muts_i if isinstance(_muts_i, list) else [_muts_i]
                                         try:
@@ -647,266 +664,6 @@ class DynamicForkController:
 
         return False
 
-    def _resume_checkpoint_exploration(self, checkpoint: FuzzCheckpoint, iteration_id: int) -> bool:
-        """
-        Restore from checkpoint and continue exploration
-        """
-        alog(f"🔄 Restoring checkpoint {checkpoint.checkpoint_id}", "DFC", "DEBUG")
-
-        # Restore coverage state
-        self._restore_coverage_state(checkpoint.coverage_state)
-        self.stats['snapshot_restores'] += 1
-
-        # Take next unexplored mutation
-        if not checkpoint.unexplored_mutations:
-            alog(f"📋 No more mutations in checkpoint {checkpoint.checkpoint_id}", "DFC", "DEBUG")
-            return False
-
-        next_mutation = checkpoint.unexplored_mutations.pop(0)
-
-        # ✅ Task #6补充: Get corresponding mutation node ID
-        next_mutation_node_id = None
-        if checkpoint.mutation_node_ids:
-            next_mutation_node_id = checkpoint.mutation_node_ids.pop(0)
-
-        # If more mutations remain, re-add to queue
-        if checkpoint.unexplored_mutations:
-            self.checkpoint_queue.append(checkpoint)
-
-        alog(f"🧪 Testing next mutation from checkpoint...", "DFC", "DEBUG")
-
-        # 执行mutation
-        try:
-            results = self.executor.execute_fork(
-                trace_file=checkpoint.trace_file,
-                fork_point=checkpoint.syscall_index,
-                mutation_variants=[next_mutation],
-                depth=checkpoint.depth,
-                iteration_id=iteration_id
-            )
-
-            # ✅ Update unified stats counter (1 execution per variant)
-            if self.fuzzing_stats and results:
-                self.fuzzing_stats.total_execs += len(results)
-
-            if results and len(results) > 0:
-                result = results[0]
-                has_new_coverage = self.coverage_tracker.has_new_coverage(result.coverage_bitmap)
-
-                # ✅ Task #6补充: Update mutation result in graph
-                if self.mutation_graph and next_mutation_node_id:
-                    coverage_stats = self.coverage_tracker.get_stats()
-                    self.mutation_graph.update_mutation_result(
-                        node_id=next_mutation_node_id,
-                        has_new_coverage=has_new_coverage,
-                        new_edges=coverage_stats.get('new_edges_this_run', 0),
-                        total_edges=coverage_stats.get('total_edges', 0),
-                        crashed=result.crashed,
-                        timed_out=False,
-                        exec_time=getattr(result, 'exec_time', 0.0)
-                    )
-
-                # 🔥 FIX: Correct handling after checkpoint restoration
-                    # ✅ Update global counter for UI ONLY IF NOT DUPLICATE
-                    is_unique = False
-                    if self.crash_detector:
-                        _ck_trace = checkpoint.trace_file if isinstance(checkpoint.trace_file, Trace) else self.current_trace
-                        is_unique = self.crash_detector.save_crash(
-                            result=result,
-                            trace=_ck_trace,
-                            mutations=next_mutation
-                        )
-                        if is_unique and self.triage_callback and _ck_trace:
-                            _muts_list = next_mutation if isinstance(next_mutation, list) else [next_mutation]
-                            try:
-                                self.triage_callback(_ck_trace, _muts_list, result, crash_id=is_unique)
-                            except Exception as _te:
-                                alog(f"triage_callback error (ck): {_te}", "DFC", "WARN")
-
-                    if is_unique and self.fuzzing_stats:
-                        self.fuzzing_stats.crashes_found += 1
-                    
-                    # ✅ Notify Layer 5 analyzer
-                    if self.crash_analyzer:
-                        qemu_status = {
-                            'signal': result.signal_number,
-                            'exit_code': result.qemu_exit_code,
-                            'pc': getattr(result, 'pc', 0),
-                            'fault_address': getattr(result, 'fault_address', None),
-                            'backtrace': getattr(result, 'backtrace', [])
-                        }
-                        
-                        mutation_recipe = {
-                            'syscall_index': getattr(next_mutation, 'syscall_index', -1),
-                            'mutations': [str(next_mutation)]
-                        }
-                        
-                        try:
-                            crash_info = self.crash_analyzer.analyze_crash(
-                                qemu_status=qemu_status,
-                                mutation_recipe=mutation_recipe,
-                                iteration=self.fuzzing_stats.total_execs if self.fuzzing_stats else 0
-                            )
-                            self.crash_analyzer.save_crash(crash_info) # ✅ Persist to DB
-                        except Exception as e:
-                            alog(f"⚠️ Layer5 Analysis failed (checkpoint): {e}", "DFC", "ERROR")
-                    
-                    return True  # crash是成功结果，继续处理其他checkpoints
-
-                elif has_new_coverage:
-                    alog(f"🎉 New coverage from checkpoint restoration!", "DFC", "INFO")
-                    self.stats['new_paths_discovered'] += 1
-                    alog(f"⬅️  Program finished (normal exit with new coverage), backtracking...", "DFC", "DEBUG")
-                    return True  # 有新coverage，成功的探索
-
-                else:
-                    alog(f"📊 No new coverage from restored checkpoint", "DFC", "DEBUG")
-                    alog(f"⬅️  Program finished (normal exit, no new coverage), backtracking...", "DFC", "DEBUG")
-                    return False  # 无新发现，回退
-
-        except Exception as e:
-            alog(f"Error during checkpoint restoration: {e}", "DFC", "ERROR")
-            return False
-
-        return False
-
-    def _save_coverage_state(self) -> bytes:
-        """Save current coverage state"""
-        self.stats['snapshot_saves'] += 1
-        # Should save actual coverage bitmap state here
-        # For simplicity, currently returns empty bytes; actual implementation should save coverage_tracker state
-        return b""
-
-    def _restore_coverage_state(self, state: bytes):
-        """Restore coverage state"""
-        # Should restore coverage bitmap state here
-        # For simplicity, currently only resets coverage
-        self.executor.reset_coverage()
-
-    def _find_next_io_syscalls(self, trace_file: str, current_index: int) -> List[int]:
-        """
-        Find IO syscalls after the specified index
-        """
-        # Should analyze trace file to find subsequent IO syscalls
-        # For simplicity, returning some hypothetical subsequent IO syscalls for now
-        try:
-            from conductor.trace_analyzer import TraceAnalyzer
-        except ImportError:
-            # Fix relative import error
-            import sys
-            from pathlib import Path
-            parent_dir = Path(__file__).parent.parent
-            sys.path.insert(0, str(parent_dir))
-            from conductor.trace_analyzer import TraceAnalyzer
-
-        try:
-            analyzer = TraceAnalyzer(trace_file)
-            all_io_syscalls = []
-            for record in analyzer.syscalls:
-                if hasattr(record, 'name') and record.name.lower() in ['read', 'write', 'open', 'close', 'openat', 'accept', 'accept4', 'select', 'pselect6', 'recv', 'recvfrom', '_newselect']:
-                    all_io_syscalls.append(record.index)
-
-            # Return IO syscalls greater than current_index
-            next_ios = [idx for idx in all_io_syscalls if idx > current_index]
-            return next_ios[:3]  # Return at most 3 subsequent IO syscalls
-        except:
-            # If analysis fails, return empty list
-            return []
-
-    def _explore_breadth_first(self, trace: Trace, iteration_id: int) -> bool:
-        """
-        Traditional breadth-first exploration (compatibility)
-        """
-        # This is a simplified version of the original explore_multi_path logic
-        # Maintaining backward compatibility
-        alog(f"Using legacy breadth-first mode", "DFC", "INFO")
-        return False
-    
-    def _get_covered_blocks(self) -> set:
-        """
-        Get set of covered basic blocks
-        
-        Returns:
-            Set of covered block addresses
-        """
-        covered = set()
-        
-        # Extract covered edges from coverage bitmap
-        for i, val in enumerate(self.coverage_tracker.global_bitmap):
-            if val > 0:
-                # Simplification: Use bitmap index as block ID
-                covered.add(i & 0xFFFF)
-        
-        return covered
-    
-    def _select_top_branches(self, branches: List[Dict], max_n: int) -> List[Dict]:
-        """
-        Select the most valuable N branches
-        
-        Args:
-            branches: All uncovered branches
-            max_n: Maximum selection count
-        
-        Returns:
-            Top-N branch list
-        """
-        scored = []
-        
-        for branch in branches:
-            score = self._evaluate_branch_value(branch)
-            scored.append((score, branch))
-        
-        # ✅ FIX: Sort by score only (first element is float)
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [b for _, b in scored[:max_n]]
-    
-    def _evaluate_branch_value(self, branch: Dict) -> float:
-        """
-        Evaluate branch value
-        
-        Scoring criteria:
-        - Proximity (ease of reach)
-        - Contains syscalls (targets for mutation)
-        - Type is conditional branch (not switch)
-        """
-        score = 0.0
-        
-        # 1. Distance score
-        distance = branch.get('distance', 999)
-        score += 10.0 / (1 + distance)
-        
-        # 2. Syscall score
-        if branch.get('has_syscall', False):
-            score += 5.0
-        
-        # 3. Type score
-        if branch.get('type') in ['true_branch', 'false_branch']:
-            score += 3.0
-        
-        return score
-    
-    def _find_recipe_for_branch(self, branch: Dict) -> Optional[Dict]:
-        """
-        Find the recipe corresponding to a branch
-        
-        Args:
-            branch: Branch information
-        
-        Returns:
-            Recipe dict or None
-        """
-        if not self.recipe_pool:
-            return None
-        
-        target_addr = branch['to']
-        
-        # Traverse active recipes
-        for recipe in self.recipe_pool.active_recipes:
-            if recipe.get('target_branch') == f"0x{target_addr:x}":
-                return recipe
-        
-        return None
-    
     def _find_io_syscalls(self, trace: Trace, max_fork_points: int = 10) -> list:
         """
         Intelligently select IO syscalls as fork points
@@ -983,7 +740,7 @@ class DynamicForkController:
                     retval = int(sc.retval) if hasattr(sc, 'retval') else 0
                     if retval > 0:
                         priority_score += min(retval, 100)  # Max +100 points
-                except:
+                except Exception:
                     pass
 
                 # 3. Position bonus (intermediate syscalls are more important)
@@ -1026,76 +783,6 @@ class DynamicForkController:
 
         return result
 
-    def _select_diverse_fork_point(self, io_syscalls: list, iteration_id: int) -> int:
-        """
-        Select diverse fork points to avoid getting stuck in restricted local optima.
-
-        Strategy:
-        1. Rotation: Cycle through available IO syscalls.
-        2. Tiered exploration: Target early/mid/late phases based on iteration.
-        3. Random perturbation: Add jitter to selection.
-        4. (Future) PathFinder integration: Prioritize CFG-guided hotspots.
-
-        Args:
-            io_syscalls: List of available IO syscall indices
-            iteration_id: Current iteration ID
-
-        Returns:
-            Selected fork point index
-        """
-        if not io_syscalls:
-            return 10  # Default fallback
-
-        # Strategy 1: Iteration ID based rotation algorithm
-        base_index = iteration_id % len(io_syscalls)
-
-        # Strategy 2: Tiered exploration - Select different regions based on iteration phase
-        if iteration_id < 10:
-            # Early phase: Explore early IO syscalls
-            region_start = 0
-            region_end = min(3, len(io_syscalls))
-        elif iteration_id < 30:
-            # Mid phase: Explore middle part
-            region_start = len(io_syscalls) // 3
-            region_end = min(len(io_syscalls) * 2 // 3 + 1, len(io_syscalls))
-        else:
-            # Late phase: Explore all syscalls, focusing on the latter part
-            region_start = max(0, len(io_syscalls) - 5)
-            region_end = len(io_syscalls)
-
-        # Selection within the chosen region
-        if region_end > region_start:
-            region_syscalls = io_syscalls[region_start:region_end]
-            target_index = base_index % len(region_syscalls)
-            fork_point = region_syscalls[target_index]
-        else:
-            fork_point = io_syscalls[base_index]
-
-        # Strategy 3: Random perturbation (20% probability)
-        if random.random() < 0.2:
-            fork_point = random.choice(io_syscalls)
-
-        # Strategy 4: PathFinder integration (if available)
-        # TODO: Integrate PathFinder hotspot analysis in the future
-
-        # Ensure minimum value
-        return max(10, fork_point)
-
-    def _mutation_from_recipe(self, recipe: Dict) -> List:
-        """
-        Generate mutation from recipe
-        
-        Args:
-            recipe: Recipe dict
-        
-        Returns:
-            Mutation instruction list
-        """
-        # ✅ Reuse SmartMutator recipe support
-        # TODO: Implement recipe to instruction conversion
-        # Currently simplified: use mutator to generate
-        return self.mutator.mutate(None)
-    
     def get_statistics(self) -> Dict:
         """Get statistics"""
         return self.stats.copy()

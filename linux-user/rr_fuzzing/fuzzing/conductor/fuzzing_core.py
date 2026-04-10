@@ -96,24 +96,12 @@ except ImportError:
     _HAS_LAYER5_CRASH = False
     _HAS_LAYER5_CORPUS = False
 
-# ✅ Option A: Use Realtime Tree Visualizer (from QEMU dynamic messages)
-# ❌ Deprecated: tree_visualizer (from static trace file, inaccurate data)
-# try:
-#     from tree_visualizer import TreeVisualizer
-#     _HAS_TREE_VIZ = True
-# except ImportError:
-#     _HAS_TREE_VIZ = False
-#     print("[FuzzingCore] ⚠️  TreeVisualizer不可用")
-
 # ✅ BB Trace support
 try:
     from .bb_trace_parser import BBTraceParser, BBEntry
     BB_TRACE_AVAILABLE = True
 except ImportError:
     BB_TRACE_AVAILABLE = False
-
-# ✅ Realtime tree visualizer does not need to be imported; it will run as a separate process
-_HAS_REALTIME_VIZ = False  # ⚠️ DISABLED: Visualizer O(N) search causing 10-100x slowdown
 
 
 @dataclass
@@ -163,10 +151,7 @@ class CrashDetector:
     def save_crash(self, result: ExecutionResult, trace: Trace, mutations: list):
         """Save crash info"""
         import hashlib
-        import json
-        import os
-        from pathlib import Path
-        
+
         # Create crash directory
         crash_dir = Path(self.output_dir) / "crashes"
         crash_dir.mkdir(parents=True, exist_ok=True)
@@ -200,9 +185,6 @@ class CrashDetector:
         # Save crash metadata
         crash_meta = crash_dir / f"{crash_id}.meta"
         
-        # Get syscall name mapping (Avoid slow TraceAnalyzer here)
-        syscall_names = {}
-        
         try:
             payload = {
                 'crash_id': crash_id,
@@ -217,7 +199,7 @@ class CrashDetector:
                 'mutations': [
                     {
                         'syscall_index': m.syscall_index,
-                        'syscall_name': syscall_names.get(m.syscall_index, 'unknown'),  # ✅ From TraceAnalyzer
+                        'syscall_name': 'unknown',
                         'cmd': m.cmd,
                         'mutation_type': get_mutation_type_name(m.cmd),  # ✅ Use mapping
                         'arg_index': m.arg_index,
@@ -478,19 +460,6 @@ class FuzzingCore:
             else:
                 alog(f"  ⚠️  CorpusManager unavailable", "CORE", "WARN")
             
-            # ✅ 3. Realtime Tree Visualizer (Option A: Integrated version)
-            # if _HAS_REALTIME_VIZ:
-            #     print(f"  ✅ Realtime Tree Visualizer enabled (accurate execution paths)")
-            # else:
-            #     print(f"  ⚠️  Realtime Tree Visualizer unavailable")
-        
-        # ═══════════════════════════════════════════════════════════════
-        # Option A: Realtime Visualizer Management
-        # ═══════════════════════════════════════════════════════════════
-        self.realtime_viz_process = None
-        self.realtime_viz_pipe = None
-        self.realtime_viz_thread = None  # For reading visualizer output
-        
         self.dynamic_fork_controller = None
         if enable_dfc and _HAS_DYNAMIC_FORK and DynamicForkController is not None:
             try:
@@ -537,16 +506,10 @@ class FuzzingCore:
                 self.dynamic_fork_controller = None
         elif not enable_dfc:
             alog(f"[Ablation] DynamicForkController DISABLED (--disable-dfc)", "CORE", "INFO")
-            if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
-                self.evolution_engine = EvolutionEngine(output_dir)
-                self.target_profile = None
-                self._init_re_recorder(output_dir)
+            self._ensure_evolution_engine(output_dir)
         else:
             alog(f"⚠️ DynamicForkController unavailable", "CORE", "WARN")
-            if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
-                self.evolution_engine = EvolutionEngine(output_dir)
-                self.target_profile = None
-                self._init_re_recorder(output_dir)
+            self._ensure_evolution_engine(output_dir)
 
         # ✅ Initialize Watchdog (Phase 1 Fix: Tighten timeout for performance)
         self.watchdog = FuzzingWatchdog(
@@ -581,11 +544,6 @@ class FuzzingCore:
                 self.checkpoint_manager.load(self)
             else:
                 alog(f"💾 Persistence enabled. Periodic saving every {self.checkpoint_interval}s", "CORE", "INFO")
-        
-        # ✅ Layer 6: Evolutionary Promotion Engine (ALREADY INITIALIZED ABOVE)
-        # self.evolution_engine = EvolutionEngine(output_dir)
-        # self.target_profile: Optional[TargetProfile] = None 
-        # self._init_re_recorder(output_dir)
         
         alog(f"✅ Initialization complete", "CORE", "INFO")
 
@@ -623,12 +581,14 @@ class FuzzingCore:
                 if os.path.exists(pt):
                     tree_file = pt
                     break
-            # Glob fallback: pick most recent tree from a previous run
+            # Glob fallback: pick most recent tree from a previous run.
+            # C exports as .html (rr_tree_export_json writes an HTML bundle);
+            # also check .json in case a future build changes the format.
             if tree_file is None:
                 import glob as _glob
-                json_files = _glob.glob("/tmp/syscall_tree_*.json")
-                if json_files:
-                    tree_file = max(json_files, key=os.path.getctime)
+                candidates = _glob.glob("/tmp/syscall_tree_*.html") + _glob.glob("/tmp/syscall_tree_*.json")
+                if candidates:
+                    tree_file = max(candidates, key=os.path.getctime)
             
             if tree_file:
                 alog(f"🌳 Found Syscall Tree: {tree_file}, performing precise mapping...", "CORE", "INFO")
@@ -675,6 +635,53 @@ class FuzzingCore:
             alog(f"⚠️ PathFinder unavailable (requires angr)", "CORE", "WARN")
             alog(f"  _HAS_PATH_FINDER={_HAS_PATH_FINDER}", "CORE", "WARN")
 
+    def _ensure_evolution_engine(self, output_dir: str):
+        """Initialize EvolutionEngine if not already done."""
+        if not hasattr(self, 'evolution_engine') or self.evolution_engine is None:
+            self.evolution_engine = EvolutionEngine(output_dir)
+            self.target_profile = None
+            self._init_re_recorder(output_dir)
+
+    def _cleanup_orphan_qemu(self):
+        """Kill orphaned (PPID=1) QEMU processes that leaked from previous runs."""
+        my_pid = os.getpid()
+        my_children = set()
+        try:
+            for pid_str in os.listdir('/proc'):
+                if not pid_str.isdigit():
+                    continue
+                try:
+                    ppid = int(open(f'/proc/{pid_str}/status').read().split('PPid:')[1].split()[0])
+                    if ppid == my_pid:
+                        my_children.add(int(pid_str))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            pgrep = subprocess.run(
+                ['pgrep', '-f', 'qemu-mips|qemu-arm|qemu-mipsel'],
+                capture_output=True, text=True
+            )
+            killed = 0
+            for qpid in [int(p) for p in pgrep.stdout.split() if p.strip()]:
+                if qpid == my_pid or qpid in my_children:
+                    continue
+                try:
+                    exe_name = os.readlink(f'/proc/{qpid}/exe').split('/')[-1]
+                    if not exe_name.startswith('qemu-'):
+                        continue
+                    ppid = int(open(f'/proc/{qpid}/status').read().split('PPid:')[1].split()[0])
+                    if ppid == 1:
+                        os.kill(qpid, 9)
+                        killed += 1
+                except Exception:
+                    continue
+            if killed:
+                alog(f"🧹 Killed {killed} orphaned QEMU processes", "CORE", "WARN")
+        except Exception:
+            pass
+
     def _check_executor_alive(self) -> bool:
         """Watchdog callback: Check if QEMU process is alive"""
         if not self.execution_engine:
@@ -711,10 +718,7 @@ class FuzzingCore:
             self.execution_engine._watchdog = self.watchdog
             
         alog("QEMU Engine restarted by Watchdog", "CORE", "INFO")
-    
-    # ✅ Remove duplicate _start_realtime_visualizer definition
-    # Use the version on line 655, it is more complete and sets the correct variable names
-    
+
     def _extract_covered_blocks(self) -> set:
         """
         Extracts covered basic blocks from the coverage bitmap
@@ -783,7 +787,6 @@ class FuzzingCore:
         # Strategy 2: Exploration Mode (Fallback for saturated graph)
         if self.path_finder and hasattr(self.path_finder, 'exploration_targets') and self.path_finder.exploration_targets:
             targets = self.path_finder.exploration_targets
-            import random
             # Pick targets
             selected = random.sample(targets, min(len(targets), count))
             fork_points = [t['target_syscall_idx'] for t in selected]
@@ -796,8 +799,6 @@ class FuzzingCore:
         
         # Assume trace has syscall_count attribute, or get it via trace.metadata
         # For simplicity, randomly select from 0 to 30 (assumption)
-        import random
-        # Try to get the actual syscall count
         limit = 20
         if hasattr(trace, 'metadata') and hasattr(trace.metadata, 'syscall_count'):
              limit = trace.metadata.syscall_count
@@ -856,13 +857,7 @@ class FuzzingCore:
             return
         
         cov_stats = self.coverage_tracker.get_stats()
-        
-        # Calculate speed
-        elapsed = time.time() - self.start_time
-        if elapsed > 0:
-            # execs_per_sec and elapsed_time are properties, no need to set them
-            pass
-        
+
         alog(f"\n{'━' * 60}", "STATS", "INFO")
         alog(f"Iteration: {self.stats.total_execs}", "STATS", "INFO")
         alog(f"{'━' * 60}", "STATS", "INFO")
@@ -876,15 +871,6 @@ class FuzzingCore:
         else:
             trace_count = 0
         alog(f"Trace pool:  {trace_count} traces", "STATS", "INFO")
-        # The instruction implies uncommenting a debug statement here, but the provided "Code Edit"
-        # seems to be an insertion of new code that is syntactically incorrect in this context.
-        # Assuming the intent was to add a debug log related to trace_pool if it were to be saved/manifested.
-        # Since the original code does not have a commented out `for t_data in data['traces']:` loop,
-        # I will not insert new code that is not present or commented out in the original document.
-        # If there was a commented line like `# alog(f"[TracePool] Manifest Saved: ...", "DEBUG")`, I would uncomment it.
-        # As there isn't, and the provided "Code Edit" is syntactically problematic as an insertion,
-        # I will proceed without adding this specific line, adhering strictly to "uncomment" existing statements.
-
         alog(f"Coverage:    {cov_stats['total_edges']} edges", "STATS", "INFO")
         alog(f"Paths found: {self.stats.paths_found}", "STATS", "INFO")
         alog(f"Crashes:     {self.stats.crashes_found} "
@@ -917,72 +903,6 @@ class FuzzingCore:
         # Online triage blocks the main fuzzing loop and causes watchdog stalls (46s timeout).
         # Crash is already saved to disk; use batch_triage.py for offline analysis instead.
         return 'DEFERRED-OFFLINE'
-
-        network_fd_map = getattr(self.mutator, 'syscall_network_fd_map', {})
-        net_instrs  = [m for m in mutations if network_fd_map.get(getattr(m, 'syscall_index', -1), False)]
-        file_instrs = [m for m in mutations if not network_fd_map.get(getattr(m, 'syscall_index', -1), False)]
-
-        trace_file = trace.file_path if hasattr(trace, 'file_path') else str(trace)
-
-        def _run(instrs, label):
-            if not instrs:
-                return False
-            try:
-                r = self.execution_engine.execute(trace_file, instrs)
-                return getattr(r, 'crashed', False)
-            except Exception as e:
-                alog(f"_triage_crash_online({label}) error: {e}", "CORE", "WARN")
-                return False
-
-        crashed_net  = _run(net_instrs,  'net_only')
-        crashed_file = _run(file_instrs, 'file_only')
-
-        if crashed_net:
-            verdict = 'NETWORK-EXPLOITABLE'
-        elif crashed_file:
-            verdict = 'FILE-FD-ONLY'
-        elif result.crashed:
-            verdict = 'COMBINED-STATE'
-        else:
-            verdict = 'NOT-REPRODUCED'
-
-        print(f"[FuzzingCore] 🔍 Crash triage: net_only={crashed_net} file_only={crashed_file} → {verdict}")
-
-        # Patch verdict into the crash .meta file on disk
-        try:
-            import glob, json
-            crash_dir = os.path.join(self.output_dir, "crashes")
-            # Prefer exact match by crash_id; fallback to most recently modified .meta
-            if crash_id:
-                files = glob.glob(os.path.join(crash_dir, f"{crash_id}.meta"))
-            else:
-                files = []
-            if not files:
-                all_metas = sorted(
-                    glob.glob(os.path.join(crash_dir, "crash_w*.meta")),
-                    key=os.path.getmtime, reverse=True
-                )
-                files = all_metas[:1]
-            for f in files:
-                try:
-                    d = json.loads(open(f).read())
-                    d['triage'] = {
-                        'verdict': verdict,
-                        'crashed_net_only': crashed_net,
-                        'crashed_file_only': crashed_file,
-                        'net_syscall_indices': [getattr(m, 'syscall_index', -1) for m in net_instrs],
-                        'file_syscall_indices': [getattr(m, 'syscall_index', -1) for m in file_instrs],
-                    }
-                    tmp = f + '.tmp'
-                    with open(tmp, 'w') as fh:
-                        json.dump(d, fh, indent=2)
-                    os.replace(tmp, f)
-                except Exception:
-                    pass
-        except Exception as e:
-            alog(f"_triage_crash_online patch-meta failed: {e}", "CORE", "WARN")
-
-        return verdict
 
     def _perform_cfg_analysis(self, trace: Trace, has_new_coverage: bool, trigger_reason: str, iteration_id: int):
         """Performs unified CFG/PathFinder analysis"""
@@ -1024,10 +944,6 @@ class FuzzingCore:
 
         try:
             # Load syscall tree mapping (Auto-detect from HTML bundle)
-            import glob
-            import os
-            from pathlib import Path
-            
             # Request a fresh tree dump from the live fork server parent before searching.
             # This is the only way to get an up-to-date tree during a long fuzzing session
             # (the C-side only exports at process exit otherwise).
@@ -1143,7 +1059,6 @@ class FuzzingCore:
 
                         if exploration_targets:
                             # Pick random subset to avoid overwhelming
-                            import random
                             subset = random.sample(exploration_targets, min(len(exploration_targets), 10))
                             ex_recipes = self.path_finder.generate_recipes(subset, max_recipes=10)
                             if ex_recipes:
@@ -1155,9 +1070,6 @@ class FuzzingCore:
 
     def run_single_iteration(self, iteration_id: int = 0) -> IterationResult:
         """Runs a single fuzzing iteration"""
-        import os
-        import glob
-        
         # ✅ P2: Periodic Seed Import (Seed Loopback)
         if self.sync_dir and (self.stats.total_execs - self.last_seed_sync_iter >= self.seed_sync_interval):
             self.import_external_seeds()
@@ -1166,9 +1078,6 @@ class FuzzingCore:
         # ✅ Task #7: Record iteration start
         self.metrics.success_counts['total_iterations'] += 1
         self.total_iterations += 1
-        
-        import os
-        import glob
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 1: Trace Selection
@@ -1464,12 +1373,7 @@ class FuzzingCore:
                     self.stats.timeouts += 1
 
         # ═════════════════════════════════════════════════════════════════
-        # CFG-guided Fuzzing (Critical Fix!)
-        # 🔥 Fix: Remove has_new_coverage dependency, allow proactive CFG analysis
-        # ═════════════════════════════════════════════════════════════════
-        # ═════════════════════════════════════════════════════════════════
-        # CFG-guided Fuzzing (Critical Fix!)
-        # 🔥 Fix: Remove has_new_coverage dependency, allow proactive CFG analysis
+        # CFG-guided Fuzzing
         # ═════════════════════════════════════════════════════════════════
         if self.path_finder:
             should_run_cfg = False
@@ -1480,8 +1384,6 @@ class FuzzingCore:
             if self.stats.total_execs % 10 == 0:  # Print every 10 iterations
                 alog(f"[FuzzingCore] 🔍 CFG Check: exec={self.stats.total_execs}, last={self.last_cfg_analysis_iter}, interval={self.cfg_analysis_interval_iters}", "DEBUG")
 
-            # ✅ P1: Mixed trigger conditions
-            # ✅ P1: Mixed trigger conditions
             # Condition 1: Iteration threshold reached
             interval = self.cfg_analysis_interval_iters
             elapsed = self.stats.total_execs - self.last_cfg_analysis_iter
@@ -1616,23 +1518,6 @@ class FuzzingCore:
                 trace_id=trace.id
             )
     
-    def _read_visualizer_output(self):
-        """Reads Realtime Visualizer output in a separate thread (refer to fuzz_conductor.py)"""
-        if not self.realtime_viz_process or not self.realtime_viz_process.stdout:
-            return
-        
-        try:
-            while True:
-                line = self.realtime_viz_process.stdout.readline()
-                if not line:
-                    break
-                # Only print important visualizer messages (reduce noise)
-                line_str = line.rstrip()
-                if any(keyword in line_str for keyword in ['✅', '❌', '⚠️', 'FORK', 'ERROR', 'Tree', 'MSG', 'ITER', 'DEBUG', 'SimpleVisualizer', 'Connected', 'Initialized']):
-                    alog(f"[Visualizer] {line_str}", "CORE", "INFO")
-        except Exception as e:
-            alog(f"Visualizer output read error: {e}", "CORE", "ERROR")
-    
     def _start_realtime_visualizer(self):
         """
         Configures C-Side Syscall Tree Export
@@ -1641,25 +1526,17 @@ class FuzzingCore:
         try:
             # Set output path
             if self.enable_pathfinder:
-                # Force enable syscall tree export for PathFinder mapping accuracy
-                from pathlib import Path
                 tree_output_path = Path(self.output_dir) / "latest_syscall_tree.html"
                 os.environ["RR_TREE_OUTPUT"] = str(tree_output_path.absolute())
                 alog(f"[FuzzingCore] 🌲 PathFinder Syscall Tree Configured: output={tree_output_path}", "CORE")
 
             if self.enable_tree_viz:
-                # Clear old pipe vars if any
                 if "RR_TRACE_PIPE" in os.environ:
                     del os.environ["RR_TRACE_PIPE"]
                 alog(f"[FuzzingCore] 🎨 Visualizer enabled", "CORE")
             
         except Exception as e:
             alog(f"❌ Failed to configure syscall tree: {e}", "CORE", "ERROR")
-
-    def _stop_realtime_visualizer(self):
-        """Stub"""
-        pass
-
 
     def _get_coverage_percentage(self):
         """Gets current coverage percentage"""
@@ -1838,13 +1715,6 @@ class FuzzingCore:
         """
         Execute actual fuzzing loop, supporting various stop conditions
         """
-        # ═══════════════════════════════════════════════════════════════
-        # ✅ Note: Visualizer already started in __init__, do not restart
-        # ═══════════════════════════════════════════════════════════════
-        # Start now if not already started
-        if self.enable_tree_viz and not self.realtime_viz_process:
-            self._start_realtime_visualizer()
-
         # ✅ Check and Start Watchdog
         if self.watchdog and not self.watchdog.running:
              self.watchdog.start()
@@ -1939,54 +1809,7 @@ class FuzzingCore:
 
                 # 🧹 Periodic orphan QEMU cleanup — kill any stray qemu child processes
                 if iteration > 0 and iteration % 50 == 0:
-                    import subprocess, os
-                    my_pid = os.getpid()
-                    # Collect direct children of this process so we never kill them
-                    try:
-                        _my_children = set()
-                        for _child_pid_str in os.listdir('/proc'):
-                            if not _child_pid_str.isdigit():
-                                continue
-                            try:
-                                _stat = open(f'/proc/{_child_pid_str}/status').read()
-                                _ppid = int(_stat.split('PPid:')[1].split()[0])
-                                if _ppid == my_pid:
-                                    _my_children.add(int(_child_pid_str))
-                            except Exception:
-                                pass
-                    except Exception:
-                        _my_children = set()
-                    try:
-                        _pgrep = subprocess.run(
-                            ['pgrep', '-f', 'qemu-mips|qemu-arm|qemu-mipsel'],
-                            capture_output=True, text=True
-                        )
-                        qemu_pids = [int(p) for p in _pgrep.stdout.split() if p.strip()]
-                        killed = 0
-                        for qpid in qemu_pids:
-                            # Never kill ourselves or our direct children
-                            if qpid == my_pid or qpid in _my_children:
-                                continue
-                            try:
-                                # Only kill actual QEMU processes (executable name starts with qemu-)
-                                # This prevents accidentally killing other fuzz_main.py instances
-                                # whose cmdline contains "qemu-mipsel" as an argument
-                                try:
-                                    exe_name = os.readlink(f'/proc/{qpid}/exe').split('/')[-1]
-                                    if not exe_name.startswith('qemu-'):
-                                        continue  # Skip non-QEMU processes
-                                except Exception:
-                                    continue  # Can't verify, skip to be safe
-                                ppid = int(open(f'/proc/{qpid}/status').read().split('PPid:')[1].split()[0])
-                                if ppid == 1:  # orphan adopted by init
-                                    os.kill(qpid, 9)
-                                    killed += 1
-                            except Exception:
-                                pass
-                        if killed:
-                            alog(f"🧹 Killed {killed} orphaned QEMU processes", "CORE", "WARN")
-                    except Exception:
-                        pass
+                    self._cleanup_orphan_qemu()
                 
                 if result and result.is_failure():
                     alog(f"⚠️  Iteration {iteration} failed: {result}", "CORE", "WARN")
@@ -2011,14 +1834,8 @@ class FuzzingCore:
                 alog(f"💾 Saving final checkpoint...", "CORE", "INFO")
                 self.checkpoint_manager.save(self)
 
-            # ═══════════════════════════════════════════════════════════════
-            # Option A: Stop Realtime Visualizer and generate final tree
-            # ═══════════════════════════════════════════════════════════════
             alog(f"⏳ Waiting for components to finalize...", "CORE", "INFO")
-            alog(f"⏳ Waiting for components to finalize...", "CORE", "INFO")
-            time.sleep(5)  # ✅ Wait for all messages to be processed
-            alog(f"⏳ Stopping Visualizer...", "CORE", "INFO")
-            self._stop_realtime_visualizer()
+            time.sleep(5)
             
             # Final statistics
             self._display_final_statistics()
@@ -2035,24 +1852,11 @@ class FuzzingCore:
         self.save_final_results()
     
     def save_final_results(self):
-        """
-        Save final results to disk
-        
-        Layer 5 Integration: Auto-generate all monitoring and analysis reports
-        """
-        import json
-        from pathlib import Path
-        
+        """Save final results to disk."""
         output_path = Path(self.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Display final statistics before saving
+
         self._display_progress(force=True)
-        
-        # 🔥 DEBUG: Check stats object identity and values
-        alog(f"DEBUG: stats.total_execs={self.stats.total_execs}, type={type(self.stats)}", "CORE", "DEBUG")
-        alog(f"DEBUG: cov_tracker.total_edges={self.coverage_tracker.total_edges_cached}", "CORE", "DEBUG")
-        
         alog(f"💾 Saving final results...", "CORE", "INFO")
         
         # Save corpus (Layer 2)
@@ -2202,87 +2006,6 @@ class FuzzingCore:
                 alog("✅ Project cleanup complete. Goodbye!", "CORE", "INFO")
                 self.logger.stop()
     
-    def _generate_syscall_trees(self, output_path: Path):
-        """
-        Generate Syscall Tree Visualization (Layer 5 key feature)
-        
-        Generates a unified horizontal tree visualization for all traces.
-        Uses D3.js tree layout for a true hierarchical structure.
-        """
-        trees_dir = output_path / "syscall_trees"
-        trees_dir.mkdir(exist_ok=True)
-        
-        # Collect all trace files
-        trace_files = []
-        labels = []
-        
-        # 1. Initial trace
-        if os.path.exists(self.initial_trace):
-            trace_files.append(self.initial_trace)
-            labels.append("Initial Trace")
-        
-        # 2. Corpus traces (limit to top 10)
-        corpus_dir = Path(self.output_dir) / "corpus"
-        if corpus_dir.exists():
-            for trace_file in sorted(corpus_dir.glob("*.bin"))[:10]:
-                trace_files.append(str(trace_file))
-                labels.append(f"Corpus: {trace_file.stem}")
-        
-        # 3. Crash traces (limit to top 5)
-        crashes_dir = Path(self.output_dir) / "crashes"
-        if crashes_dir.exists():
-            for crash_file in sorted(crashes_dir.glob("*.bin"))[:5]:
-                trace_files.append(str(crash_file))
-                labels.append(f"Crash: {crash_file.stem}")
-        
-        if not trace_files:
-
-            return
-        
-        # Use TreeVisualizer to generate horizontal tree (with stats)
-        alog(f"  🌳 Generating tree visualization for {len(trace_files)} traces...", "CORE", "INFO")
-        
-        try:
-            viz = TreeVisualizer()
-            
-            for trace_file, label in zip(trace_files, labels):
-                # ✅ Get statistics for this trace
-                # Extract trace_id from filename (if it's a corpus file)
-                trace_id = None
-                if 'corpus' in str(trace_file):
-                    trace_id = Path(trace_file).stem
-                # ✅ Fix: Initial trace should be independent, not using corpus stats
-                # Because initial trace has no mutations, it shouldn't share stats with mutated traces
-                
-                # Build stats dict
-                stats_dict = None
-                if trace_id:
-                    syscall_stats = self.trace_manager.get_syscall_stats(trace_id)
-                    if syscall_stats:
-                        stats_dict = {
-                            'syscall_stats': syscall_stats,
-                            'trace_id': trace_id
-                        }
-                    alog(f"  📊 Found stats for {trace_id}: {len(syscall_stats)} syscalls have data", "CORE", "DEBUG")
-                else:
-                    # Initial trace has no stats (all mutation_applied=False)
-                    alog(f"  📊 {label} has no stats (initial trace, no mutations)", "CORE", "DEBUG")
-                
-                # Add trace (with stats)
-                viz.add_trace(trace_file, label, stats=stats_dict)
-            
-            tree_html = trees_dir / "syscall_tree.html"
-            if viz.generate_html(str(tree_html)):
-                alog(f"  ✅ Tree generated: {tree_html}", "CORE", "INFO")
-                alog(f"  📂 View tree: file://{tree_html.absolute()}", "CORE", "INFO")
-            else:
-                alog(f"  ⚠️  Failed to generate tree visualization", "CORE", "WARN")
-        
-        except Exception as e:
-            alog(f"  ⚠️  Tree generation failed: {e}", "CORE", "ERROR")
-            import traceback
-            traceback.print_exc()
-    
     def sync_pool_pruning(self):
         """Synchronizes TracePool pruning with TraceManager/SeedQueue"""
         removed_ids = self.trace_pool.prune_redundant_traces(max_per_category=20)
@@ -2317,11 +2040,6 @@ class FuzzingCore:
         
         # Display final statistics if not already shown recently
         self._display_progress(force=True)
-        
-        # ═══════════════════════════════════════════════════════════════
-        # Option A: Ensure Realtime Visualizer is stopped
-        # ═══════════════════════════════════════════════════════════════
-        self._stop_realtime_visualizer()
         
         # ✅ Fix: Gracefully stop persistent QEMU executor
         if hasattr(self, 'execution_engine') and self.execution_engine:

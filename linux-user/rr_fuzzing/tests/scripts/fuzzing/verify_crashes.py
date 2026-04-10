@@ -105,19 +105,42 @@ def load_crash_samples(crash_dir: Path) -> dict:
 
 # ── single variant runner ────────────────────────────────────────────────────
 
-def run_variant(executor: QEMUExecutor, trace_file: str,
-                instrs: list, label: str) -> tuple:
-    """Run one variant. Returns (crashed: bool, description: str)."""
+def run_variant(qemu_path: str, target_binary: str, ld_prefix: str, timeout: float,
+                trace_file: str, instrs: list, label: str,
+                target_args: str = '', fork_point: int = 0) -> tuple:
+    """
+    Run one variant using execute_fork() — the only path that propagates crash signals.
+    Each call uses a fresh executor to prevent state pollution between runs.
+    """
     if not instrs:
         return False, "skipped (no mutations)"
+    executor = QEMUExecutor(
+        qemu_path=qemu_path,
+        target_binary=target_binary,
+        target_args=target_args,
+        ld_prefix=ld_prefix or None,
+        timeout=timeout,
+    )
     try:
-        result = executor.execute(trace_file, instrs)
-        crashed = result.crashed
+        results = executor.execute_fork(
+            trace_file=trace_file,
+            fork_point=fork_point,
+            mutation_variants=[instrs],
+            depth=0,
+            iteration_id=0,
+        )
+        if not results:
+            return False, "no result"
+        result = results[0]
+        crashed = getattr(result, 'crashed', False)
         sig = getattr(result, 'signal_number', '')
-        desc = f"status={result.status_name} sig={sig}"
+        status_name = getattr(result, 'status_name', 'unknown')
+        desc = f"status={status_name} sig={sig}"
         return crashed, desc
     except Exception as e:
         return False, f"error: {e}"
+    finally:
+        executor.stop_persistent_qemu()
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -133,6 +156,8 @@ def main():
                     help="Target args as single string, e.g. '-p 8093'")
     ap.add_argument("--net-indices",  default="81",
                     help="Comma-separated socket-fd syscall indices")
+    ap.add_argument("--fork-point",   type=int, default=0,
+                    help="Fork point (auth_boundary) for execute_fork replay")
     ap.add_argument("--top-n",        type=int, default=10)
     ap.add_argument("--timeout",      type=float, default=8.0)
     ap.add_argument("--output",       default="verify_results.json")
@@ -156,14 +181,15 @@ def main():
 
     samples = load_crash_samples(crash_dir)
 
-    # Build executor (persistent fork server, reused across variants)
-    executor = QEMUExecutor(
+    # Each variant gets its own fresh executor to prevent state pollution.
+    # Uses execute_fork() — the only path that propagates crash signals via IPC.
+    run_kwargs = dict(
         qemu_path=args.qemu,
         target_binary=args.target,
-        target_args=args.args,          # string, not list
-        ld_prefix=args.ld_prefix or None,
+        ld_prefix=args.ld_prefix,
         timeout=args.timeout,
-        persistent_mode=True,
+        target_args=args.args,
+        fork_point=args.fork_point,
     )
 
     results = {}
@@ -190,9 +216,9 @@ def main():
         net_instrs  = [i for i in all_instrs if i.syscall_index in net_indices]
         file_instrs = [i for i in all_instrs if i.syscall_index not in net_indices]
 
-        crashed_all,  desc_all  = run_variant(executor, args.trace, all_instrs,  "all")
-        crashed_net,  desc_net  = run_variant(executor, args.trace, net_instrs,  "net")
-        crashed_file, desc_file = run_variant(executor, args.trace, file_instrs, "file")
+        crashed_all,  desc_all  = run_variant(**run_kwargs, trace_file=args.trace, instrs=all_instrs,  label="all")
+        crashed_net,  desc_net  = run_variant(**run_kwargs, trace_file=args.trace, instrs=net_instrs,  label="net")
+        crashed_file, desc_file = run_variant(**run_kwargs, trace_file=args.trace, instrs=file_instrs, label="file")
 
         if crashed_net:
             verdict = "✅ NETWORK-EXPLOITABLE"
@@ -220,8 +246,6 @@ def main():
             "desc_net":          desc_net,
             "desc_file":         desc_file,
         }
-
-    executor.stop_persistent_qemu()
 
     out = Path(args.output)
     out.write_text(json.dumps(results, indent=2))

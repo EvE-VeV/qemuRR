@@ -364,12 +364,7 @@ class BaseMutator:
                 # Get buffer argument index (read's second argument is buffer pointer)
                 buf_arg_index = 1
                 
-                # Chance to use attack patterns instead of IOMutator content
                 content_to_use = m.buffer_content
-                alog(f"WARN: Inside buffer_content. Dict len: {len(self.dictionary)}", "MUTATOR", "WARN")
-                with open("/tmp/debug_token.txt", "a") as df:
-                    df.write(f"INSIDE BUFFER: Dict len={len(self.dictionary)}\n")
-                
                 # Chance to use attack patterns instead of IOMutator content
                 if random.random() < 0.01: # Reduced from 0.3 to force dictionary
                      patterns = [
@@ -522,7 +517,6 @@ class BaseMutator:
         if len(instructions) > FUZZ_MAX_INSTRUCTIONS:
             alog(f"Random mutation generated {len(instructions)} instructions, truncating to {FUZZ_MAX_INSTRUCTIONS}", "MUTATOR", "WARN")
             instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
-            instructions = instructions[:FUZZ_MAX_INSTRUCTIONS]
 
         return instructions
 
@@ -614,8 +608,6 @@ class SmartMutator:
         # FD tracking and environment filtering
         self._perform_fd_tracking()
         
-        # These can be removed later
-        # These can be removed later
         alog(f"Found {len(self.pure_candidates)} pure replay syscalls:", "MUTATOR", "DEBUG")
         for cand in self.pure_candidates[:10]:  # Only print first 10
             alog(f"  index={cand.index}, name={cand.name}, nr={cand.syscall_nr}", "MUTATOR", "DEBUG")
@@ -763,13 +755,6 @@ class SmartMutator:
         Returns:
             bool: True to skip, False to allow mutation
         """
-        # Core protection
-        # 1. General startup phase protection: First 40 syscalls usually ld.so and libc init
-        # Remove hardcoded index < 40 check, use PathFinder smart filtering instead
-        # if index < 40:
-        #    alog(f"Startup Protection: Skip early init syscall (index={index})", "MUTATOR", "DEBUG")
-        #    return True
-            
         syscall_name = getattr(syscall_info, 'name', '').lower()
         
         # 2. Identified Forbidden FD protection
@@ -800,10 +785,6 @@ class SmartMutator:
                     break
             
             if not is_target_reachable:
-                # If syscall is in trace but never called/covered by BB in target range,
-                # it's likely called by early loader or libc init code.
-                # alog(f"PathFinder Filter: Skip non-target syscall (index={index}, {syscall_name})", "MUTATOR", "DEBUG")
-                pass
                 return True
         
         return False
@@ -1012,9 +993,9 @@ class SmartMutator:
                         if token not in self.dictionary:
                             self.dictionary.append(token)
                             count += 1
-                    except:
+                    except Exception:
                         pass
-            
+
             # Common Magic Bytes and Protocol Keywords
             common_magics = [
                 # HTTP / Web
@@ -1538,8 +1519,8 @@ class SmartMutator:
             instr = FuzzInstruction(index, FUZZ_CMD_BOUNDARY_VALUE, 1, data, mutation_type='boundary_value')
 
         elif strategy_type == 9:
-            # MUTATE_FLAGS
-            data = struct.pack('B', random.choice([1, 4]))
+            # MUTATE_FLAGS — C handler requires uint64_t (8 bytes), pack accordingly
+            data = struct.pack('Q', random.choice([1, 4, 0x40, 0x80, 0x100, 0x200]))
             instr = FuzzInstruction(index, FUZZ_CMD_MUTATE_FLAGS, 0, data, mutation_type='flags')
 
         elif strategy_type == 10:
