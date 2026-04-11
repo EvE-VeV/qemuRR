@@ -557,7 +557,11 @@ int rr_fork_server_loop(void)
                     }
                     
                     RR_INFO("Batch fork: %d variants", num_variants);
-                    
+
+                    /* Reset coverage BEFORE forking: child(ren) write fresh data; Python reads
+                     * after the last rr_ipc_send_status() with no risk of being wiped. */
+                    rr_coverage_reset();
+
                     /* Batch fork multiple child processes */
                     pid_t child_pids[RR_MAX_VARIANTS];
                     memset(child_pids, 0, sizeof(child_pids));
@@ -750,7 +754,6 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Batch fork completed");
                     g_rr_framework->child_pid = 0;
-                    rr_coverage_reset();
                 }
                 break;
 
@@ -763,6 +766,10 @@ int rr_fork_server_loop(void)
                         RR_VERBOSE("Case 'F': iteration_id=%u from shared memory", shm->iteration_id);
                     }
                     
+                    /* Reset coverage BEFORE forking: child writes fresh data; Python reads it
+                     * after rr_ipc_send_status() returns with no risk of being wiped. */
+                    rr_coverage_reset();
+
                     /* ===== CRITICAL FIX: Load Fuzz instructions from shared memory BEFORE fork ===== */
                     if (g_rr_framework->shared_memory) {
                         RR_VERBOSE("Loading fuzz instructions from shared memory before fork");
@@ -965,10 +972,9 @@ int rr_fork_server_loop(void)
                         }
                         
                         g_rr_framework->child_pid = 0;
-                        
+
                         /* Reset fork point state for next iteration */
                         g_at_fork_point = false;
-                        rr_coverage_reset();
                         RR_VERBOSE("Reset fork point for next iteration");
                         RR_VERBOSE("Completed execution (child process finished)");
 
@@ -1004,9 +1010,12 @@ int rr_fork_server_loop(void)
                         RR_INFO("Sent ITERATION message");
                     }
                     
+                    /* Reset coverage BEFORE forking so Python reads this execution's data. */
+                    rr_coverage_reset();
+
                     // Fork a child to execute the full baseline trace
                     rr_reset_trace_position();
-                    
+
                     pid_t baseline_pid = fork();
                     if (baseline_pid < 0) {
                         RR_ERROR("Fork failed for baseline execution");
@@ -1085,7 +1094,6 @@ int rr_fork_server_loop(void)
                         RR_INFO("Baseline execution completed");
                         rr_ipc_send_status(0);
                     }
-                    rr_coverage_reset();
                 }
                 break;
 
@@ -1168,10 +1176,14 @@ int rr_fork_server_loop(void)
                     memset(child_pids, 0, sizeof(child_pids));
                     int status;
                     
+                    /* Reset coverage BEFORE forking: all children write fresh data into a clean
+                     * bitmap; Python reads the union after the last rr_ipc_send_status(). */
+                    rr_coverage_reset();
+
                     /* Check parent strace replay state */
                     bool parent_strace_enabled = rr_strace_replay_enabled();
                     RR_INFO("🔍 DEBUG: Parent strace_replay_enabled=%d before fork", parent_strace_enabled);
-                    
+
                     for (int variant_idx = 0; variant_idx < num_variants; variant_idx++) {
                         FuzzVariant *variant = &shm->variants[variant_idx];
                         size_t count = variant->instruction_count;
@@ -1437,8 +1449,6 @@ int rr_fork_server_loop(void)
                     
                     RR_INFO("Fork completed: %d variants", num_variants);
                     g_rr_framework->child_pid = 0;
-                    /* Reset coverage after Python has read the bitmap (reset before next batch) */
-                    rr_coverage_reset();
                 }
                 break;
 
