@@ -541,7 +541,9 @@ class DynamicForkController:
                             # ✅ Task #8: Deep Analysis & Saving ONLY IF CRASHED
                             is_unique = False
                             if result.crashed:
-                                if self.crash_detector:
+                                if getattr(result, 'is_fork_artifact', False):
+                                    alog(f"Fork artifact ignored (fake-fd EBADF, not mutation-triggered): signal={result.signal_number}", "DFC", "WARN")
+                                elif self.crash_detector:
                                     alog(f"Saving crash report...", "DFC", "INFO")
                                     if result.crashed:
                                         # ✅ Active PC Capture: Read PC from SHM
@@ -553,8 +555,8 @@ class DynamicForkController:
                                     trace_obj = self.current_trace
                                     # Ensure trace object has file_path
                                     if trace_obj and not hasattr(trace_obj, 'file_path'):
-                                        trace_obj = None 
-                                    
+                                        trace_obj = None
+
                                     # Log crash details to detector
                                     _muts_i = mutations[i] if i < len(mutations) else mutations[0]
                                     is_unique = self.crash_detector.save_crash(

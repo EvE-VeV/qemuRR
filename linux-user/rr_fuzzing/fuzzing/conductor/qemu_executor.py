@@ -50,6 +50,7 @@ class ExecutionResult:
     signal_number: Optional[int] = None
     pc: Optional[int] = None
     fault_address: Optional[int] = None
+    is_fork_artifact: bool = False
     
     @property
     def crashed(self) -> bool:
@@ -645,6 +646,8 @@ class QEMUExecutor:
                          if self.qemu_process.poll() is not None:
                              exit_code = self.qemu_process.returncode
                              alog(f"❌ QEMU Process Exited Unexpectedly with Code: {exit_code}", "EXEC", "ERROR")
+                             if exit_code is not None and exit_code < 0:
+                                 return (STATUS_CRASH, exit_code, -exit_code, False)
                              return None
                     return None
                     
@@ -657,23 +660,22 @@ class QEMUExecutor:
                             extra_bytes = os.read(self.status_pipe_read, 8)
                             if len(extra_bytes) == 8:
                                 exit_code, signal_number = struct.unpack('ii', extra_bytes)
-                                return (status, exit_code, signal_number)
+                                return (status, exit_code, signal_number, True)
                             else:
                                 alog(f"⚠️ Incomplete crash data: {len(extra_bytes)} bytes", "EXEC", "WARN")
-                                return (status, None, None)
+                                return (status, None, None, True)
                         except Exception as e:
                             alog(f"⚠️ Failed to read crash details: {e}", "EXEC", "ERROR")
-                            return (status, None, None)
+                            return (status, None, None, True)
                     else:
                         # Non-crash status, no extra data needed
-                        return (status, None, None)
+                        return (status, None, None, True)
 
             # Check if process is still alive
             if self.qemu_process and self.qemu_process.poll() is not None:
                 # Process exited unexpectedly
                 exit_code = self.qemu_process.returncode
                 alog(f"❌ QEMU Process Exited Unexpectedly with Code: {exit_code}", "EXEC", "ERROR")
-                # Try to read stderr if available
                 if self.qemu_process.stderr:
                    try:
                        err_out = self.qemu_process.stderr.read()
@@ -681,6 +683,8 @@ class QEMUExecutor:
                            print(f"[QEMUExecutor] 📜 Last Stderr: {err_out.decode('utf-8', errors='replace')}")
                    except Exception:
                        pass
+                if exit_code is not None and exit_code < 0:
+                    return (STATUS_CRASH, exit_code, -exit_code, False)
                 return None
 
         return None  # Timeout
@@ -945,23 +949,30 @@ class QEMUExecutor:
             coverage_bitmap = self._read_coverage()
             
             # Step 8: Unpack status and crash details
-            status, exit_code, signal_number = status_data
-            
+            status, exit_code, signal_number, from_ipc_pipe = status_data
+
             # Step 9: Determine status name
             # Ensure STATUS_NORMAL_EXIT (3) is explicitly handled
             if status == 3:
                 status_name = "normal_exit"
             else:
                 status_name = self._STATUS_MAP.get(status, f"unknown_{status}")
-            
+
+            is_fork_artifact = False
             if status == STATUS_CRASH:
                 self.total_crashes += 1
                 # Read crash PC from SHM (first variant for execute method)
                 crash_pc = self.shm.read_crash_pc(0)
-                print(f"[QEMUExecutor] CRASH DETECTED at PC=0x{crash_pc:x}! exit_code={exit_code}, signal={signal_number}")
+                # Fork artifacts: QEMU exited via signal without C crash handler running.
+                # Identified by: unexpected exit (not reported via IPC pipe).
+                # These are caused by fake-fd side effects (accept() returns recorded fd
+                # without creating a real OS fd; subsequent fcntl/select fail with EBADF).
+                is_fork_artifact = not from_ipc_pipe
+                artifact_tag = " [FORK ARTIFACT - FILTERED]" if is_fork_artifact else ""
+                print(f"[QEMUExecutor] CRASH DETECTED at PC=0x{crash_pc:x}! exit_code={exit_code}, signal={signal_number}{artifact_tag}")
             else:
                 crash_pc = 0
-            
+
             # In persistent mode, fork server returns AT_FORK_POINT (2) after execution.
             if status == STATUS_AT_FORK_POINT:
                 # Fork server is ready for next command
@@ -977,7 +988,7 @@ class QEMUExecutor:
                     self._terminate_qemu()
                     self._qemu_ready = False
                     exit_code = -1
-            
+
             return ExecutionResult(
                 status=status,
                 status_name=status_name,
@@ -985,7 +996,8 @@ class QEMUExecutor:
                 execution_time=time.time() - start_time,
                 qemu_exit_code=exit_code,
                 signal_number=signal_number,
-                pc=crash_pc
+                pc=crash_pc,
+                is_fork_artifact=is_fork_artifact
             )
         
         except Exception as e:
@@ -1106,7 +1118,7 @@ class QEMUExecutor:
                         break
                     
                     # Unpack status and crash details
-                    status, exit_code, signal_number = result_data
+                    status, exit_code, signal_number, from_ipc_pipe = result_data
 
                     # Parent overshot fork_point — drain remaining variants then restart
                     if status == STATUS_NEED_RESTART:
@@ -1130,13 +1142,16 @@ class QEMUExecutor:
                     
                     print(f"[QEMUExecutor] Variant {variant_idx}: Read status={status}, name={status_name}")
                     
+                    is_fork_artifact = False
                     if status == STATUS_CRASH:
                         self.total_crashes += 1
                         crash_pc = self.shm.read_crash_pc(variant_idx)
-                        print(f"[QEMUExecutor] CRASH DETECTED at PC=0x{crash_pc:x}! exit_code={exit_code}, signal={signal_number}")
+                        is_fork_artifact = not from_ipc_pipe
+                        artifact_tag = " [FORK ARTIFACT - FILTERED]" if is_fork_artifact else ""
+                        print(f"[QEMUExecutor] CRASH DETECTED at PC=0x{crash_pc:x}! exit_code={exit_code}, signal={signal_number}{artifact_tag}")
                     else:
                         crash_pc = 0
-                    
+
                     result = ExecutionResult(
                         status=status,
                         status_name=status_name,
@@ -1144,7 +1159,8 @@ class QEMUExecutor:
                         execution_time=time.time() - start_time,
                         qemu_exit_code=exit_code,
                         signal_number=signal_number,
-                        pc=crash_pc
+                        pc=crash_pc,
+                        is_fork_artifact=is_fork_artifact
                     )
                     
                     if status == STATUS_CRASH:

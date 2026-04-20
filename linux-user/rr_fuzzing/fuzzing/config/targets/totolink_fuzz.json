@@ -3,7 +3,7 @@
     "arch": "mips",
     "trace_file": "seeds/TOTOLINK/boa_totolink_v2.trace",
     "dictionary": "config/dicts/totolink_http.dict",
-    "fork_point": 180,
+    "fork_point": 204,
     "protocol": "http",
     "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
     "binary_path": "bin/boa",

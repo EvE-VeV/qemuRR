@@ -19,4 +19,4 @@ python3 /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/fuzzing/fuzz_main.py 
     --ld-prefix /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root \
     --word-size 32 \
     --args "-c /home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root/etc/boa -d" \
-    --workers 4
+    --workers ${WORKERS:-1}

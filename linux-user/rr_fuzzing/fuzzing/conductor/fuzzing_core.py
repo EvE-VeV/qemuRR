@@ -1332,14 +1332,17 @@ class FuzzingCore:
                 # Step 6: Crash Detection and Saving
                 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                 if result.crashed:
-                    saved_id = self.crash_detector.save_crash(result, trace, mutations)
-                    if saved_id:
-                        self.stats.crashes_found += 1
-                        crashes_found_count += 1
-                        print(f"[FuzzingCore] 💥 NEW UNIQUE CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
-                        self._triage_crash_online(trace, mutations, result, crash_id=saved_id)
+                    if getattr(result, 'is_fork_artifact', False):
+                        print(f"[FuzzingCore] ⚠️ Fork artifact ignored (fake-fd EBADF side effect, not mutation-triggered): signal={result.signal_number}, pc=0x{getattr(result, 'pc', 0) or 0:x}")
                     else:
-                        print(f"[FuzzingCore] 💥 Duplicate crash ignored (Stats consistency)")
+                        saved_id = self.crash_detector.save_crash(result, trace, mutations)
+                        if saved_id:
+                            self.stats.crashes_found += 1
+                            crashes_found_count += 1
+                            print(f"[FuzzingCore] 💥 NEW UNIQUE CRASH FOUND! exit_code={result.qemu_exit_code}, signal={result.signal_number}")
+                            self._triage_crash_online(trace, mutations, result, crash_id=saved_id)
+                        else:
+                            print(f"[FuzzingCore] 💥 Duplicate crash ignored (Stats consistency)")
 
                     if self.layer5_crash_analyzer:
                         qemu_status = {

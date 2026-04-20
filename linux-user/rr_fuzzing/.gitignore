@@ -4,6 +4,9 @@ evaluation/
 evaluation.md
 paper_data_patch.md
 campaign_statistics.md
+firmware_targets_analysis.md
+rrfuzz_full.md
+verify_results.json
 crashes/real_world_repro/
 crashes/newbugs/
 tests/seeds/**/*.bin
