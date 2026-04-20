@@ -22,7 +22,8 @@ nohup env \
     --qemu "${VT}/Asus_RTAX56U/qemu_wrapper.sh" \
     --trace "${VT}/Asus_RTAX56U/traces/init.trace" \
     --target "${VT}/Asus_RTAX56U/rootfs/usr/sbin/httpd" \
-    --ld-prefix "${VT}/Asus_RTAX56U/rootfs" > "${RR_ROOT}/fuzz_output_rtax56u/launch.log" 2>&1 &
+    --ld-prefix "${VT}/Asus_RTAX56U/rootfs" \
+    --fork-point 476 > "${RR_ROOT}/fuzz_output_rtax56u/launch.log" 2>&1 &
 
 PID=$!
 echo "    PID=$PID"

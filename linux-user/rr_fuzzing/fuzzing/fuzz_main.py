@@ -65,8 +65,47 @@ def main():
                         help="Syscall index marking end of auth phase. Mutations on network-fd "
                              "syscalls after this index are prioritised as the primary attack "
                              "surface (post-auth network input). Default=0 (disabled).")
-    
+    # Auto-record mode
+    parser.add_argument("--auto-record", action="store_true",
+                        help="Auto-discover endpoints and record traces before fuzzing. "
+                             "Requires --sim-root. Produces traces consumed by multi-trace mode.")
+    parser.add_argument("--sim-root", default=None,
+                        help="Path to target rootfs (used by --auto-record for endpoint discovery "
+                             "and as QEMU LD prefix if --ld-prefix is not specified).")
+    parser.add_argument("--auto-record-max", type=int, default=20,
+                        help="Max endpoints to probe in --auto-record mode (default: 20).")
+    parser.add_argument("--multi-trace", action="store_true",
+                        help="Run all resolved traces in round-robin via MultiTraceFuzzer.")
+    parser.add_argument("--chunk", type=int, default=500,
+                        help="Iterations per trace per rotation in --multi-trace mode (default: 500).")
+
     args = parser.parse_args()
+
+    # ── Auto-record mode ──────────────────────────────────────────────────────
+    if args.auto_record:
+        from recorder.auto_recorder import AutoRecorder
+        sim_root = args.sim_root or args.ld_prefix
+        if not sim_root:
+            print("[!] --auto-record requires --sim-root (or --ld-prefix)", file=sys.stderr)
+            sys.exit(1)
+        auto_out = str(Path(args.output) / 'auto_traces')
+        print(f"[*] --auto-record: discovering endpoints and recording traces → {auto_out}")
+        recorder = AutoRecorder(
+            qemu_path=args.qemu,
+            target_binary=args.target,
+            sim_root=sim_root,
+            output_dir=auto_out,
+        )
+        recorded = recorder.run(max_endpoints=args.auto_record_max)
+        if not recorded:
+            print("[!] --auto-record produced 0 valid traces — check target startup", file=sys.stderr)
+            sys.exit(1)
+        # Inject auto-recorded traces into --traces list for downstream use
+        if not args.traces:
+            args.traces = recorded
+        else:
+            args.traces = list(args.traces) + recorded
+        print(f"[*] Auto-record complete: {len(recorded)} traces added")
 
     # ── Resolve seed traces ──────────────────────────────────────────────────
     # Priority: --traces > --trace-dir > --trace
@@ -90,6 +129,29 @@ def main():
         print(f"[*] Multi-seed mode: {len(all_traces)} traces loaded")
         for i, t in enumerate(all_traces):
             print(f"    [{i}] {t}")
+
+    # ── Multi-trace round-robin mode ─────────────────────────────────────────
+    if args.multi_trace and len(all_traces) > 1:
+        from orchestrator.multi_trace_fuzzer import MultiTraceFuzzer
+        core_kw = {}
+        if args.ld_prefix:
+            core_kw['ld_prefix'] = args.ld_prefix
+        elif args.sim_root:
+            core_kw['ld_prefix'] = args.sim_root
+        if args.auth_boundary:
+            core_kw['auth_boundary'] = args.auth_boundary
+        if args.fork_point is not None:
+            core_kw['manual_fork_point'] = args.fork_point
+        fuzzer = MultiTraceFuzzer(
+            traces=all_traces,
+            qemu_path=args.qemu,
+            target_binary=args.target,
+            output_dir=args.output,
+            rotation_chunk=args.chunk,
+            **core_kw,
+        )
+        fuzzer.run(total_iterations=args.iterations)
+        return 0
 
     global _fuzzing_core_ref
     fuzzing_core = None

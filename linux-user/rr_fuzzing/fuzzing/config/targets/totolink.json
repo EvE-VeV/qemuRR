@@ -1,5 +1,5 @@
 {
-    "name": "TOTOLINK_A720R",
+    "name": "TOTOLINK_N200RE",
     "arch": "mips",
     "rootfs_path": "/home/webfuzz/Documents/qemu/linux-user/rr_fuzzing/tests/images/Totolink/extracted_firmware/sim_root",
     "binary_path": "bin/boa",

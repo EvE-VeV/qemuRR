@@ -136,13 +136,13 @@ launch_fuzzer "rtax88u" \
     --target "${VT}/Asus_RTAX88U/sim_root/usr/sbin/httpd" \
     --ld-prefix "${VT}/Asus_RTAX88U/sim_root"
 
-# 13. TOTOLINK A720R (MIPS-BE) - BOA
-echo "[*] 13/15 TOTOLINK A720R"
-launch_fuzzer "a720r" \
+# 13. TOTOLINK N200RE (MIPS-BE) - BOA
+echo "[*] 13/15 TOTOLINK N200RE"
+launch_fuzzer "n200re" \
     --qemu "$QEMU_MIPS" \
-    --trace "tests/seeds/TOTOLINK_A720R.trace" \
-    --target "${VT}/TOTOLINK_A720R/rootfs/bin/boa" \
-    --ld-prefix "${VT}/TOTOLINK_A720R/rootfs" \
+    --trace "tests/seeds/TOTOLINK/boa_totolink_v2.trace" \
+    --target "${RR_ROOT}/tests/images/Totolink/extracted_firmware/sim_root/bin/boa" \
+    --ld-prefix "${RR_ROOT}/tests/images/Totolink/extracted_firmware/sim_root" \
     --args="-d" \
     --word-size 32
 

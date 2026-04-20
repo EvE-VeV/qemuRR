@@ -350,6 +350,13 @@ class BaseMutator:
         instructions = []
         for m in selected_mutations:
             # 1. Return value mutation
+            # Guard: skip retval mutation on non-network FDs when fork_point is active.
+            # File-FD retval manipulation causes unreachable-by-attacker heap corruption.
+            _is_net = self.syscall_network_fd_map.get(m.syscall_index, False)
+            if fork_point is not None and not _is_net:
+                alog(f"io_return_value: skip file-FD sc={m.syscall_index}", "MUTATOR", "DEBUG")
+                continue
+
             data = struct.pack('Q', m.new_return_value)  # New return value
 
             instruction = FuzzInstruction(
@@ -698,6 +705,14 @@ class SmartMutator:
         if dictionary_file:
             self._load_dictionary(dictionary_file)
             
+        # UCB1 strategy feedback: track per-strategy effectiveness for adaptive selection.
+        # Each strategy starts with 1 run / 1 new_edge to avoid division-by-zero and
+        # give all strategies an initial chance before UCB1 can discriminate.
+        self._strategy_feedback = {
+            i: {'runs': 1, 'new_edges': 1, 'crashes': 0} for i in range(11)
+        }
+        self.last_strategy_type: int = -1  # most recently selected strategy index
+
         alog(f"Stagnation detection enabled (threshold={self.stagnation_threshold} iterations)", "MUTATOR", "INFO")
 
     def clear(self):
@@ -1202,20 +1217,28 @@ class SmartMutator:
                     print(f"[Mutator] Stagnation detected at iteration {iteration}!")
                     print(f"[Mutator] Switching to aggressive mutation mode...")
     
+    def record_strategy_result(self, strategy_type: int, new_edges: int, crashed: bool):
+        """Called by FuzzingCore after each iteration to feed back effectiveness."""
+        if strategy_type < 0 or strategy_type >= 11:
+            return
+        fb = self._strategy_feedback[strategy_type]
+        fb['runs'] += 1
+        fb['new_edges'] += new_edges
+        if crashed:
+            fb['crashes'] += 1
+
     def _select_strategy(self):
         """
-        Choose mutation strategy with balanced probability
-        
-        New design principles:
-        1. Balance discovery capability for various vulnerability types
-        2. Avoid excessive bias towards a single vulnerability type
-        3. Support diversified mutation patterns
-        
+        Choose mutation strategy.
+        Regular mode: UCB1 multi-armed bandit — exploit productive strategies while
+        exploring under-used ones.  Stagnant mode: keep existing aggressive hardcoded
+        weights as a safety-net exploration sweep.
+
         Returns:
             int: Strategy type (0-10)
         """
         if self.is_stagnant:
-            # Stagnation mode: Aggressive strategy distribution
+            # Stagnation mode: Aggressive strategy distribution (unchanged)
             strategy_weights = [
                 8,   # 0: FLIP_BITS
                 15,  # 1: INTERESTING_VALUES
@@ -1229,23 +1252,21 @@ class SmartMutator:
                 10,  # 9: MUTATE_FLAGS
                 8,   # 10: OVERWRITE_AT_OFFSET
             ]
+            chosen = random.choices(range(11), weights=strategy_weights)[0]
         else:
-            # Regular mode: Balanced strategy distribution
-            strategy_weights = [
-                12,  # 0: FLIP_BITS
-                12,  # 1: INTERESTING_VALUES
-                10,  # 2: TRUNCATE
-                14,  # 3: EXTEND
-                8,   # 4: LIGHT_MUTATION
-                9,   # 5: MUTATE_AUX_BUFFER
-                9,   # 6: REPLACE_BUFFER (small)
-                10,  # 7: REPLACE_BUFFER (large)
-                10,  # 8: BOUNDARY_VALUE
-                9,   # 9: MUTATE_FLAGS
-                7,   # 10: OVERWRITE_AT_OFFSET
-            ]
+            # UCB1: balance exploit (known-good strategies) with explore (under-tried ones)
+            import math as _math
+            total = sum(fb['runs'] for fb in self._strategy_feedback.values())
+            weights = []
+            for i in range(11):
+                fb = self._strategy_feedback[i]
+                exploit = (fb['new_edges'] + fb['crashes'] * 10) / fb['runs']
+                explore = _math.sqrt(2.0 * _math.log(max(total, 1)) / fb['runs'])
+                weights.append(max(0.5, exploit + explore))
+            chosen = random.choices(range(11), weights=weights)[0]
 
-        return random.choices(range(11), weights=strategy_weights)[0]
+        self.last_strategy_type = chosen
+        return chosen
     
     def _generate_http_request(self, url_path: bytes, method: bytes = b'GET',
                                auth_header: bytes = b'', extra_headers: bytes = b'',
@@ -1609,7 +1630,11 @@ class SmartMutator:
         # Convert to FuzzInstruction
         instructions = []
         for m in selected_mutations:
-            # 1. Return value mutation
+            # 1. Return value mutation — skip file-FD syscalls (not network-controllable)
+            _is_net = self.syscall_network_fd_map.get(m.syscall_index, False)
+            if fork_point is not None and not _is_net:
+                alog(f"io_return_value: skip file-FD sc={m.syscall_index}", "MUTATOR", "DEBUG")
+                continue
             data = struct.pack('Q', m.new_return_value)  # New return value
 
             instruction = FuzzInstruction(
@@ -1799,8 +1824,8 @@ class SmartMutator:
                     print(f"[Mutator] OK: Fork point {fork_point} ({target_sc.name}) is an IO syscall - Force including it")
                     valid_candidates = [target_sc]
                 else:
-                    print(f"[Mutator] WARNING: No candidates >= fork_point and {fork_point} is not a valid IO target")
-                    valid_candidates = self.mutable_candidates
+                    print(f"[Mutator] WARNING: No candidates >= fork_point={fork_point}, skipping pre-fork mutations")
+                    valid_candidates = []  # Don't fall back to pre-fork_point candidates
         
         num_candidates = len(valid_candidates)
         

@@ -187,6 +187,12 @@ class DynamicForkController:
         self._CRASHY_SKIP_THRESHOLD = 20      # skip after this many duplicates
         self._crashy_reset_iter = 0           # iteration when we last reset counts
 
+        # Weighted fork point rotation: track per-fork-point exploration stats
+        # so the root level rotates across all post-auth IO syscalls instead of
+        # always starting from manual_fork_point.
+        self._fork_point_visits: dict = {}    # fork_point -> visit count
+        self._fork_point_new_edges: dict = {} # fork_point -> cumulative new edges found
+
         alog(f"Initialized (Depth-First Checkpoint Mode)", "DFC", "INFO")
         alog(f"  Max exploration depth: {self.max_depth}", "DFC", "INFO")
         alog(f"  Max variants per checkpoint: {self.max_variants_per_checkpoint}", "DFC", "INFO")
@@ -353,11 +359,36 @@ class DynamicForkController:
         # from the next post-auth IO syscall so depth > 0 actually explores new ground.
         if self.manual_fork_point is not None:
             alog(f"🎯 Applying Manual Fork Point Override: {self.manual_fork_point}", "DFC", "INFO")
-            # Build the deeper exploration list: post-auth IO syscalls AFTER the fork point.
-            # These are used by _explore_at_checkpoint to recurse when new coverage is found.
-            post_auth_io = [idx for idx in io_syscalls if idx > self.manual_fork_point]
-            # Root entry: always start from manual_fork_point
-            io_syscalls = [self.manual_fork_point] + post_auth_io[:4]  # cap at 5 total
+            # Build the full post-auth IO candidate pool (>= manual_fork_point).
+            post_auth_pool = [idx for idx in io_syscalls if idx >= self.manual_fork_point]
+            if self.manual_fork_point not in post_auth_pool:
+                post_auth_pool.insert(0, self.manual_fork_point)
+
+            # Weighted sampling: prefer under-explored points and productive ones.
+            # crash-heavy points are soft-downweighted (they will be hard-skipped below).
+            import math as _math
+            weights = []
+            for fp in post_auth_pool:
+                visits = self._fork_point_visits.get(fp, 0)
+                new_edges = self._fork_point_new_edges.get(fp, 0)
+                crash_cnt = self._crashy_fork_points.get(fp, 0)
+                w = (1.0 / (1 + visits)) * (1.0 + new_edges * 0.1)
+                if crash_cnt >= self._CRASHY_SKIP_THRESHOLD:
+                    w *= 0.05
+                weights.append(max(0.01, w))
+
+            # Pick up to 3 root fork points via weighted sampling (without exact replacement).
+            num_root = min(3, len(post_auth_pool))
+            chosen = set()
+            attempts = 0
+            while len(chosen) < num_root and attempts < num_root * 4:
+                pick = random.choices(post_auth_pool, weights=weights, k=1)[0]
+                chosen.add(pick)
+                attempts += 1
+            # Always include manual_fork_point to preserve existing behaviour as a floor.
+            chosen.add(self.manual_fork_point)
+            io_syscalls = sorted(chosen)
+            alog(f"🎯 Weighted root fork points: {io_syscalls} (pool size={len(post_auth_pool)})", "DFC", "INFO")
 
         if not io_syscalls:
             alog("No IO syscalls found, falling back to Havoc mode at fork point 0", "DFC", "WARN")
@@ -374,8 +405,10 @@ class DynamicForkController:
         # so stale crash data doesn't permanently suppress exploration.
         if iteration_id - self._crashy_reset_iter > 2000:
             self._crashy_fork_points.clear()
+            self._fork_point_visits.clear()
+            self._fork_point_new_edges.clear()
             self._crashy_reset_iter = iteration_id
-            alog("Crash-steering counters reset", "DFC", "DEBUG")
+            alog("Crash-steering + visit counters reset", "DFC", "DEBUG")
 
         # Filter out fork_points that have accumulated too many duplicate crashes.
         # Always keep the mandatory fork_point (manual_fork_point / auth_boundary).
@@ -391,12 +424,20 @@ class DynamicForkController:
 
         # Horizontal exploration: Try all preselected IO syscalls at root level
         any_success = False
+        edges_before = self.coverage_tracker.get_stats().get('total_edges', 0)
         for i, syscall_index in enumerate(io_syscalls):
             alog(f"🎯 Starting deep exploration branch {i+1}/{len(io_syscalls)} @syscall[{syscall_index}]", "DFC", "INFO")
+            self._fork_point_visits[syscall_index] = self._fork_point_visits.get(syscall_index, 0) + 1
             success = self._explore_at_checkpoint(trace.file_path, syscall_index, 0, iteration_id, f"root_{i}")
             if success:
                 any_success = True
-                
+                edges_after = self.coverage_tracker.get_stats().get('total_edges', 0)
+                gained = max(0, edges_after - edges_before)
+                if gained > 0:
+                    self._fork_point_new_edges[syscall_index] = \
+                        self._fork_point_new_edges.get(syscall_index, 0) + gained
+                    edges_before = edges_after
+
         return any_success
 
     def _explore_at_checkpoint(self, trace_file: str, syscall_index: int, depth: int, iteration_id: int, parent_id: str) -> bool:

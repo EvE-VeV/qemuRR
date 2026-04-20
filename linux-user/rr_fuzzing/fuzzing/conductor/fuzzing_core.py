@@ -1489,6 +1489,20 @@ class FuzzingCore:
                     )
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Step 5.6: Strategy Feedback (UCB1)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if hasattr(self.mutator, 'record_strategy_result') and hasattr(self.mutator, 'last_strategy_type'):
+            strat = self.mutator.last_strategy_type
+            if strat >= 0:
+                coverage_stats = self.coverage_tracker.get_stats()
+                new_edge_count = len(coverage_stats.get('new_edges', set())) if has_new_coverage else 0
+                self.mutator.record_strategy_result(
+                    strategy_type=strat,
+                    new_edges=new_edge_count,
+                    crashed=crashes_found_count > 0,
+                )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 7: Statistics Update and Display
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         self._display_progress()

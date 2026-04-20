@@ -828,6 +828,7 @@ abi_long rr_do_syscall(CPUArchState *env, int num,
                 if (g_rr_debug.level >= RR_DEBUG_INFO) {
                     fprintf(stderr, "[FUZZ-STABILIZE] Intercepting fatal signal handler (sig=%d). Returning 0.\n", sig);
                 }
+                g_in_rr_hook = false;
                 return 0; /* Succeed without registering handler */
             }
         }

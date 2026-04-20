@@ -1,3 +1,15 @@
+# 论文/实验数据（保存在独立私有repo）
+paper/
+evaluation/
+evaluation.md
+paper_data_patch.md
+campaign_statistics.md
+crashes/real_world_repro/
+crashes/newbugs/
+tests/seeds/**/*.bin
+tests/seeds/**/*.bbl
+tests/seeds/**/*.trace
+
 # 编译产物
 *.o
 *.a

@@ -1,5 +1,5 @@
 {
-    "name": "TOTOLINK_A720R",
+    "name": "TOTOLINK_N200RE",
     "arch": "mips",
     "trace_file": "seeds/TOTOLINK/boa_totolink_v2.trace",
     "dictionary": "config/dicts/totolink_http.dict",
